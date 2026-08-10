@@ -1,0 +1,9 @@
+.git
+.github
+.llmwiki
+target
+data
+quotamux.toml
+AGENTS.md
+CLAUDE.md
+.DS_Store

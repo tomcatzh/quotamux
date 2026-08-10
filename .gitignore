@@ -1,0 +1,9 @@
+/.llmwiki/
+/AGENTS.md
+/CLAUDE.md
+/quotamux.toml
+/data/
+/target/
+/.DS_Store
+/coverage/
+*.profraw

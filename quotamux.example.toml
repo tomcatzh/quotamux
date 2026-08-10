@@ -1,0 +1,28 @@
+# QuotaMux version-one configuration.
+# Copy this file to quotamux.toml and keep the populated file private.
+config_version = 1
+
+[server]
+# Docker publishes this port on 127.0.0.1; QuotaMux listens on all container
+# interfaces so OrbStack can forward the host port.
+listen = "0.0.0.0:8080"
+data_dir = "./data"
+
+[model]
+# Version one exposes one logical model. Clients cannot choose a provider.
+logical_name = "deepseek-v4-flash-0731"
+
+[providers.opencode_go]
+# OpenCode Go API root. QuotaMux appends /chat/completions.
+endpoint = "https://opencode.ai/zen/go/v1"
+api_key = ""
+# OpenCode Go exposes the current Flash release through this rolling alias.
+model = "deepseek-v4-flash"
+
+[providers.deepseek]
+# Official API root. QuotaMux uses the official Chat Completions, Responses,
+# or Anthropic-compatible path according to the client ingress protocol.
+endpoint = "https://api.deepseek.com"
+api_key = ""
+# This is DeepSeek's public rolling alias for the current Flash release.
+model = "deepseek-v4-flash"

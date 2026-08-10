@@ -1,0 +1,37 @@
+[package]
+name = "quotamux"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A quota-aware local gateway for DeepSeek V4 Flash"
+repository = "https://github.com/tomcatzh/quotamux"
+
+[dependencies]
+async-stream = "0.3.6"
+axum = { version = "0.8.9", features = ["http1", "http2", "json", "tokio"] }
+bytes = "1.11.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
+futures-util = "0.3.33"
+httpdate = "1.0.3"
+redb = "4.1.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "json", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.53.1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.24.0", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"
