@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::types::Protocol;
+use crate::{affinity::PrefixAffinityConfig, types::Protocol};
 
 pub const LOGICAL_MODEL: &str = "deepseek-v4-flash-0731";
 pub const UPSTREAM_MODEL: &str = "deepseek-v4-flash";
@@ -17,6 +17,8 @@ pub const UPSTREAM_MODEL: &str = "deepseek-v4-flash";
 pub struct Config {
     pub config_version: u32,
     pub server: ServerConfig,
+    #[serde(default)]
+    pub affinity: PrefixAffinityConfig,
     pub providers: Vec<ProviderConfig>,
     pub models: Vec<ServedModelConfig>,
 }
@@ -159,6 +161,7 @@ impl ServedModelConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum RouteStrategy {
     Random,
+    PromptPrefixAffinity,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -233,6 +236,7 @@ impl Config {
         if self.models.is_empty() {
             return Err(invalid("models must not be empty"));
         }
+        self.affinity.validate().map_err(invalid)?;
 
         let mut provider_ids = HashSet::new();
         for (provider_index, provider) in self.providers.iter().enumerate() {
@@ -455,6 +459,7 @@ mod tests {
                 listen: "127.0.0.1:8080".into(),
                 data_dir: "data".into(),
             },
+            affinity: PrefixAffinityConfig::default(),
             providers: vec![
                 ProviderConfig {
                     id: "go".into(),
@@ -567,6 +572,16 @@ mod tests {
     }
 
     #[test]
+    fn validates_prompt_affinity_strategy_and_tuning() {
+        let mut config = valid();
+        config.models[0].layers[0].strategy = RouteStrategy::PromptPrefixAffinity;
+        config.validate().unwrap();
+        config.affinity.checkpoint_bytes = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("affinity.checkpoint_bytes"));
+    }
+
+    #[test]
     fn parses_documented_v2_shape() {
         let config: Config = toml::from_str(
             r#"
@@ -574,6 +589,12 @@ config_version = 2
 [server]
 listen = "127.0.0.1:8080"
 data_dir = "data"
+[affinity]
+checkpoint_bytes = 256
+max_checkpoints_per_path = 1024
+max_candidates_per_prefix = 4
+max_leases = 2048
+success_ttl_ms = 60000
 [[providers]]
 id = "go"
 kind = "opencode-go"
@@ -589,11 +610,18 @@ aliases = ["deepseek-v4-flash"]
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 [[models.layers]]
 name = "plan"
-strategy = "random"
+strategy = "prompt-prefix-affinity"
 targets = [{ provider = "go", credential = "go-a", model = "deepseek-v4-flash" }]
 "#,
         )
         .unwrap();
         config.validate().unwrap();
+        assert_eq!(config.affinity.checkpoint_bytes, 256);
+        assert_eq!(config.affinity.max_checkpoints_per_path, 1024);
+        assert_eq!(config.affinity.max_leases, 2048);
+        assert_eq!(
+            config.models[0].layers[0].strategy,
+            RouteStrategy::PromptPrefixAffinity
+        );
     }
 }

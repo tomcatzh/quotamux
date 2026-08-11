@@ -211,6 +211,8 @@ pub struct RequestRecord {
     pub route_layer_index: Option<usize>,
     #[serde(default)]
     pub selection_reason: Option<String>,
+    #[serde(default)]
+    pub matched_prefix_bytes: Option<u64>,
     pub fallback: bool,
     pub translated: bool,
     pub request_bytes: u64,
@@ -239,6 +241,8 @@ pub struct AttemptRecord {
     pub route_layer_index: Option<usize>,
     #[serde(default)]
     pub selection_reason: Option<String>,
+    #[serde(default)]
+    pub matched_prefix_bytes: Option<u64>,
     pub upstream_model: String,
     pub egress_protocol: Protocol,
     pub translated: bool,

@@ -1,6 +1,6 @@
 # QuotaMux configuration and routing architecture v2
 
-Status: active design and implementation contract
+Status: implemented and verified
 
 This document records the product decisions for the first general-purpose
 QuotaMux configuration and routing system. It replaces the version-one
@@ -144,7 +144,8 @@ provider. All targets in a layer are declared semantically equivalent for the
 served model. QuotaMux is therefore allowed to select any healthy target in the
 layer.
 
-Version-two selection policy is `random`:
+Every layer chooses either `random` or `prompt-prefix-affinity`. Both preserve
+the same health and fallback semantics:
 
 1. Resolve the served model and ingress protocol.
 2. For the first route layer, collect targets that are configured, protocol-
@@ -160,10 +161,11 @@ Version-two selection policy is `random`:
 8. Per-target circuit state survives restarts and prevents a failed credential
    from disabling sibling credentials or the whole provider type.
 
-The `random` strategy is an intentionally replaceable layer-local selector. The
-next strategy, `prompt-prefix-affinity`, will use the same route/layer contracts.
+`prompt-prefix-affinity` starts from the same randomized order, then promotes
+the eligible cache domain with the longest currently warm canonical prefix.
+When no prefix matches, it is exactly the normal random policy.
 
-## Proposed TOML shape
+## TOML shape
 
 ```toml
 config_version = 2
@@ -171,6 +173,13 @@ config_version = 2
 [server]
 listen = "0.0.0.0:8080"
 data_dir = "./data"
+
+[affinity]
+checkpoint_bytes = 128
+max_checkpoints_per_path = 4096
+max_candidates_per_prefix = 8
+max_leases = 16384
+success_ttl_ms = 300000
 
 [[providers]]
 id = "go"
@@ -263,6 +272,9 @@ schema migration. API keys and prompt/model response bodies remain excluded.
 
 ## Delivery and acceptance plan
 
+All three phases below are implemented. The captured unit, end-to-end, and
+real-provider results are in [test-evidence.md](test-evidence.md).
+
 ### Phase 1: design record
 
 - This document and the separate prompt-prefix-affinity design are present.
@@ -294,7 +306,7 @@ Evidence required:
 
 - Implement as a library independent of HTTP/provider code.
 - Keep the online lookup/index in memory.
-- Use redb only for batched warm-restart persistence.
+- Keep affinity metadata memory-only; a restart intentionally starts cold.
 - Bypass hashing/index lookup for a layer with one eligible target.
 - Integrate behind the layer-local selector interface.
 
@@ -302,7 +314,7 @@ Evidence required:
 
 - unit/property-style tests for chunk-independent prefix hashing, canonical
   encoding, longest-prefix lookup, branch retention, expiry, epoch dominance,
-  collision namespace separation, candidate limits, and restart recovery;
+  collision namespace separation, candidate limits, and cold restart behavior;
 - concurrency tests for read/update/GC interaction;
 - end-to-end mock-worker tests that prove two prompts sharing a long prefix are
   routed to the warm target while diverging/expired prompts are not;

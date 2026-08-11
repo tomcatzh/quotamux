@@ -161,6 +161,7 @@ impl Gateway {
                 listen: "127.0.0.1:0".into(),
                 data_dir: "unused-test-data".into(),
             },
+            affinity: Default::default(),
             providers: vec![
                 ProviderConfig {
                     id: "opencode-go".into(),
@@ -287,14 +288,24 @@ fn chat_completion(reasoning: &str, content: &str) -> Value {
 }
 
 fn chat_request() -> Value {
+    chat_request_with_content("hello")
+}
+
+fn chat_request_with_content(content: &str) -> Value {
     json!({
         "model": LOGICAL_MODEL,
-        "messages": [{"role":"user","content":"hello"}]
+        "messages": [{"role":"user","content":content}]
     })
 }
 
 fn test_provider(id: &str, credential: &str, upstream: &MockProvider) -> ProviderConfig {
-    test_provider_protocol(id, credential, upstream, Protocol::OpenAiChat)
+    test_provider_kind(
+        id,
+        credential,
+        upstream,
+        ProviderKind::OpenCodeGo,
+        Protocol::OpenAiChat,
+    )
 }
 
 fn test_provider_protocol(
@@ -303,9 +314,19 @@ fn test_provider_protocol(
     upstream: &MockProvider,
     protocol: Protocol,
 ) -> ProviderConfig {
+    test_provider_kind(id, credential, upstream, ProviderKind::OpenCodeGo, protocol)
+}
+
+fn test_provider_kind(
+    id: &str,
+    credential: &str,
+    upstream: &MockProvider,
+    kind: ProviderKind,
+    protocol: Protocol,
+) -> ProviderConfig {
     ProviderConfig {
         id: id.into(),
-        kind: ProviderKind::OpenCodeGo,
+        kind,
         endpoint: Some(upstream.endpoint()),
         credentials: vec![CredentialConfig {
             id: credential.into(),
@@ -336,6 +357,7 @@ fn test_config(
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
         },
+        affinity: Default::default(),
         providers,
         models: vec![ServedModelConfig {
             name: LOGICAL_MODEL.into(),
@@ -503,6 +525,277 @@ async fn random_strategy_distributes_requests_within_one_layer() {
             .filter(|attempt| attempt["provider"] == "worker-b")
             .count(),
         count_b
+    );
+    eprintln!(
+        "RANDOM_LAYER_EVIDENCE {}",
+        json!({"requests":REQUESTS,"worker_a":count_a,"worker_b":count_b,"persisted_attempts":attempts.len()})
+    );
+}
+
+#[tokio::test]
+async fn prompt_prefix_affinity_routes_a_divergent_branch_across_mixed_provider_kinds() {
+    let worker_a = MockProvider::start(
+        (0..4)
+            .map(|_| MockReply::json(StatusCode::OK, chat_completion("a", "worker-a")))
+            .collect(),
+    )
+    .await;
+    let worker_b = MockProvider::start(
+        (0..4)
+            .map(|_| MockReply::json(StatusCode::OK, chat_completion("b", "worker-b")))
+            .collect(),
+    )
+    .await;
+    let mut config = test_config(
+        vec![
+            test_provider("worker-a", "key-a", &worker_a),
+            test_provider_kind(
+                "worker-b",
+                "key-b",
+                &worker_b,
+                ProviderKind::DeepSeekOfficial,
+                Protocol::OpenAiChat,
+            ),
+        ],
+        vec![(
+            "mixed-plan-payg",
+            vec![target("worker-a", "key-a"), target("worker-b", "key-b")],
+        )],
+    );
+    config.models[0].layers[0].strategy = RouteStrategy::PromptPrefixAffinity;
+    config.affinity.checkpoint_bytes = 128;
+    config.affinity.success_ttl_ms = 200;
+    let gateway = Gateway::start_config(config, 0xa11f_1a17).await;
+    let client = reqwest::Client::new();
+    let common = "a".repeat(3_000);
+    let long = format!("{common}{}", "b".repeat(4_000));
+    let branch = format!("{common}{}", "c".repeat(3_000));
+
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request_with_content(&long))
+        .send()
+        .await
+        .expect("cold affinity request");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(header_value(&first, "x-relay-selection-reason"), "random");
+    let warm_provider = header_value(&first, "x-relay-provider");
+    let _ = first.json::<Value>().await.expect("cold response JSON");
+
+    let second = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request_with_content(&branch))
+        .send()
+        .await
+        .expect("warm branch request");
+    let second_request_id = header_value(&second, "x-relay-request-id");
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(header_value(&second, "x-relay-provider"), warm_provider);
+    assert_eq!(
+        header_value(&second, "x-relay-selection-reason"),
+        "prompt-prefix-affinity"
+    );
+    let matched = header_value(&second, "x-relay-matched-prefix-bytes")
+        .parse::<u64>()
+        .expect("matched prefix byte count");
+    assert!(
+        ((common.len() - 128) as u64..=(common.len() + 128) as u64).contains(&matched),
+        "matched={matched}"
+    );
+    let _ = second.json::<Value>().await.expect("warm response JSON");
+
+    let unrelated = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request_with_content("completely unrelated prompt"))
+        .send()
+        .await
+        .expect("unrelated affinity request");
+    assert_eq!(unrelated.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&unrelated, "x-relay-selection-reason"),
+        "random"
+    );
+    assert!(
+        unrelated
+            .headers()
+            .get("x-relay-matched-prefix-bytes")
+            .is_none()
+    );
+    let _ = unrelated.json::<Value>().await.expect("unrelated JSON");
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let expired = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request_with_content(&branch))
+        .send()
+        .await
+        .expect("expired affinity request");
+    assert_eq!(expired.status(), StatusCode::OK);
+    assert_eq!(header_value(&expired, "x-relay-selection-reason"), "random");
+    let _ = expired
+        .json::<Value>()
+        .await
+        .expect("expired response JSON");
+
+    assert_eq!(worker_a.calls().await + worker_b.calls().await, 4);
+    let warm_calls = if warm_provider == "worker-a" {
+        worker_a.calls().await
+    } else {
+        worker_b.calls().await
+    };
+    assert!(
+        warm_calls >= 2,
+        "warm_provider={warm_provider} calls={warm_calls}"
+    );
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=20"))
+        .send()
+        .await
+        .expect("affinity attempts response")
+        .json::<Value>()
+        .await
+        .expect("affinity attempts JSON");
+    let warm_attempt = attempts_for_request(&attempts, &second_request_id);
+    assert_eq!(warm_attempt.len(), 1);
+    assert_eq!(warm_attempt[0]["provider"], warm_provider);
+    assert_eq!(
+        warm_attempt[0]["selection_reason"],
+        "prompt-prefix-affinity"
+    );
+    assert_eq!(warm_attempt[0]["matched_prefix_bytes"], matched);
+    assert_eq!(warm_attempt[0]["usage"]["cache_hit_tokens"], 3);
+    eprintln!(
+        "MOCK_AFFINITY_EVIDENCE {}",
+        json!({"warm_provider":warm_provider,"matched_prefix_bytes":matched,"warm_provider_calls":warm_calls,"recorded_cache_hit_tokens":3})
+    );
+}
+
+#[tokio::test]
+async fn single_target_affinity_layer_skips_hashing_and_bookkeeping() {
+    let worker = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("single", "single-worker"),
+    )])
+    .await;
+    let mut config = test_config(
+        vec![test_provider("single-worker", "single-key", &worker)],
+        vec![("plan", vec![target("single-worker", "single-key")])],
+    );
+    config.models[0].layers[0].strategy = RouteStrategy::PromptPrefixAffinity;
+    let gateway = Gateway::start_config(config, 17).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("single-target affinity response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&response, "x-relay-selection-reason"),
+        "single-target"
+    );
+    assert!(
+        response
+            .headers()
+            .get("x-relay-matched-prefix-bytes")
+            .is_none()
+    );
+    let _ = response.json::<Value>().await.expect("single-target JSON");
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("single-target status")
+        .json::<Value>()
+        .await
+        .expect("single-target status JSON");
+    assert_eq!(status["affinity"]["storage"], "memory-only");
+    assert_eq!(status["affinity"]["leases"], 0);
+    eprintln!(
+        "SINGLE_TARGET_EVIDENCE {}",
+        json!({"selection_reason":"single-target","affinity_leases":0})
+    );
+}
+
+#[tokio::test]
+async fn completed_stream_warms_prefix_affinity_for_the_next_request() {
+    let worker_a = MockProvider::start(
+        (0..2)
+            .map(|_| MockReply::sse(chat_stream("a", "worker-a", true)))
+            .collect(),
+    )
+    .await;
+    let worker_b = MockProvider::start(
+        (0..2)
+            .map(|_| MockReply::sse(chat_stream("b", "worker-b", true)))
+            .collect(),
+    )
+    .await;
+    let mut config = test_config(
+        vec![
+            test_provider("worker-a", "key-a", &worker_a),
+            test_provider("worker-b", "key-b", &worker_b),
+        ],
+        vec![(
+            "plan",
+            vec![target("worker-a", "key-a"), target("worker-b", "key-b")],
+        )],
+    );
+    config.models[0].layers[0].strategy = RouteStrategy::PromptPrefixAffinity;
+    let gateway = Gateway::start_config(config, 0x57ea_0a11).await;
+    let client = reqwest::Client::new();
+    let common = "stream-prefix".repeat(300);
+
+    let mut first_body = chat_request_with_content(&format!("{common}-first"));
+    first_body["stream"] = json!(true);
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&first_body)
+        .send()
+        .await
+        .expect("first streaming affinity response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let warm_provider = header_value(&first, "x-relay-provider");
+    assert_eq!(header_value(&first, "x-relay-selection-reason"), "random");
+    let first_stream = first.text().await.expect("first stream body");
+    assert!(first_stream.contains("data: [DONE]"));
+
+    let mut second_body = chat_request_with_content(&format!("{common}-branch"));
+    second_body["stream"] = json!(true);
+    let second = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&second_body)
+        .send()
+        .await
+        .expect("second streaming affinity response");
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(header_value(&second, "x-relay-provider"), warm_provider);
+    assert_eq!(
+        header_value(&second, "x-relay-selection-reason"),
+        "prompt-prefix-affinity"
+    );
+    assert!(
+        header_value(&second, "x-relay-matched-prefix-bytes")
+            .parse::<u64>()
+            .expect("stream matched prefix bytes")
+            > 3_000
+    );
+    let second_stream = second.text().await.expect("second stream body");
+    assert!(second_stream.contains("data: [DONE]"));
+    assert_eq!(worker_a.calls().await + worker_b.calls().await, 2);
+    eprintln!(
+        "STREAM_AFFINITY_EVIDENCE {}",
+        json!({"warm_provider":warm_provider,"requests":2,"completed_done_events":2})
     );
 }
 

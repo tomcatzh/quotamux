@@ -25,8 +25,11 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
+    affinity::{
+        AffinityDirectory, CacheDomain, CacheEvidence, EvidenceConfidence, FingerprintPath,
+    },
     circuit::{CircuitBreaker, RouteDecision},
-    config::{Config, ProviderKind, RouteTargetConfig, ServedModelConfig},
+    config::{Config, ProviderKind, RouteStrategy, RouteTargetConfig, ServedModelConfig},
     dashboard::INDEX_HTML,
     protocol::{self, ValidationError, anthropic, chat, responses},
     provider::{ProviderClient, ProviderError},
@@ -43,6 +46,7 @@ pub struct AppState {
     pub store: Store,
     targets: HashMap<RouteTargetConfig, Arc<TargetRuntime>>,
     selector: RandomSelector,
+    affinity: AffinityDirectory,
     balance_client: Option<ProviderClient>,
     started_at_ms: i64,
     balance: RwLock<Option<Value>>,
@@ -72,6 +76,8 @@ impl AppState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         config.validate()?;
         let store = Store::open(&config.server.data_dir)?;
+        let affinity =
+            AffinityDirectory::new(config.affinity.clone()).map_err(std::io::Error::other)?;
         let mut targets = HashMap::new();
         let mut balance_client = None;
         for served_model in &config.models {
@@ -109,6 +115,7 @@ impl AppState {
             store,
             targets,
             selector,
+            affinity,
             balance_client,
             started_at_ms: Utc::now().timestamp_millis(),
             balance: RwLock::new(balance),
@@ -116,6 +123,16 @@ impl AppState {
     }
 
     pub fn start_background(self: &Arc<Self>) {
+        let affinity_state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                affinity_state
+                    .affinity
+                    .expire(Utc::now().timestamp_millis());
+            }
+        });
         let Some(balance_client) = self.balance_client.clone() else {
             return;
         };
@@ -272,11 +289,19 @@ struct RouteCandidate {
     target: RouteTargetConfig,
     layer_name: String,
     layer_index: usize,
-    selection_reason: &'static str,
+    selection_reason: String,
+    matched_prefix_bytes: Option<u64>,
+    affinity_path: Option<FingerprintPath>,
+    cache_domain: Option<CacheDomain>,
     probe: bool,
 }
 
-fn route_candidates(state: &AppState, model: &ServedModelConfig) -> Vec<RouteCandidate> {
+fn route_candidates(
+    state: &AppState,
+    model: &ServedModelConfig,
+    ingress: Protocol,
+    original: &Value,
+) -> Vec<RouteCandidate> {
     let mut candidates = Vec::new();
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let order = state.selector.order(layer.targets.len());
@@ -285,22 +310,120 @@ fn route_candidates(state: &AppState, model: &ServedModelConfig) -> Vec<RouteCan
         } else {
             "random"
         };
+        let mut layer_candidates = Vec::with_capacity(layer.targets.len());
         for target_index in order {
             let target = layer.targets[target_index].clone();
-            candidates.push(RouteCandidate {
+            layer_candidates.push(RouteCandidate {
                 target,
                 layer_name: layer.name.clone(),
                 layer_index,
-                selection_reason,
+                selection_reason: selection_reason.into(),
+                matched_prefix_bytes: None,
+                affinity_path: None,
+                cache_domain: None,
                 probe: false,
             });
         }
+        if layer.strategy == RouteStrategy::PromptPrefixAffinity && layer_candidates.len() > 1 {
+            let now_ms = Utc::now().timestamp_millis();
+            for candidate in &mut layer_candidates {
+                let Some((path, domain)) =
+                    affinity_context(state, &candidate.target, ingress, original)
+                else {
+                    continue;
+                };
+                candidate.matched_prefix_bytes = state
+                    .affinity
+                    .lookup(&path, &HashSet::from([domain.clone()]), now_ms)
+                    .map(|found| found.matched_bytes);
+                candidate.affinity_path = Some(path);
+                candidate.cache_domain = Some(domain);
+                if candidate.matched_prefix_bytes.is_some() {
+                    candidate.selection_reason = "prompt-prefix-affinity".into();
+                }
+            }
+            layer_candidates.sort_by(|left, right| {
+                right
+                    .matched_prefix_bytes
+                    .unwrap_or(0)
+                    .cmp(&left.matched_prefix_bytes.unwrap_or(0))
+            });
+        }
+        candidates.extend(layer_candidates);
     }
     candidates
 }
 
+fn affinity_context(
+    state: &AppState,
+    target: &RouteTargetConfig,
+    ingress: Protocol,
+    original: &Value,
+) -> Option<(FingerprintPath, CacheDomain)> {
+    let runtime = target_runtime(state, target);
+    let egress = runtime.client.protocol_for(ingress);
+    let (_, _, prepared) =
+        prepare_for_provider(egress, ingress, original, runtime.client.model()).ok()?;
+    let bytes = canonical_prompt_bytes(prepared)?;
+    let namespace = format!(
+        "{}\0{}\0{}\0canonical-json-v1",
+        runtime.client.kind().as_str(),
+        egress.as_str(),
+        runtime.client.model()
+    );
+    let path = state
+        .affinity
+        .fingerprint(namespace.as_bytes(), [bytes.as_slice()]);
+    let domain = CacheDomain {
+        id: format!(
+            "{}\0{}\0{}\0{}",
+            target.provider,
+            target.credential,
+            target.model,
+            egress.as_str()
+        ),
+        generation: "configured-target-v1".into(),
+    };
+    Some((path, domain))
+}
+
+fn canonical_prompt_bytes(mut prepared: Value) -> Option<Vec<u8>> {
+    let object = prepared.as_object_mut()?;
+    object.remove("model");
+    object.remove("stream");
+    object.remove("stream_options");
+    serde_json::to_vec(&prepared).ok()
+}
+
 fn target_runtime<'a>(state: &'a AppState, target: &RouteTargetConfig) -> &'a TargetRuntime {
     state.targets.get(target).expect("validated runtime target")
+}
+
+fn observe_affinity(state: &AppState, candidate: &RouteCandidate, usage: &Usage) {
+    let (Some(path), Some(domain), Some(through_checkpoint)) = (
+        candidate.affinity_path.clone(),
+        candidate.cache_domain.clone(),
+        candidate
+            .affinity_path
+            .as_ref()
+            .and_then(FingerprintPath::deepest_ordinal),
+    ) else {
+        return;
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    let evidence = CacheEvidence {
+        through_checkpoint,
+        expires_at_ms: now_ms.saturating_add(state.affinity.success_ttl_ms()),
+        cached_tokens: usage.cache_hit_tokens,
+        confidence: if usage.cache_hit_tokens > 0 {
+            EvidenceConfidence::ProviderReported
+        } else {
+            EvidenceConfidence::SuccessfulRequest
+        },
+    };
+    if let Err(error) = state.affinity.observe(path, domain, evidence, now_ms) {
+        tracing::warn!(%error, "failed to update in-memory affinity directory");
+    }
 }
 
 fn terminal_route_failure(
@@ -332,7 +455,7 @@ async fn handle_nonstream(
         .unwrap_or(0);
     let include_metadata = metadata_requested(&headers);
     let served_model = resolve_served_model(&state, protocol, &body).expect("validated model");
-    let candidates = route_candidates(&state, &served_model);
+    let candidates = route_candidates(&state, &served_model, protocol, &body);
     let mut fallback_reason = None;
     let mut last_failure = None;
     let mut last_candidate = None;
@@ -363,6 +486,11 @@ async fn handle_nonstream(
         {
             Ok(mut success) => {
                 runtime.circuit.success().await;
+                observe_affinity(
+                    &state,
+                    &success.candidate,
+                    &usage_for(success.egress, &success.raw_upstream),
+                );
                 success.fallback_reason = fallback_reason;
                 outcome = Some(success);
                 break;
@@ -418,7 +546,8 @@ async fn handle_nonstream(
         credential: Some(outcome.candidate.target.credential.clone()),
         route_layer: Some(outcome.candidate.layer_name.clone()),
         route_layer_index: Some(outcome.candidate.layer_index),
-        selection_reason: Some(outcome.candidate.selection_reason.into()),
+        selection_reason: Some(outcome.candidate.selection_reason.clone()),
+        matched_prefix_bytes: outcome.candidate.matched_prefix_bytes,
         fallback: outcome.candidate.layer_index > 0,
         translated: outcome.translated,
         request_bytes,
@@ -590,7 +719,8 @@ async fn execute_json_attempt(
         credential: Some(candidate.target.credential.clone()),
         route_layer: Some(candidate.layer_name.clone()),
         route_layer_index: Some(candidate.layer_index),
-        selection_reason: Some(candidate.selection_reason.into()),
+        selection_reason: Some(candidate.selection_reason.clone()),
+        matched_prefix_bytes: candidate.matched_prefix_bytes,
         upstream_model: runtime.client.model().into(),
         egress_protocol: egress,
         translated,
@@ -636,7 +766,7 @@ async fn handle_stream(
         .unwrap_or(0);
     let include_metadata = metadata_requested(&headers);
     let served_model = resolve_served_model(&state, protocol, &body).expect("validated model");
-    let candidates = route_candidates(&state, &served_model);
+    let candidates = route_candidates(&state, &served_model, protocol, &body);
     let mut fallback_reason = None;
     let mut last_failure = None;
     let mut last_candidate = None;
@@ -828,7 +958,8 @@ async fn handle_stream(
             credential:Some(candidate_for_stream.target.credential.clone()),
             route_layer:Some(candidate_for_stream.layer_name.clone()),
             route_layer_index:Some(candidate_for_stream.layer_index),
-            selection_reason:Some(candidate_for_stream.selection_reason.into()),
+            selection_reason:Some(candidate_for_stream.selection_reason.clone()),
+            matched_prefix_bytes:candidate_for_stream.matched_prefix_bytes,
             upstream_model,
             egress_protocol:egress,
             translated,
@@ -862,14 +993,15 @@ async fn handle_stream(
             credential:Some(candidate_for_stream.target.credential.clone()),
             route_layer:Some(candidate_for_stream.layer_name.clone()),
             route_layer_index:Some(candidate_for_stream.layer_index),
-            selection_reason:Some(candidate_for_stream.selection_reason.into()),
+            selection_reason:Some(candidate_for_stream.selection_reason.clone()),
+            matched_prefix_bytes:candidate_for_stream.matched_prefix_bytes,
             fallback:candidate_for_stream.layer_index>0,
             translated,
             request_bytes,
             response_bytes,
             first_byte_ms:Some(first_byte_ms),
             total_ms:started.elapsed().as_millis() as u64,
-            usage,
+            usage:usage.clone(),
             claude_session_id,
             claude_agent_id,
             claude_parent_agent_id
@@ -879,6 +1011,7 @@ async fn handle_stream(
             runtime_for_stream.circuit.failure(class,None).await;
             record_alert_if_needed(&state_for_stream,&request_id_for_stream,&candidate_for_stream,class).await;
         } else {
+            observe_affinity(&state_for_stream,&candidate_for_stream,&usage);
             runtime_for_stream.circuit.success().await;
         }
     };
@@ -1148,7 +1281,8 @@ async fn terminal_failure(
         credential: candidate.map(|candidate| candidate.target.credential.clone()),
         route_layer: candidate.map(|candidate| candidate.layer_name.clone()),
         route_layer_index: candidate.map(|candidate| candidate.layer_index),
-        selection_reason: candidate.map(|candidate| candidate.selection_reason.into()),
+        selection_reason: candidate.map(|candidate| candidate.selection_reason.clone()),
+        matched_prefix_bytes: candidate.and_then(|candidate| candidate.matched_prefix_bytes),
         fallback: candidate.is_some_and(|candidate| candidate.layer_index > 0),
         translated: false,
         request_bytes,
@@ -1240,7 +1374,8 @@ fn failed_attempt(
         credential: Some(candidate.target.credential.clone()),
         route_layer: Some(candidate.layer_name.clone()),
         route_layer_index: Some(candidate.layer_index),
-        selection_reason: Some(candidate.selection_reason.into()),
+        selection_reason: Some(candidate.selection_reason.clone()),
+        matched_prefix_bytes: candidate.matched_prefix_bytes,
         upstream_model: model.into(),
         egress_protocol: egress,
         translated,
@@ -1386,7 +1521,7 @@ fn apply_metadata(
         ),
         (
             "x-relay-selection-reason",
-            candidate.selection_reason.into(),
+            candidate.selection_reason.clone(),
         ),
         ("x-relay-upstream-model", model.into()),
         (
@@ -1411,6 +1546,11 @@ fn apply_metadata(
         if let (Ok(name), Ok(value)) = (HeaderName::try_from(name), HeaderValue::try_from(value)) {
             headers.insert(name, value);
         }
+    }
+    if let Some(bytes) = candidate.matched_prefix_bytes
+        && let Ok(value) = HeaderValue::from_str(&bytes.to_string())
+    {
+        headers.insert("x-relay-matched-prefix-bytes", value);
     }
 }
 
@@ -1489,6 +1629,15 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         "active_provider":active_provider,
         "circuit":circuit,
         "targets":target_rows,
+        "affinity":{
+            "storage":"memory-only",
+            "leases":state.affinity.lease_count(),
+            "max_leases":state.config.affinity.max_leases,
+            "checkpoint_bytes":state.config.affinity.checkpoint_bytes,
+            "max_checkpoints_per_path":state.config.affinity.max_checkpoints_per_path,
+            "max_candidates_per_prefix":state.config.affinity.max_candidates_per_prefix,
+            "success_ttl_ms":state.config.affinity.success_ttl_ms,
+        },
         "deepseek_balance":{"display":display,"raw":balance},
         "alerts":alerts
     }))
@@ -1549,6 +1698,54 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affinity_canonicalization_ignores_transport_and_model_fields() {
+        let baseline = canonical_prompt_bytes(json!({
+            "model":"provider-model-a",
+            "messages":[{"role":"user","content":"same prompt"}],
+            "stream":false
+        }))
+        .unwrap();
+        let streaming = canonical_prompt_bytes(json!({
+            "model":"provider-model-b",
+            "messages":[{"role":"user","content":"same prompt"}],
+            "stream":true,
+            "stream_options":{"include_usage":true}
+        }))
+        .unwrap();
+        assert_eq!(baseline, streaming);
+    }
+
+    #[test]
+    fn affinity_canonicalization_preserves_prompt_semantics() {
+        let baseline = canonical_prompt_bytes(json!({
+            "model":"provider-model",
+            "messages":[{"role":"user","content":"same prompt"}],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+        }))
+        .unwrap();
+        for changed in [
+            json!({
+                "model":"provider-model",
+                "messages":[{"role":"assistant","content":"same prompt"}],
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+            }),
+            json!({
+                "model":"provider-model",
+                "messages":[{"role":"user","content":" same prompt"}],
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+            }),
+            json!({
+                "model":"provider-model",
+                "messages":[{"role":"user","content":"same prompt"}],
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
+            }),
+        ] {
+            assert_ne!(baseline, canonical_prompt_bytes(changed).unwrap());
+        }
+    }
+
     #[test]
     fn rejects_provider_selection() {
         assert!(has_provider_selector(

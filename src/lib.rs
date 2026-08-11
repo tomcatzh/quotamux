@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod app;
 pub mod circuit;
 pub mod config;

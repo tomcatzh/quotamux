@@ -1,6 +1,6 @@
 # Prompt-prefix affinity routing
 
-Status: active design; phase-three implementation contract
+Status: implemented; process-local memory-only selector
 
 Prompt-prefix affinity routes any two requests with an identical effective
 prompt prefix to an upstream cache domain that is likely to retain that prefix.
@@ -50,19 +50,19 @@ counts as evidence that requires a coordinate adapter.
 ## Checkpoints and hashing
 
 The algorithm is incremental and independent of transport chunking. The initial
-implementation uses a 128-bit streaming non-cryptographic hash at sparse
-checkpoints rather than storing every character prefix.
+implementation uses keyed BLAKE3 truncated to 128 bits at sparse checkpoints
+rather than storing every character prefix. A new random key is generated for
+each QuotaMux process because the affinity directory itself is memory-only.
 
-Checkpoint boundaries include semantic message/tool boundaries and a fixed
-interval over canonical bytes or Unicode scalar values. The interval is a
-configuration/tuning parameter, initially chosen to keep metadata bounded. A
-checkpoint key contains the namespace, checkpoint ordinal/length, and 128-bit
-fingerprint. Length is part of the key even when the hash is 128-bit.
+The current runtime places checkpoints at a fixed interval over canonical
+provider-request bytes. Message roles, content, tools, and schemas remain
+distinct because they are preserved in that deterministic representation and
+its namespace. The interval is configurable. A checkpoint key contains the
+namespace, checkpoint ordinal/length, and 128-bit fingerprint. Length is part
+of the key even when the hash is 128-bit.
 
-When the caller is untrusted, the implementation must prevent cheap deliberate
-collision/route steering. A keyed hash or a per-installation secret finalizer is
-preferred if the chosen non-cryptographic primitive is not denial-of-service
-resistant.
+The process-local key prevents an untrusted caller from cheaply constructing a
+chosen collision to steer routes.
 
 ## Cache-domain leases and frontier epochs
 
@@ -99,11 +99,13 @@ it must never fabricate a longer or longer-lived cache claim.
 
 ## Provider evidence and TTL semantics
 
-Provider-reported cached tokens are evidence, not a character offset. Mapping
-them to a safe checkpoint requires a provider/model tokenizer and chat-template
-adapter, or a deliberately conservative approximation. The safe frontier is the
-greatest checkpoint whose required token count is no greater than the reported
-cached-token count.
+Provider-reported cached tokens are evidence, not a character offset. The first
+runtime records a completed request's full processed path as short-lived
+success evidence; when the response reports cached tokens, it also records the
+count and raises the evidence confidence. It does not claim that the token count
+maps to a particular byte checkpoint. A future provider/model tokenizer and
+chat-template adapter can replace this creation-based assumption with a
+verified token-to-checkpoint frontier.
 
 Provider cache TTL behavior is explicit:
 
@@ -115,7 +117,12 @@ Provider cache TTL behavior is explicit:
   hard upstream guarantee.
 
 Logical expiry is immediate (`expires_at <= now` is a miss). Physical deletion
-is lazy and batched.
+from the in-memory maps is lazy and batched.
+
+Memory growth is explicitly bounded by `max_checkpoints_per_path` and
+`max_leases`, in addition to the per-prefix candidate limit. Capacity eviction
+or checkpoint truncation may cause a conservative false negative; neither may
+create a cache claim.
 
 ## Lookup and selection
 
@@ -127,41 +134,29 @@ For a layer with more than one eligible target:
 4. Combine affinity with health/circuit eligibility. Version one of the library
    uses longest prefix first and random tie-breaking.
 5. If no warm candidate exists, use the layer's normal random selector.
-6. Mark the selected path pending with a short lease if configured, preventing a
-   burst of identical cold requests from warming different targets.
-7. After the upstream result, use actual cached-token evidence when present;
-   otherwise add only lower-confidence success evidence.
+6. After a complete upstream result, add short-lived success evidence; retain
+   provider-reported cached-token counts and confidence when present.
+
+Pending admission control for bursts of identical cold requests is intentionally
+left for a later selector revision.
 
 If a layer has exactly one eligible target, QuotaMux skips canonical encoding,
 hashing, index lookup, and affinity bookkeeping for that selection.
 
-## Storage architecture
+## Memory-only lifecycle
 
-The in-memory index is authoritative for the online data path:
+The prefix directory is deliberately process-local and purely in memory:
 
 ```text
 request -> memory PrefixIndex -> selection
-                         |
-                         +-> bounded mutation channel
-                                   |
-                                   +-> single batch writer -> redb
 ```
 
-redb is a warm-restart persistence/checkpoint layer, not a request-path lookup
-database. One writer batches insert/update operations and expiry cleanup into
-transactions. TTL refresh may leave stale expiry-index rows; GC validates the
-current lease version before deleting the live prefix/lease.
-
-Suggested redb tables:
-
-- prefix key -> bounded lease references;
-- lease ID -> cache domain, path/checkpoints, epochs, version;
-- expiry bucket + lease ID + version -> empty value.
-
-At startup QuotaMux scans persisted leases, drops expired evidence, rebuilds the
-memory index, and tolerates losing all affinity metadata. A worker restart or
-cache-domain generation change invalidates prior leases even when their wall
-clock TTL has not elapsed.
+There is no redb table, mutation writer, snapshot, or warm-restart restore for
+affinity metadata. Restarting QuotaMux starts with an empty directory. This can
+temporarily reduce cache hit rate, but cannot affect response semantics because
+the directory is only a routing optimization hint. Request/attempt observability
+continues to use the existing store; prompt fingerprints, leases, and TTL epochs
+do not.
 
 ## Library boundary
 
@@ -172,12 +167,12 @@ storage. Its public operations are conceptually:
 ```text
 fingerprint(canonical chunks) -> checkpoints
 lookup(namespace, checkpoints, eligible domains, now) -> optional match
-observe(path, domain, cache evidence, now) -> mutations
+observe(path, domain, cache evidence, now) -> updated memory state
 expire(now) -> removed counts
-snapshot/restore -> persistence records
 ```
 
-Time, randomness, and persistence are injected so tests are deterministic.
+Time, randomness, and the keyed hash secret are injected so tests are
+deterministic. Production creates a new secret for each process.
 
 ## Test matrix and concrete evidence
 
@@ -194,12 +189,13 @@ The library is accepted only with data-bearing assertions:
 - lookup returns exact matched checkpoint length and target, not only a boolean;
 - expired evidence is ignored before GC and removed after GC;
 - candidate pruning never returns a checkpoint not actually covered;
-- restart restoration produces the same valid lookup result and drops expired
-  entries;
+- constructing a new directory starts empty and cannot discover leases from a
+  previous instance;
 - simultaneous observations and lookups remain race-free and bounded;
 - an end-to-end mock-worker run records request count by target, matched prefix
   length, selection reason, and reported cache-hit tokens;
-- the real-worker experiment records sanitized JSON/CSV evidence containing
-  timestamp, request case ID, target identity, matched prefix length,
-  provider-reported input/cache-hit tokens, and success/failure. It records no
-  prompt bodies or API keys.
+- the real-worker experiment records sanitized evidence containing target
+  identity, matched prefix length, provider-reported input/cache-hit tokens,
+  and success/failure. It records no prompt bodies or API keys.
+
+The current captured results are in [test-evidence.md](test-evidence.md).

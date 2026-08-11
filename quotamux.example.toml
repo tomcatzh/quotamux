@@ -8,6 +8,14 @@ config_version = 2
 listen = "0.0.0.0:8080"
 data_dir = "./data"
 
+# Prefix affinity metadata is process-local and never written to redb.
+[affinity]
+checkpoint_bytes = 128
+max_checkpoints_per_path = 4096
+max_candidates_per_prefix = 8
+max_leases = 16384
+success_ttl_ms = 300000
+
 # Provider definitions use exact upstream model IDs. Official provider kinds
 # supply their standard endpoint unless endpoint is explicitly overridden.
 [[providers]]
@@ -41,6 +49,8 @@ aliases = ["deepseek-v4-flash"]
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 
 # Layers are attempted in order. One target skips random/affinity work.
+# Use strategy = "prompt-prefix-affinity" when a layer has multiple equivalent
+# cache domains; the current single-target layer intentionally stays random.
 [[models.layers]]
 name = "plan"
 strategy = "random"

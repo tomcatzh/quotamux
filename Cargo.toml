@@ -10,9 +10,11 @@ repository = "https://github.com/tomcatzh/quotamux"
 async-stream = "0.3.6"
 axum = { version = "0.8.9", features = ["http1", "http2", "json", "tokio"] }
 bytes = "1.11.1"
+blake3 = "1.8.5"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
 futures-util = "0.3.33"
+getrandom = "0.4.3"
 httpdate = "1.0.3"
 redb = "4.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "json", "stream"] }

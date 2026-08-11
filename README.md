@@ -9,7 +9,7 @@ to later capacity/price layers before a response is committed.
 ```sh
 cp quotamux.example.toml quotamux.toml
 # Add provider API keys and validate every route reference.
-cargo run -- --check
+cargo run --bin quotamux -- --check
 docker compose up --build -d
 ```
 
@@ -27,7 +27,9 @@ Clients cannot select a provider. Send `X-Relay-Include-Metadata: 1` to receive 
 
 See [the v2 routing architecture](docs/routing-architecture-v2.md) for the
 provider → route layer → served model configuration and
-[the affinity design](docs/prompt-prefix-affinity.md) for the next selector.
+[the affinity design](docs/prompt-prefix-affinity.md) for the optional
+memory-only prefix selector. Captured verification data is in
+[the test evidence report](docs/test-evidence.md).
 
 ## Test
 
