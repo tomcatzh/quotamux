@@ -6,8 +6,6 @@ use tokio::sync::Mutex;
 
 use crate::{store::Store, types::FailureClass};
 
-const CIRCUIT_KEY: &str = "opencode-go-circuit";
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CircuitMode {
@@ -51,12 +49,14 @@ pub enum RouteDecision {
 pub struct CircuitBreaker {
     state: Mutex<CircuitSnapshot>,
     store: Store,
+    store_key: String,
 }
 
 impl CircuitBreaker {
-    pub fn load(store: Store) -> Result<Self, String> {
+    pub fn load(store: Store, store_key: impl Into<String>) -> Result<Self, String> {
+        let store_key = store_key.into();
         let mut state = store
-            .get_state::<CircuitSnapshot>(CIRCUIT_KEY)?
+            .get_state::<CircuitSnapshot>(&store_key)?
             .unwrap_or_default();
         if state.mode == CircuitMode::HalfOpen {
             state.mode = CircuitMode::Open;
@@ -65,6 +65,7 @@ impl CircuitBreaker {
         Ok(Self {
             state: Mutex::new(state),
             store,
+            store_key,
         })
     }
 
@@ -144,7 +145,7 @@ impl CircuitBreaker {
     }
 
     fn persist(&self, state: &CircuitSnapshot) {
-        if let Err(error) = self.store.put_state(CIRCUIT_KEY, state) {
+        if let Err(error) = self.store.put_state(&self.store_key, state) {
             tracing::error!(%error, "failed to persist circuit state");
         }
     }
@@ -189,7 +190,7 @@ mod tests {
     async fn transient_failures_use_exponential_backoff() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let circuit = CircuitBreaker::load(store).unwrap();
+        let circuit = CircuitBreaker::load(store, "test-circuit").unwrap();
         circuit.failure(FailureClass::ProviderTransient, None).await;
         let first = circuit.snapshot().await;
         assert_eq!(first.mode, CircuitMode::Open);
@@ -201,7 +202,7 @@ mod tests {
     async fn auth_failure_suspends_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let circuit = CircuitBreaker::load(store).unwrap();
+        let circuit = CircuitBreaker::load(store, "test-circuit").unwrap();
         circuit.failure(FailureClass::ProviderAuth, None).await;
         assert_eq!(circuit.snapshot().await.mode, CircuitMode::Suspended);
     }
@@ -210,7 +211,7 @@ mod tests {
     async fn success_resets_circuit() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let circuit = CircuitBreaker::load(store).unwrap();
+        let circuit = CircuitBreaker::load(store, "test-circuit").unwrap();
         circuit.failure(FailureClass::ProviderTransient, None).await;
         circuit.success().await;
         assert_eq!(circuit.snapshot().await.mode, CircuitMode::Closed);

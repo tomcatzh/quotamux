@@ -1,27 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Provider {
-    OpenCodeGo,
-    DeepSeek,
-}
+use crate::config::ProviderKind;
 
-impl Provider {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenCodeGo => "opencode-go",
-            Self::DeepSeek => "deepseek",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Protocol {
+    #[serde(rename = "openai-chat")]
     OpenAiChat,
+    #[serde(rename = "openai-responses")]
     OpenAiResponses,
+    #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
 }
 
@@ -212,7 +200,17 @@ pub struct RequestRecord {
     pub streaming: bool,
     pub status: u16,
     pub error_class: Option<FailureClass>,
-    pub provider: Option<Provider>,
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub provider_kind: Option<ProviderKind>,
+    #[serde(default)]
+    pub credential: Option<String>,
+    #[serde(default)]
+    pub route_layer: Option<String>,
+    #[serde(default)]
+    pub route_layer_index: Option<usize>,
+    #[serde(default)]
+    pub selection_reason: Option<String>,
     pub fallback: bool,
     pub translated: bool,
     pub request_bytes: u64,
@@ -230,7 +228,17 @@ pub struct AttemptRecord {
     pub id: String,
     pub request_id: Option<String>,
     pub sequence: u32,
-    pub provider: Provider,
+    pub provider: String,
+    #[serde(default)]
+    pub provider_kind: Option<ProviderKind>,
+    #[serde(default)]
+    pub credential: Option<String>,
+    #[serde(default)]
+    pub route_layer: Option<String>,
+    #[serde(default)]
+    pub route_layer_index: Option<usize>,
+    #[serde(default)]
+    pub selection_reason: Option<String>,
     pub upstream_model: String,
     pub egress_protocol: Protocol,
     pub translated: bool,
@@ -253,7 +261,11 @@ pub struct AttemptRecord {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AlertRecord {
     pub id: String,
-    pub provider: Provider,
+    pub provider: String,
+    #[serde(default)]
+    pub provider_kind: Option<ProviderKind>,
+    #[serde(default)]
+    pub credential: Option<String>,
     pub class: FailureClass,
     pub active: bool,
     pub first_seen_ms: i64,

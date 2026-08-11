@@ -1,12 +1,15 @@
 # QuotaMux
 
-QuotaMux is a local gateway for DeepSeek V4 Flash 0731. It uses OpenCode Go first and falls back to the official DeepSeek API before a response is committed.
+QuotaMux is a local, layered model gateway. It exposes user-defined model names,
+routes across equivalent provider credentials inside each layer, and falls back
+to later capacity/price layers before a response is committed.
 
 ## Run
 
 ```sh
 cp quotamux.example.toml quotamux.toml
-# Add both API keys.
+# Add provider API keys and validate every route reference.
+cargo run -- --check
 docker compose up --build -d
 ```
 
@@ -21,6 +24,10 @@ The API and dashboard listen on `http://127.0.0.1:8080`.
 - `GET /v1/models`
 
 Clients cannot select a provider. Send `X-Relay-Include-Metadata: 1` to receive `X-Relay-*` routing headers.
+
+See [the v2 routing architecture](docs/routing-architecture-v2.md) for the
+provider → route layer → served model configuration and
+[the affinity design](docs/prompt-prefix-affinity.md) for the next selector.
 
 ## Test
 

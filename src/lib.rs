@@ -4,6 +4,7 @@ pub mod config;
 pub mod dashboard;
 pub mod protocol;
 pub mod provider;
+pub mod routing;
 pub mod sse;
 pub mod store;
 pub mod types;

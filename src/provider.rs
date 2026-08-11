@@ -7,16 +7,21 @@ use reqwest::{
 use serde_json::Value;
 
 use crate::{
-    config::ProviderConfig,
-    types::{FailureClass, Protocol, Provider},
+    config::{CredentialConfig, ProviderConfig, ProviderKind, ProviderModelConfig},
+    types::{FailureClass, Protocol},
 };
 
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub struct ProviderClient {
-    kind: Provider,
-    config: ProviderConfig,
+    provider_id: String,
+    credential_id: String,
+    kind: ProviderKind,
+    endpoint: String,
+    api_key: String,
+    model: String,
+    protocols: Vec<Protocol>,
     client: reqwest::Client,
 }
 
@@ -29,7 +34,11 @@ pub struct ProviderError {
 }
 
 impl ProviderClient {
-    pub fn new(kind: Provider, config: ProviderConfig) -> Result<Self, reqwest::Error> {
+    pub fn new(
+        provider: &ProviderConfig,
+        credential: &CredentialConfig,
+        model: &ProviderModelConfig,
+    ) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .user_agent(concat!("quotamux/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
@@ -39,20 +48,46 @@ impl ProviderClient {
             .http2_adaptive_window(true)
             .build()?;
         Ok(Self {
-            kind,
-            config,
+            provider_id: provider.id.clone(),
+            credential_id: credential.id.clone(),
+            kind: provider.kind,
+            endpoint: provider
+                .endpoint()
+                .expect("validated provider endpoint")
+                .to_string(),
+            api_key: credential.api_key.clone(),
+            model: model.name.clone(),
+            protocols: model.protocols.clone(),
             client,
         })
     }
 
-    pub const fn kind(&self) -> Provider {
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+    pub const fn kind(&self) -> ProviderKind {
         self.kind
     }
     pub fn model(&self) -> &str {
-        &self.config.model
+        &self.model
     }
     pub fn endpoint(&self) -> &str {
-        &self.config.endpoint
+        &self.endpoint
+    }
+    pub fn protocols(&self) -> &[Protocol] {
+        &self.protocols
+    }
+    pub fn protocol_for(&self, ingress: Protocol) -> Protocol {
+        if self.protocols.contains(&ingress) {
+            ingress
+        } else if self.protocols.contains(&Protocol::OpenAiChat) {
+            Protocol::OpenAiChat
+        } else {
+            self.protocols[0]
+        }
     }
 
     pub async fn send(
@@ -61,11 +96,13 @@ impl ProviderClient {
         body: &Value,
         inbound_headers: &HeaderMap,
     ) -> Result<Response, ProviderError> {
+        debug_assert!(self.protocols.contains(&protocol));
         let url = self.url(protocol);
         let mut request = self.client.post(url).json(body);
         match (self.kind, protocol) {
-            (Provider::DeepSeek, Protocol::AnthropicMessages) => {
-                request = request.header("x-api-key", &self.config.api_key).header(
+            (ProviderKind::DeepSeekOfficial, Protocol::AnthropicMessages)
+            | (ProviderKind::CustomAnthropic, Protocol::AnthropicMessages) => {
+                request = request.header("x-api-key", &self.api_key).header(
                     "anthropic-version",
                     inbound_headers
                         .get("anthropic-version")
@@ -76,7 +113,7 @@ impl ProviderClient {
                     request = request.header("anthropic-beta", beta);
                 }
             }
-            _ => request = request.bearer_auth(&self.config.api_key),
+            _ => request = request.bearer_auth(&self.api_key),
         }
 
         let response = request.send().await.map_err(|error| ProviderError {
@@ -104,14 +141,14 @@ impl ProviderClient {
     }
 
     pub async fn balance(&self) -> Result<Value, ProviderError> {
-        debug_assert_eq!(self.kind, Provider::DeepSeek);
+        debug_assert_eq!(self.kind, ProviderKind::DeepSeekOfficial);
         let response = self
             .client
             .get(format!(
                 "{}/user/balance",
-                self.config.endpoint.trim_end_matches('/')
+                self.endpoint.trim_end_matches('/')
             ))
-            .bearer_auth(&self.config.api_key)
+            .bearer_auth(&self.api_key)
             .send()
             .await
             .map_err(|error| ProviderError {
@@ -141,14 +178,17 @@ impl ProviderClient {
     }
 
     fn url(&self, protocol: Protocol) -> String {
-        let base = self.config.endpoint.trim_end_matches('/');
+        if self.kind.uses_exact_endpoint() {
+            return self.endpoint.clone();
+        }
+        let base = self.endpoint.trim_end_matches('/');
         match (self.kind, protocol) {
             (_, Protocol::OpenAiChat) => format!("{base}/chat/completions"),
-            (Provider::DeepSeek, Protocol::OpenAiResponses) => format!("{base}/responses"),
-            (Provider::DeepSeek, Protocol::AnthropicMessages) => {
+            (_, Protocol::OpenAiResponses) => format!("{base}/responses"),
+            (ProviderKind::DeepSeekOfficial, Protocol::AnthropicMessages) => {
                 format!("{base}/anthropic/v1/messages")
             }
-            (Provider::OpenCodeGo, _) => format!("{base}/chat/completions"),
+            (_, Protocol::AnthropicMessages) => format!("{base}/messages"),
         }
     }
 }

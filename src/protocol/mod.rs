@@ -5,8 +5,6 @@ pub mod responses;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
-use crate::config::{LOGICAL_MODEL, UPSTREAM_MODEL};
-
 #[derive(Debug)]
 pub struct ValidationError {
     pub status: StatusCode,
@@ -33,17 +31,14 @@ impl ValidationError {
     }
 }
 
-pub fn validate_model(body: &Value) -> Result<(), ValidationError> {
-    let model = body
-        .get("model")
+pub fn model_name(body: &Value) -> Result<&str, ValidationError> {
+    body.get("model")
         .and_then(Value::as_str)
-        .ok_or_else(|| ValidationError::invalid("model is required", Some("model")))?;
-    if !matches!(model, LOGICAL_MODEL | UPSTREAM_MODEL) {
-        return Err(ValidationError::invalid(
-            format!("unsupported model {model}; QuotaMux exposes only {LOGICAL_MODEL}"),
-            Some("model"),
-        ));
-    }
+        .ok_or_else(|| ValidationError::invalid("model is required", Some("model")))
+}
+
+pub fn validate_model(body: &Value) -> Result<(), ValidationError> {
+    model_name(body)?;
     if body.get("provider").is_some() {
         return Err(ValidationError::invalid(
             "clients cannot select a provider",

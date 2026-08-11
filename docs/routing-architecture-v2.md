@@ -69,8 +69,8 @@ The first implementation recognizes these provider kinds:
 - `custom-responses`
 - `custom-anthropic`
 
-Each enabled model records the provider protocol that actually serves it. This
-is model-specific: for example, OpenCode currently documents different
+Each enabled model records every provider protocol that actually serves it.
+This is model-specific: for example, OpenCode currently documents different
 endpoints for Responses, Anthropic Messages, and Chat Completions models. The
 configuration is explicit even when QuotaMux can infer a default, so validation
 can reject an impossible route before startup.
@@ -90,9 +90,10 @@ be guessed:
   <https://platform.kimi.com/docs/overview>
 - Alibaba Cloud Model Studio model IDs and endpoints vary by model and region:
   <https://help.aliyun.com/en/model-studio/models>
-- Ollama Cloud lists models through `https://ollama.com/api/tags` and uses its
-  native chat API:
-  <https://docs.ollama.com/cloud>
+- Ollama lists cloud models through `https://ollama.com/api/tags`; its official
+  compatibility API documents both Chat Completions and Responses, so an
+  enabled cloud model may explicitly declare either supported protocol:
+  <https://docs.ollama.com/api/openai-compatibility>
 
 ## Served-model layer
 
@@ -185,7 +186,7 @@ api_key = "..."
 
 [[providers.models]]
 name = "deepseek-v4-flash"
-protocol = "openai-chat"
+protocols = ["openai-chat"]
 
 [[providers]]
 id = "deepseek"
@@ -197,7 +198,7 @@ api_key = "..."
 
 [[providers.models]]
 name = "deepseek-v4-flash"
-protocol = "openai-chat"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 
 [[models]]
 name = "deepseek-v4-flash-0731"

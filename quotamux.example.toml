@@ -1,6 +1,6 @@
-# QuotaMux version-one configuration.
+# QuotaMux version-two layered routing configuration.
 # Copy this file to quotamux.toml and keep the populated file private.
-config_version = 1
+config_version = 2
 
 [server]
 # Docker publishes this port on 127.0.0.1; QuotaMux listens on all container
@@ -8,21 +8,49 @@ config_version = 1
 listen = "0.0.0.0:8080"
 data_dir = "./data"
 
-[model]
-# Version one exposes one logical model. Clients cannot choose a provider.
-logical_name = "deepseek-v4-flash-0731"
+# Provider definitions use exact upstream model IDs. Official provider kinds
+# supply their standard endpoint unless endpoint is explicitly overridden.
+[[providers]]
+id = "opencode-go"
+kind = "opencode-go"
 
-[providers.opencode_go]
-# OpenCode Go API root. QuotaMux appends /chat/completions.
-endpoint = "https://opencode.ai/zen/go/v1"
+[[providers.credentials]]
+id = "go-plan"
 api_key = ""
-# OpenCode Go exposes the current Flash release through this rolling alias.
-model = "deepseek-v4-flash"
 
-[providers.deepseek]
-# Official API root. QuotaMux uses the official Chat Completions, Responses,
-# or Anthropic-compatible path according to the client ingress protocol.
-endpoint = "https://api.deepseek.com"
+[[providers.models]]
+name = "deepseek-v4-flash"
+protocols = ["openai-chat"]
+
+[[providers]]
+id = "deepseek"
+kind = "deepseek-official"
+
+[[providers.credentials]]
+id = "deepseek-payg"
 api_key = ""
-# This is DeepSeek's public rolling alias for the current Flash release.
-model = "deepseek-v4-flash"
+
+[[providers.models]]
+name = "deepseek-v4-flash"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+# QuotaMux owns this public model name and its explicit compatibility alias.
+[[models]]
+name = "deepseek-v4-flash-0731"
+aliases = ["deepseek-v4-flash"]
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+# Layers are attempted in order. One target skips random/affinity work.
+[[models.layers]]
+name = "plan"
+strategy = "random"
+targets = [
+  { provider = "opencode-go", credential = "go-plan", model = "deepseek-v4-flash" },
+]
+
+[[models.layers]]
+name = "payg"
+strategy = "random"
+targets = [
+  { provider = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
+]

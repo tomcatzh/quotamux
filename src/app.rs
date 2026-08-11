@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     convert::Infallible,
     sync::Arc,
     time::{Duration, Instant},
@@ -26,13 +26,14 @@ use uuid::Uuid;
 
 use crate::{
     circuit::{CircuitBreaker, RouteDecision},
-    config::{Config, LOGICAL_MODEL},
+    config::{Config, ProviderKind, RouteTargetConfig, ServedModelConfig},
     dashboard::INDEX_HTML,
     protocol::{self, ValidationError, anthropic, chat, responses},
     provider::{ProviderClient, ProviderError},
+    routing::RandomSelector,
     sse::{SseDecoder, SseEvent},
     store::Store,
-    types::{AlertRecord, AttemptRecord, FailureClass, Protocol, Provider, RequestRecord, Usage},
+    types::{AlertRecord, AttemptRecord, FailureClass, Protocol, RequestRecord, Usage},
 };
 
 const METADATA_HEADER: &str = "x-relay-include-metadata";
@@ -40,39 +41,90 @@ const METADATA_HEADER: &str = "x-relay-include-metadata";
 pub struct AppState {
     pub config: Config,
     pub store: Store,
-    pub circuit: Arc<CircuitBreaker>,
-    primary: ProviderClient,
-    fallback: ProviderClient,
+    targets: HashMap<RouteTargetConfig, Arc<TargetRuntime>>,
+    selector: RandomSelector,
+    balance_client: Option<ProviderClient>,
     started_at_ms: i64,
     balance: RwLock<Option<Value>>,
 }
 
+struct TargetRuntime {
+    client: ProviderClient,
+    circuit: Arc<CircuitBreaker>,
+}
+
 impl AppState {
     pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_selector(config, RandomSelector::default()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn new_with_random_seed(
+        config: Config,
+        seed: u64,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_selector(config, RandomSelector::with_seed(seed)).await
+    }
+
+    async fn new_with_selector(
+        config: Config,
+        selector: RandomSelector,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        config.validate()?;
         let store = Store::open(&config.server.data_dir)?;
-        let circuit = Arc::new(CircuitBreaker::load(store.clone())?);
-        let primary =
-            ProviderClient::new(Provider::OpenCodeGo, config.providers.opencode_go.clone())?;
-        let fallback = ProviderClient::new(Provider::DeepSeek, config.providers.deepseek.clone())?;
+        let mut targets = HashMap::new();
+        let mut balance_client = None;
+        for served_model in &config.models {
+            for layer in &served_model.layers {
+                for target in &layer.targets {
+                    if let Entry::Vacant(entry) = targets.entry(target.clone()) {
+                        let provider = config
+                            .provider(&target.provider)
+                            .expect("validated route provider");
+                        let credential = provider
+                            .credential(&target.credential)
+                            .expect("validated route credential");
+                        let model = provider
+                            .model(&target.model)
+                            .expect("validated route model");
+                        let client = ProviderClient::new(provider, credential, model)?;
+                        if balance_client.is_none()
+                            && provider.kind == ProviderKind::DeepSeekOfficial
+                        {
+                            balance_client = Some(client.clone());
+                        }
+                        let circuit_key = format!(
+                            "circuit:{}:{}:{}",
+                            target.provider, target.credential, target.model
+                        );
+                        let circuit = Arc::new(CircuitBreaker::load(store.clone(), circuit_key)?);
+                        entry.insert(Arc::new(TargetRuntime { client, circuit }));
+                    }
+                }
+            }
+        }
         let balance = store.get_state("deepseek-balance").unwrap_or(None);
         Ok(Self {
             config,
             store,
-            circuit,
-            primary,
-            fallback,
+            targets,
+            selector,
+            balance_client,
             started_at_ms: Utc::now().timestamp_millis(),
             balance: RwLock::new(balance),
         })
     }
 
     pub fn start_background(self: &Arc<Self>) {
+        let Some(balance_client) = self.balance_client.clone() else {
+            return;
+        };
         let state = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(15 * 60));
             loop {
                 interval.tick().await;
-                match state.fallback.balance().await {
+                match balance_client.balance().await {
                     Ok(balance) => {
                         *state.balance.write().await = Some(balance.clone());
                         if let Err(error) = state.store.put_state("deepseek-balance", &balance) {
@@ -109,15 +161,22 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(
-        json!({"status":"ok","model":LOGICAL_MODEL,"uptime_seconds":(Utc::now().timestamp_millis()-state.started_at_ms)/1000}),
-    )
+    Json(json!({
+        "status":"ok",
+        "models":state.config.models.iter().map(|model|model.name.as_str()).collect::<Vec<_>>(),
+        "uptime_seconds":(Utc::now().timestamp_millis()-state.started_at_ms)/1000
+    }))
 }
 
-async fn models() -> Json<Value> {
-    Json(
-        json!({"object":"list","data":[{"id":LOGICAL_MODEL,"object":"model","created":0,"owned_by":"quotamux"},{"id":"deepseek-v4-flash","object":"model","created":0,"owned_by":"quotamux"}]}),
-    )
+async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let data = state
+        .config
+        .models
+        .iter()
+        .flat_map(|model| std::iter::once(&model.name).chain(model.aliases.iter()))
+        .map(|name| json!({"id":name,"object":"model","created":0,"owned_by":"quotamux"}))
+        .collect::<Vec<_>>();
+    Json(json!({"object":"list","data":data}))
 }
 
 async fn chat_completions(
@@ -144,7 +203,11 @@ async fn anthropic_messages(
     handle_inference(state, Protocol::AnthropicMessages, headers, body).await
 }
 
-async fn count_tokens(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     if has_provider_selector(&headers, &body) {
         return client_error(
             Protocol::AnthropicMessages,
@@ -152,7 +215,7 @@ async fn count_tokens(headers: HeaderMap, Json(body): Json<Value>) -> Response {
             Some("provider"),
         );
     }
-    if let Err(error) = protocol::validate_model(&body) {
+    if let Err(error) = resolve_served_model(&state, Protocol::AnthropicMessages, &body) {
         return validation_error(Protocol::AnthropicMessages, error);
     }
     Json(json!({"input_tokens":anthropic::estimate_tokens(&body),"x_quotamux_estimated":true}))
@@ -172,12 +235,87 @@ async fn handle_inference(
             Some("provider"),
         );
     }
+    if let Err(error) = resolve_served_model(&state, protocol, &body) {
+        return validation_error(protocol, error);
+    }
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if streaming {
         handle_stream(state, protocol, headers, body).await
     } else {
         handle_nonstream(state, protocol, headers, body).await
     }
+}
+
+fn resolve_served_model(
+    state: &AppState,
+    protocol: Protocol,
+    body: &Value,
+) -> Result<ServedModelConfig, ValidationError> {
+    let requested = protocol::model_name(body)?;
+    let model = state.config.resolve_model(requested).ok_or_else(|| {
+        ValidationError::invalid(format!("unsupported model {requested}"), Some("model"))
+    })?;
+    if !model.protocols.contains(&protocol) {
+        return Err(ValidationError::invalid(
+            format!(
+                "model {requested} is not exposed through {}",
+                protocol.as_str()
+            ),
+            Some("model"),
+        ));
+    }
+    Ok(model.clone())
+}
+
+#[derive(Clone)]
+struct RouteCandidate {
+    target: RouteTargetConfig,
+    layer_name: String,
+    layer_index: usize,
+    selection_reason: &'static str,
+    probe: bool,
+}
+
+fn route_candidates(state: &AppState, model: &ServedModelConfig) -> Vec<RouteCandidate> {
+    let mut candidates = Vec::new();
+    for (layer_index, layer) in model.layers.iter().enumerate() {
+        let order = state.selector.order(layer.targets.len());
+        let selection_reason = if layer.targets.len() == 1 {
+            "single-target"
+        } else {
+            "random"
+        };
+        for target_index in order {
+            let target = layer.targets[target_index].clone();
+            candidates.push(RouteCandidate {
+                target,
+                layer_name: layer.name.clone(),
+                layer_index,
+                selection_reason,
+                probe: false,
+            });
+        }
+    }
+    candidates
+}
+
+fn target_runtime<'a>(state: &'a AppState, target: &RouteTargetConfig) -> &'a TargetRuntime {
+    state.targets.get(target).expect("validated runtime target")
+}
+
+fn terminal_route_failure(
+    failure: Option<AttemptFailure>,
+    candidate: Option<RouteCandidate>,
+) -> (AttemptFailure, Option<RouteCandidate>) {
+    let failure = failure.unwrap_or_else(|| AttemptFailure {
+        error: ProviderError {
+            class: FailureClass::FallbackUnavailable,
+            status: Some(StatusCode::SERVICE_UNAVAILABLE),
+            retry_after: None,
+            safe_message: "no route target is currently available".into(),
+        },
+    });
+    (failure, candidate)
 }
 
 async fn handle_nonstream(
@@ -193,116 +331,95 @@ async fn handle_nonstream(
         .map(|v| v.len() as u64)
         .unwrap_or(0);
     let include_metadata = metadata_requested(&headers);
-    let decision = state.circuit.decide().await;
-    let (first_provider, probe, circuit_reason) = match decision {
-        RouteDecision::Primary { probe } => (Provider::OpenCodeGo, probe, None),
-        RouteDecision::Fallback { reason } => (Provider::DeepSeek, false, reason),
-    };
-
-    let first = execute_json_attempt(
-        &state,
-        first_provider,
-        protocol,
-        &headers,
-        &body,
-        &request_id,
-        1,
-        probe,
-        started,
-    )
-    .await;
-    let outcome = match first {
-        Ok(mut success) => {
-            if first_provider == Provider::OpenCodeGo {
-                state.circuit.success().await;
-            } else {
-                success.fallback_reason = circuit_reason;
+    let served_model = resolve_served_model(&state, protocol, &body).expect("validated model");
+    let candidates = route_candidates(&state, &served_model);
+    let mut fallback_reason = None;
+    let mut last_failure = None;
+    let mut last_candidate = None;
+    let mut outcome = None;
+    let mut sequence = 0_u32;
+    for mut candidate in candidates {
+        let runtime = target_runtime(&state, &candidate.target);
+        match runtime.circuit.decide().await {
+            RouteDecision::Primary { probe } => candidate.probe = probe,
+            RouteDecision::Fallback { reason } => {
+                fallback_reason = fallback_reason.or(reason);
+                continue;
             }
-            success
         }
-        Err(failure)
-            if first_provider == Provider::OpenCodeGo && failure.error.class.allows_fallback() =>
+        sequence += 1;
+        match execute_json_attempt(
+            &state,
+            &candidate,
+            runtime,
+            protocol,
+            &headers,
+            &body,
+            &request_id,
+            sequence,
+            started,
+        )
+        .await
         {
-            state
-                .circuit
-                .failure(failure.error.class, failure.error.retry_after)
-                .await;
-            record_alert_if_needed(&state, &request_id, failure.error.class).await;
-            match execute_json_attempt(
-                &state,
-                Provider::DeepSeek,
-                protocol,
-                &headers,
-                &body,
-                &request_id,
-                2,
-                false,
-                started,
-            )
-            .await
-            {
-                Ok(mut success) => {
-                    success.fallback_reason = Some(failure.error.class);
-                    success
-                }
-                Err(fallback) => {
-                    return terminal_failure(
-                        &state,
-                        protocol,
-                        &request_id,
-                        started_at_ms,
-                        started,
-                        request_bytes,
-                        fallback,
-                        true,
-                        include_metadata,
-                        Some(failure.error.class),
-                    )
-                    .await;
-                }
+            Ok(mut success) => {
+                runtime.circuit.success().await;
+                success.fallback_reason = fallback_reason;
+                outcome = Some(success);
+                break;
             }
-        }
-        Err(failure) => {
-            if first_provider == Provider::OpenCodeGo {
-                state
+            Err(failure) => {
+                let allows_fallback = failure.error.class.allows_fallback();
+                runtime
                     .circuit
                     .failure(failure.error.class, failure.error.retry_after)
                     .await;
-                record_alert_if_needed(&state, &request_id, failure.error.class).await;
+                record_alert_if_needed(&state, &request_id, &candidate, failure.error.class).await;
+                fallback_reason.get_or_insert(failure.error.class);
+                last_candidate = Some(candidate.clone());
+                last_failure = Some(failure);
+                if !allows_fallback {
+                    break;
+                }
             }
-            return terminal_failure(
-                &state,
-                protocol,
-                &request_id,
-                started_at_ms,
-                started,
-                request_bytes,
-                failure,
-                first_provider == Provider::DeepSeek,
-                include_metadata,
-                circuit_reason,
-            )
-            .await;
         }
+    }
+    let Some(outcome) = outcome else {
+        let (failure, candidate) = terminal_route_failure(last_failure, last_candidate);
+        return terminal_failure(
+            &state,
+            protocol,
+            &request_id,
+            started_at_ms,
+            started,
+            request_bytes,
+            failure,
+            candidate.as_ref(),
+            include_metadata,
+            fallback_reason,
+        )
+        .await;
     };
 
     let response_bytes = serde_json::to_vec(&outcome.body).unwrap_or_default();
-    let usage = usage_for(protocol, &outcome.raw_upstream);
+    let usage = usage_for(outcome.egress, &outcome.raw_upstream);
     let record = RequestRecord {
         id: request_id.clone(),
         started_at_ms,
         completed_at_ms: Utc::now().timestamp_millis(),
         protocol,
-        requested_model: body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or(LOGICAL_MODEL)
+        requested_model: protocol::model_name(&body)
+            .unwrap_or(&served_model.name)
             .into(),
         streaming: false,
         status: 200,
         error_class: None,
-        provider: Some(outcome.provider),
-        fallback: outcome.provider == Provider::DeepSeek,
+        provider: Some(outcome.candidate.target.provider.clone()),
+        provider_kind: Some(outcome.provider_kind),
+        credential: Some(outcome.candidate.target.credential.clone()),
+        route_layer: Some(outcome.candidate.layer_name.clone()),
+        route_layer_index: Some(outcome.candidate.layer_index),
+        selection_reason: Some(outcome.candidate.selection_reason.into()),
+        fallback: outcome.candidate.layer_index > 0,
         translated: outcome.translated,
         request_bytes,
         response_bytes: response_bytes.len() as u64,
@@ -319,8 +436,8 @@ async fn handle_nonstream(
         &mut response,
         include_metadata,
         &request_id,
-        outcome.provider,
-        state_provider(&state, outcome.provider).model(),
+        &outcome.candidate,
+        &outcome.candidate.target.model,
         outcome.fallback_reason,
         protocol,
         outcome.egress,
@@ -330,7 +447,8 @@ async fn handle_nonstream(
 }
 
 struct JsonSuccess {
-    provider: Provider,
+    candidate: RouteCandidate,
+    provider_kind: ProviderKind,
     egress: Protocol,
     translated: bool,
     body: Value,
@@ -346,54 +464,49 @@ struct AttemptFailure {
 #[allow(clippy::too_many_arguments)]
 async fn execute_json_attempt(
     state: &Arc<AppState>,
-    provider: Provider,
+    candidate: &RouteCandidate,
+    runtime: &TargetRuntime,
     ingress: Protocol,
     headers: &HeaderMap,
     original: &Value,
     request_id: &str,
     sequence: u32,
-    probe: bool,
     request_started: Instant,
 ) -> Result<JsonSuccess, AttemptFailure> {
     let attempt_id = Uuid::now_v7().to_string();
     let started_at_ms = Utc::now().timestamp_millis();
     let started = Instant::now();
-    let (egress, translated, prepared) = match prepare_for_provider(
-        provider,
-        ingress,
-        original,
-        state_provider(state, provider).model(),
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(AttemptFailure {
-                error: ProviderError {
-                    class: FailureClass::ClientRequest,
-                    status: Some(error.status),
-                    retry_after: None,
-                    safe_message: error.message,
-                },
-            });
-        }
-    };
+    let provider_protocol = runtime.client.protocol_for(ingress);
+    let (egress, translated, prepared) =
+        match prepare_for_provider(provider_protocol, ingress, original, runtime.client.model()) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(AttemptFailure {
+                    error: ProviderError {
+                        class: FailureClass::ClientRequest,
+                        status: Some(error.status),
+                        retry_after: None,
+                        safe_message: error.message,
+                    },
+                });
+            }
+        };
     let request_bytes = serde_json::to_vec(&prepared)
         .map(|v| v.len() as u64)
         .unwrap_or(0);
-    let response = match state_provider(state, provider)
-        .send(egress, &prepared, headers)
-        .await
-    {
+    let response = match runtime.client.send(egress, &prepared, headers).await {
         Ok(response) => response,
         Err(error) => {
             let record = failed_attempt(
                 &attempt_id,
                 Some(request_id),
                 sequence,
-                provider,
-                state_provider(state, provider).model(),
+                candidate,
+                runtime.client.kind(),
+                runtime.client.model(),
                 egress,
                 translated,
-                probe,
+                candidate.probe,
                 started_at_ms,
                 started,
                 request_bytes,
@@ -418,11 +531,12 @@ async fn execute_json_attempt(
                 &attempt_id,
                 Some(request_id),
                 sequence,
-                provider,
-                state_provider(state, provider).model(),
+                candidate,
+                runtime.client.kind(),
+                runtime.client.model(),
                 egress,
                 translated,
-                probe,
+                candidate.probe,
                 started_at_ms,
                 started,
                 request_bytes,
@@ -445,11 +559,12 @@ async fn execute_json_attempt(
                 &attempt_id,
                 Some(request_id),
                 sequence,
-                provider,
-                state_provider(state, provider).model(),
+                candidate,
+                runtime.client.kind(),
+                runtime.client.model(),
                 egress,
                 translated,
-                probe,
+                candidate.probe,
                 started_at_ms,
                 started,
                 request_bytes,
@@ -460,21 +575,26 @@ async fn execute_json_attempt(
         }
     };
     let body = if translated {
-        translate_nonstream(ingress, &raw)
+        translate_nonstream(ingress, egress, &raw)
     } else {
         raw.clone()
     };
     let usage = usage_for(egress, &raw);
-    let cost = provider_cost(provider, &raw, &usage);
+    let cost = provider_cost(runtime.client.kind(), &raw, &usage);
     let record = AttemptRecord {
         id: attempt_id,
         request_id: Some(request_id.into()),
         sequence,
-        provider,
-        upstream_model: state_provider(state, provider).model().into(),
+        provider: candidate.target.provider.clone(),
+        provider_kind: Some(runtime.client.kind()),
+        credential: Some(candidate.target.credential.clone()),
+        route_layer: Some(candidate.layer_name.clone()),
+        route_layer_index: Some(candidate.layer_index),
+        selection_reason: Some(candidate.selection_reason.into()),
+        upstream_model: runtime.client.model().into(),
         egress_protocol: egress,
         translated,
-        probe,
+        probe: candidate.probe,
         started_at_ms,
         completed_at_ms: Utc::now().timestamp_millis(),
         status: Some(status.as_u16()),
@@ -491,7 +611,8 @@ async fn execute_json_attempt(
     };
     persist_attempt(state, &record);
     Ok(JsonSuccess {
-        provider,
+        candidate: candidate.clone(),
+        provider_kind: runtime.client.kind(),
         egress,
         translated,
         body,
@@ -514,90 +635,80 @@ async fn handle_stream(
         .map(|v| v.len() as u64)
         .unwrap_or(0);
     let include_metadata = metadata_requested(&headers);
-    let decision = state.circuit.decide().await;
-    let (first_provider, probe, circuit_reason) = match decision {
-        RouteDecision::Primary { probe } => (Provider::OpenCodeGo, probe, None),
-        RouteDecision::Fallback { reason } => (Provider::DeepSeek, false, reason),
-    };
-    let first = prepare_stream_attempt(
-        state.clone(),
-        first_provider,
-        protocol,
-        &headers,
-        &body,
-        &request_id,
-        1,
-        probe,
-        started,
-    )
-    .await;
-    let prepared = match first {
-        Ok(mut prepared) => {
-            if first_provider == Provider::DeepSeek {
-                prepared.fallback_reason = circuit_reason;
+    let served_model = resolve_served_model(&state, protocol, &body).expect("validated model");
+    let candidates = route_candidates(&state, &served_model);
+    let mut fallback_reason = None;
+    let mut last_failure = None;
+    let mut last_candidate = None;
+    let mut prepared = None;
+    let mut sequence = 0_u32;
+    for mut candidate in candidates {
+        let runtime = state
+            .targets
+            .get(&candidate.target)
+            .expect("validated runtime target")
+            .clone();
+        match runtime.circuit.decide().await {
+            RouteDecision::Primary { probe } => candidate.probe = probe,
+            RouteDecision::Fallback { reason } => {
+                fallback_reason = fallback_reason.or(reason);
+                continue;
             }
-            prepared
         }
-        Err(failure)
-            if first_provider == Provider::OpenCodeGo && failure.error.class.allows_fallback() =>
+        sequence += 1;
+        match prepare_stream_attempt(
+            state.clone(),
+            &candidate,
+            runtime.clone(),
+            protocol,
+            &headers,
+            &body,
+            &request_id,
+            sequence,
+            started,
+        )
+        .await
         {
-            state
-                .circuit
-                .failure(failure.error.class, failure.error.retry_after)
-                .await;
-            record_alert_if_needed(&state, &request_id, failure.error.class).await;
-            match prepare_stream_attempt(
-                state.clone(),
-                Provider::DeepSeek,
-                protocol,
-                &headers,
-                &body,
-                &request_id,
-                2,
-                false,
-                started,
-            )
-            .await
-            {
-                Ok(mut prepared) => {
-                    prepared.fallback_reason = Some(failure.error.class);
-                    prepared
-                }
-                Err(fallback) => {
-                    return terminal_failure(
-                        &state,
-                        protocol,
-                        &request_id,
-                        started_at_ms,
-                        started,
-                        request_bytes,
-                        fallback,
-                        true,
-                        include_metadata,
-                        Some(failure.error.class),
-                    )
+            Ok(mut success) => {
+                success.fallback_reason = fallback_reason;
+                prepared = Some(success);
+                break;
+            }
+            Err(failure) => {
+                let allows_fallback = failure.error.class.allows_fallback();
+                runtime
+                    .circuit
+                    .failure(failure.error.class, failure.error.retry_after)
                     .await;
+                record_alert_if_needed(&state, &request_id, &candidate, failure.error.class).await;
+                fallback_reason.get_or_insert(failure.error.class);
+                last_candidate = Some(candidate.clone());
+                last_failure = Some(failure);
+                if !allows_fallback {
+                    break;
                 }
             }
         }
-        Err(failure) => {
-            return terminal_failure(
-                &state,
-                protocol,
-                &request_id,
-                started_at_ms,
-                started,
-                request_bytes,
-                failure,
-                first_provider == Provider::DeepSeek,
-                include_metadata,
-                circuit_reason,
-            )
-            .await;
-        }
+    }
+    let Some(prepared) = prepared else {
+        let (failure, candidate) = terminal_route_failure(last_failure, last_candidate);
+        return terminal_failure(
+            &state,
+            protocol,
+            &request_id,
+            started_at_ms,
+            started,
+            request_bytes,
+            failure,
+            candidate.as_ref(),
+            include_metadata,
+            fallback_reason,
+        )
+        .await;
     };
 
-    let provider = prepared.provider;
+    let candidate = prepared.candidate.clone();
+    let provider_kind = prepared.runtime.client.kind();
     let egress = prepared.egress;
     let translated = prepared.translated;
     let fallback_reason = prepared.fallback_reason;
@@ -607,7 +718,7 @@ async fn handle_stream(
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or(LOGICAL_MODEL)
+        .unwrap_or(&served_model.name)
         .to_string();
     let claude_session_id = header_text(&headers, "x-claude-code-session-id");
     let claude_agent_id = header_text(&headers, "x-claude-code-agent-id");
@@ -619,13 +730,17 @@ async fn handle_stream(
     let probe = prepared.probe;
     let attempt_started_at_ms = prepared.attempt_started_at_ms;
     let upstream_request_bytes = prepared.request_bytes;
-    let upstream_model = state_provider(&state, provider).model().to_string();
+    let upstream_model = prepared.runtime.client.model().to_string();
+    let runtime_for_stream = prepared.runtime.clone();
+    let candidate_for_stream = candidate.clone();
     let stream = stream! {
         let mut response_bytes = 0_u64;
         let mut usage = Usage::default();
         let mut stream_error = None;
         let mut response_translator = responses::ChatToResponsesStream::new();
         let mut anthropic_translator = anthropic::ChatToAnthropicStream::new();
+        let mut responses_source = responses::ResponsesToChatStream::new();
+        let mut anthropic_source = anthropic::AnthropicToChatStream::new();
         let mut pending_event = Some(first_event);
         loop {
             let next = if let Some(event) = pending_event.take() {
@@ -650,14 +765,40 @@ async fn handle_stream(
                     }
                     if translated {
                         match serde_json::from_str::<Value>(&event.data) {
-                            Ok(chunk) => {
-                                if chunk.get("usage").is_some_and(|value| !value.is_null()) { usage = Usage::from_openai(&chunk); }
-                                let events = match protocol {
-                                    Protocol::OpenAiResponses => response_translator.translate(&chunk),
-                                    Protocol::AnthropicMessages => anthropic_translator.translate(&chunk),
-                                    Protocol::OpenAiChat => vec![event],
+                            Ok(upstream_chunk) => {
+                                let upstream_type=upstream_chunk.get("type").and_then(Value::as_str);
+                                if matches!(upstream_type,Some("response.failed"|"error")) {
+                                    stream_error=Some(FailureClass::StreamFailure);
+                                    break;
+                                }
+                                let upstream_terminal = match egress {
+                                    Protocol::OpenAiChat => false,
+                                    Protocol::OpenAiResponses => matches!(upstream_type,Some("response.completed"|"response.incomplete")),
+                                    Protocol::AnthropicMessages => upstream_type==Some("message_stop"),
                                 };
-                                for event in events { let bytes=event.encode(); response_bytes+=bytes.len() as u64; yield Ok::<Bytes, Infallible>(bytes); }
+                                let chat_chunks = match egress {
+                                    Protocol::OpenAiChat => vec![upstream_chunk],
+                                    Protocol::OpenAiResponses => responses_source.translate(&upstream_chunk),
+                                    Protocol::AnthropicMessages => anthropic_source.translate(&upstream_chunk),
+                                };
+                                for chunk in chat_chunks {
+                                    if chunk.get("usage").is_some_and(|value| !value.is_null()) { usage = Usage::from_openai(&chunk); }
+                                    let events = match protocol {
+                                        Protocol::OpenAiResponses => response_translator.translate(&chunk),
+                                        Protocol::AnthropicMessages => anthropic_translator.translate(&chunk),
+                                        Protocol::OpenAiChat => vec![SseEvent{event:None,data:chunk.to_string()}],
+                                    };
+                                    for event in events { let bytes=event.encode(); response_bytes+=bytes.len() as u64; yield Ok::<Bytes, Infallible>(bytes); }
+                                }
+                                if upstream_terminal {
+                                    let tail = match protocol {
+                                        Protocol::OpenAiResponses => response_translator.finish(),
+                                        Protocol::AnthropicMessages => anthropic_translator.finish(),
+                                        Protocol::OpenAiChat => vec![SseEvent{event:None,data:"[DONE]".into()}],
+                                    };
+                                    for event in tail { let bytes=event.encode(); response_bytes+=bytes.len() as u64; yield Ok::<Bytes, Infallible>(bytes); }
+                                    break;
+                                }
                             }
                             Err(_) => { stream_error=Some(FailureClass::StreamFailure); break; }
                         }
@@ -678,11 +819,68 @@ async fn handle_stream(
             }
         }
         let completed_at_ms=Utc::now().timestamp_millis();
-        let attempt = AttemptRecord { id:attempt_id,request_id:Some(request_id_for_stream.clone()),sequence,provider,upstream_model,egress_protocol:egress,translated,probe,started_at_ms:attempt_started_at_ms,completed_at_ms,status:Some(200),error_class:stream_error,retry_after_ms:None,committed:true,request_bytes:upstream_request_bytes,response_bytes,first_byte_ms:Some(first_byte_ms),total_ms:started.elapsed().as_millis() as u64,usage:usage.clone(),provider_cost_usd:provider_cost(provider,&Value::Null,&usage),sanitized_error:stream_error.map(|_|"upstream stream ended unexpectedly".into())};
+        let attempt = AttemptRecord {
+            id:attempt_id,
+            request_id:Some(request_id_for_stream.clone()),
+            sequence,
+            provider:candidate_for_stream.target.provider.clone(),
+            provider_kind:Some(provider_kind),
+            credential:Some(candidate_for_stream.target.credential.clone()),
+            route_layer:Some(candidate_for_stream.layer_name.clone()),
+            route_layer_index:Some(candidate_for_stream.layer_index),
+            selection_reason:Some(candidate_for_stream.selection_reason.into()),
+            upstream_model,
+            egress_protocol:egress,
+            translated,
+            probe,
+            started_at_ms:attempt_started_at_ms,
+            completed_at_ms,
+            status:Some(200),
+            error_class:stream_error,
+            retry_after_ms:None,
+            committed:true,
+            request_bytes:upstream_request_bytes,
+            response_bytes,
+            first_byte_ms:Some(first_byte_ms),
+            total_ms:started.elapsed().as_millis() as u64,
+            usage:usage.clone(),
+            provider_cost_usd:provider_cost(provider_kind,&Value::Null,&usage),
+            sanitized_error:stream_error.map(|_|"upstream stream ended unexpectedly".into())
+        };
         persist_attempt(&state_for_stream,&attempt);
-        let request = RequestRecord { id:request_id_for_stream,started_at_ms,completed_at_ms,protocol,requested_model,streaming:true,status:if stream_error.is_some(){502}else{200},error_class:stream_error,provider:Some(provider),fallback:provider==Provider::DeepSeek,translated,request_bytes,response_bytes,first_byte_ms:Some(first_byte_ms),total_ms:started.elapsed().as_millis() as u64,usage,claude_session_id,claude_agent_id,claude_parent_agent_id};
+        let request = RequestRecord {
+            id:request_id_for_stream.clone(),
+            started_at_ms,
+            completed_at_ms,
+            protocol,
+            requested_model,
+            streaming:true,
+            status:if stream_error.is_some(){502}else{200},
+            error_class:stream_error,
+            provider:Some(candidate_for_stream.target.provider.clone()),
+            provider_kind:Some(provider_kind),
+            credential:Some(candidate_for_stream.target.credential.clone()),
+            route_layer:Some(candidate_for_stream.layer_name.clone()),
+            route_layer_index:Some(candidate_for_stream.layer_index),
+            selection_reason:Some(candidate_for_stream.selection_reason.into()),
+            fallback:candidate_for_stream.layer_index>0,
+            translated,
+            request_bytes,
+            response_bytes,
+            first_byte_ms:Some(first_byte_ms),
+            total_ms:started.elapsed().as_millis() as u64,
+            usage,
+            claude_session_id,
+            claude_agent_id,
+            claude_parent_agent_id
+        };
         persist_request(&state_for_stream,&request);
-        if provider==Provider::OpenCodeGo { if let Some(class)=stream_error { state_for_stream.circuit.failure(class,None).await; } else { state_for_stream.circuit.success().await; } }
+        if let Some(class)=stream_error {
+            runtime_for_stream.circuit.failure(class,None).await;
+            record_alert_if_needed(&state_for_stream,&request_id_for_stream,&candidate_for_stream,class).await;
+        } else {
+            runtime_for_stream.circuit.success().await;
+        }
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
@@ -696,8 +894,8 @@ async fn handle_stream(
         &mut response,
         include_metadata,
         &request_id,
-        provider,
-        state_provider(&state, provider).model(),
+        &candidate,
+        &candidate.target.model,
         fallback_reason,
         protocol,
         egress,
@@ -707,7 +905,8 @@ async fn handle_stream(
 }
 
 struct PreparedStream {
-    provider: Provider,
+    candidate: RouteCandidate,
+    runtime: Arc<TargetRuntime>,
     egress: Protocol,
     translated: bool,
     decoder: SseDecoder,
@@ -723,54 +922,49 @@ struct PreparedStream {
 #[allow(clippy::too_many_arguments)]
 async fn prepare_stream_attempt(
     state: Arc<AppState>,
-    provider: Provider,
+    candidate: &RouteCandidate,
+    runtime: Arc<TargetRuntime>,
     ingress: Protocol,
     headers: &HeaderMap,
     original: &Value,
     request_id: &str,
     sequence: u32,
-    probe: bool,
     request_started: Instant,
 ) -> Result<PreparedStream, AttemptFailure> {
     let attempt_id = Uuid::now_v7().to_string();
     let attempt_started_at_ms = Utc::now().timestamp_millis();
     let attempt_started = Instant::now();
-    let (egress, translated, prepared) = match prepare_for_provider(
-        provider,
-        ingress,
-        original,
-        state_provider(&state, provider).model(),
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(AttemptFailure {
-                error: ProviderError {
-                    class: FailureClass::ClientRequest,
-                    status: Some(error.status),
-                    retry_after: None,
-                    safe_message: error.message,
-                },
-            });
-        }
-    };
+    let provider_protocol = runtime.client.protocol_for(ingress);
+    let (egress, translated, prepared) =
+        match prepare_for_provider(provider_protocol, ingress, original, runtime.client.model()) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(AttemptFailure {
+                    error: ProviderError {
+                        class: FailureClass::ClientRequest,
+                        status: Some(error.status),
+                        retry_after: None,
+                        safe_message: error.message,
+                    },
+                });
+            }
+        };
     let request_bytes = serde_json::to_vec(&prepared)
         .map(|v| v.len() as u64)
         .unwrap_or(0);
-    let response = match state_provider(&state, provider)
-        .send(egress, &prepared, headers)
-        .await
-    {
+    let response = match runtime.client.send(egress, &prepared, headers).await {
         Ok(response) => response,
         Err(error) => {
             let record = failed_attempt(
                 &attempt_id,
                 Some(request_id),
                 sequence,
-                provider,
-                state_provider(&state, provider).model(),
+                candidate,
+                runtime.client.kind(),
+                runtime.client.model(),
                 egress,
                 translated,
-                probe,
+                candidate.probe,
                 attempt_started_at_ms,
                 attempt_started,
                 request_bytes,
@@ -795,11 +989,12 @@ async fn prepare_stream_attempt(
                 &attempt_id,
                 Some(request_id),
                 sequence,
-                provider,
-                state_provider(&state, provider).model(),
+                candidate,
+                runtime.client.kind(),
+                runtime.client.model(),
                 egress,
                 translated,
-                probe,
+                candidate.probe,
                 attempt_started_at_ms,
                 attempt_started,
                 request_bytes,
@@ -812,7 +1007,13 @@ async fn prepare_stream_attempt(
     if event.event.as_deref() == Some("error")
         || serde_json::from_str::<Value>(&event.data)
             .ok()
-            .is_some_and(|value| value.get("error").is_some())
+            .is_some_and(|value| {
+                value.get("error").is_some()
+                    || matches!(
+                        value.get("type").and_then(Value::as_str),
+                        Some("response.failed" | "error")
+                    )
+            })
     {
         let error = ProviderError {
             class: FailureClass::StreamFailure,
@@ -824,11 +1025,12 @@ async fn prepare_stream_attempt(
             &attempt_id,
             Some(request_id),
             sequence,
-            provider,
-            state_provider(&state, provider).model(),
+            candidate,
+            runtime.client.kind(),
+            runtime.client.model(),
             egress,
             translated,
-            probe,
+            candidate.probe,
             attempt_started_at_ms,
             attempt_started,
             request_bytes,
@@ -849,14 +1051,15 @@ async fn prepare_stream_attempt(
     }
     let _ = request_started;
     Ok(PreparedStream {
-        provider,
+        candidate: candidate.clone(),
+        runtime,
         egress,
         translated,
         decoder,
         first_event: event,
         attempt_id,
         sequence,
-        probe,
+        probe: candidate.probe,
         attempt_started_at_ms,
         request_bytes,
         fallback_reason: None,
@@ -864,45 +1067,45 @@ async fn prepare_stream_attempt(
 }
 
 fn prepare_for_provider(
-    provider: Provider,
+    egress: Protocol,
     ingress: Protocol,
     original: &Value,
     model: &str,
 ) -> Result<(Protocol, bool, Value), ValidationError> {
-    match (provider, ingress) {
-        (_, Protocol::OpenAiChat) => Ok((
-            Protocol::OpenAiChat,
-            false,
-            chat::prepare(original.clone(), model)?,
-        )),
-        (Provider::OpenCodeGo, Protocol::OpenAiResponses) => Ok((
-            Protocol::OpenAiChat,
-            true,
-            responses::prepare_for_chat(original.clone(), model)?,
-        )),
-        (Provider::DeepSeek, Protocol::OpenAiResponses) => Ok((
-            Protocol::OpenAiResponses,
-            false,
-            responses::prepare_direct(original.clone(), model)?,
-        )),
-        (Provider::OpenCodeGo, Protocol::AnthropicMessages) => Ok((
-            Protocol::OpenAiChat,
-            true,
-            anthropic::prepare_for_chat(original.clone(), model)?,
-        )),
-        (Provider::DeepSeek, Protocol::AnthropicMessages) => Ok((
-            Protocol::AnthropicMessages,
-            false,
-            anthropic::prepare_direct(original.clone(), model)?,
-        )),
+    if egress == ingress {
+        let direct = match ingress {
+            Protocol::OpenAiChat => chat::prepare(original.clone(), model)?,
+            Protocol::OpenAiResponses => responses::prepare_direct(original.clone(), model)?,
+            Protocol::AnthropicMessages => anthropic::prepare_direct(original.clone(), model)?,
+        };
+        return Ok((egress, false, direct));
     }
+    let canonical_chat = match ingress {
+        Protocol::OpenAiChat => chat::prepare(original.clone(), model)?,
+        Protocol::OpenAiResponses => responses::prepare_for_chat(original.clone(), model)?,
+        Protocol::AnthropicMessages => anthropic::prepare_for_chat(original.clone(), model)?,
+    };
+    let prepared = match egress {
+        Protocol::OpenAiChat => canonical_chat,
+        Protocol::OpenAiResponses => responses::prepare_from_chat(canonical_chat, model)?,
+        Protocol::AnthropicMessages => anthropic::prepare_from_chat(canonical_chat, model)?,
+    };
+    Ok((egress, true, prepared))
 }
 
-fn translate_nonstream(ingress: Protocol, raw: &Value) -> Value {
-    match ingress {
-        Protocol::OpenAiResponses => responses::chat_to_response(raw),
-        Protocol::AnthropicMessages => anthropic::chat_to_message(raw),
+fn translate_nonstream(ingress: Protocol, egress: Protocol, raw: &Value) -> Value {
+    if ingress == egress {
+        return raw.clone();
+    }
+    let chat = match egress {
         Protocol::OpenAiChat => raw.clone(),
+        Protocol::OpenAiResponses => responses::response_to_chat(raw),
+        Protocol::AnthropicMessages => anthropic::message_to_chat(raw),
+    };
+    match ingress {
+        Protocol::OpenAiChat => chat,
+        Protocol::OpenAiResponses => responses::chat_to_response(&chat),
+        Protocol::AnthropicMessages => anthropic::chat_to_message(&chat),
     }
 }
 
@@ -915,11 +1118,11 @@ async fn terminal_failure(
     started: Instant,
     request_bytes: u64,
     failure: AttemptFailure,
-    fallback: bool,
+    candidate: Option<&RouteCandidate>,
     include_metadata: bool,
     fallback_reason: Option<FailureClass>,
 ) -> Response {
-    let class = if fallback {
+    let class = if fallback_reason.is_some() && failure.error.class.allows_fallback() {
         FailureClass::FallbackUnavailable
     } else {
         failure.error.class
@@ -930,16 +1133,23 @@ async fn terminal_failure(
         started_at_ms,
         completed_at_ms: Utc::now().timestamp_millis(),
         protocol,
-        requested_model: LOGICAL_MODEL.into(),
+        requested_model: state
+            .config
+            .models
+            .first()
+            .map(|model| model.name.clone())
+            .unwrap_or_default(),
         streaming: false,
         status: status.as_u16(),
         error_class: Some(class),
-        provider: if fallback {
-            Some(Provider::DeepSeek)
-        } else {
-            Some(Provider::OpenCodeGo)
-        },
-        fallback,
+        provider: candidate.map(|candidate| candidate.target.provider.clone()),
+        provider_kind: candidate
+            .map(|candidate| target_runtime(state, &candidate.target).client.kind()),
+        credential: candidate.map(|candidate| candidate.target.credential.clone()),
+        route_layer: candidate.map(|candidate| candidate.layer_name.clone()),
+        route_layer_index: candidate.map(|candidate| candidate.layer_index),
+        selection_reason: candidate.map(|candidate| candidate.selection_reason.into()),
+        fallback: candidate.is_some_and(|candidate| candidate.layer_index > 0),
         translated: false,
         request_bytes,
         response_bytes: 0,
@@ -951,25 +1161,27 @@ async fn terminal_failure(
         claude_parent_agent_id: None,
     };
     persist_request(state, &record);
-    record_alert_if_needed(state, request_id, class).await;
+    if let Some(candidate) = candidate {
+        record_alert_if_needed(state, request_id, candidate, class).await;
+    }
     let body = error_body(protocol, &failure.error.safe_message, class);
     let mut response = (status, Json(body)).into_response();
-    let provider = if fallback {
-        Provider::DeepSeek
-    } else {
-        Provider::OpenCodeGo
-    };
-    apply_metadata(
-        &mut response,
-        include_metadata,
-        request_id,
-        provider,
-        state_provider(state, provider).model(),
-        fallback_reason,
-        protocol,
-        protocol,
-        false,
-    );
+    if let Some(candidate) = candidate {
+        let egress = target_runtime(state, &candidate.target)
+            .client
+            .protocol_for(protocol);
+        apply_metadata(
+            &mut response,
+            include_metadata,
+            request_id,
+            candidate,
+            &candidate.target.model,
+            fallback_reason,
+            protocol,
+            egress,
+            protocol != egress,
+        );
+    }
     response
 }
 
@@ -1008,7 +1220,8 @@ fn failed_attempt(
     id: &str,
     request_id: Option<&str>,
     sequence: u32,
-    provider: Provider,
+    candidate: &RouteCandidate,
+    provider_kind: ProviderKind,
     model: &str,
     egress: Protocol,
     translated: bool,
@@ -1022,7 +1235,12 @@ fn failed_attempt(
         id: id.into(),
         request_id: request_id.map(str::to_string),
         sequence,
-        provider,
+        provider: candidate.target.provider.clone(),
+        provider_kind: Some(provider_kind),
+        credential: Some(candidate.target.credential.clone()),
+        route_layer: Some(candidate.layer_name.clone()),
+        route_layer_index: Some(candidate.layer_index),
+        selection_reason: Some(candidate.selection_reason.into()),
         upstream_model: model.into(),
         egress_protocol: egress,
         translated,
@@ -1053,26 +1271,25 @@ fn usage_for(protocol: Protocol, value: &Value) -> Usage {
     }
 }
 
-fn provider_cost(provider: Provider, raw: &Value, usage: &Usage) -> Option<f64> {
-    if provider == Provider::OpenCodeGo {
+fn provider_cost(provider: ProviderKind, raw: &Value, usage: &Usage) -> Option<f64> {
+    if matches!(
+        provider,
+        ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen
+    ) {
         return raw
             .get("cost")
             .and_then(Value::as_f64)
             .or_else(|| raw.get("cost").and_then(Value::as_str)?.parse().ok());
     }
-    Some(
-        (usage.cache_hit_tokens as f64 * 0.0028
-            + usage.cache_miss_tokens as f64 * 0.14
-            + usage.output_tokens as f64 * 0.28)
-            / 1_000_000.0,
-    )
-}
-
-fn state_provider(state: &AppState, provider: Provider) -> &ProviderClient {
-    match provider {
-        Provider::OpenCodeGo => &state.primary,
-        Provider::DeepSeek => &state.fallback,
+    if provider == ProviderKind::DeepSeekOfficial {
+        return Some(
+            (usage.cache_hit_tokens as f64 * 0.0028
+                + usage.cache_miss_tokens as f64 * 0.14
+                + usage.output_tokens as f64 * 0.28)
+                / 1_000_000.0,
+        );
     }
+    None
 }
 fn persist_request(state: &AppState, record: &RequestRecord) {
     if let Err(error) = state.store.record_request(record) {
@@ -1085,7 +1302,12 @@ fn persist_attempt(state: &AppState, record: &AttemptRecord) {
     }
 }
 
-async fn record_alert_if_needed(state: &AppState, request_id: &str, class: FailureClass) {
+async fn record_alert_if_needed(
+    state: &AppState,
+    request_id: &str,
+    candidate: &RouteCandidate,
+    class: FailureClass,
+) {
     if !matches!(
         class,
         FailureClass::ProviderAuth
@@ -1097,15 +1319,19 @@ async fn record_alert_if_needed(state: &AppState, request_id: &str, class: Failu
         return;
     }
     let now = Utc::now().timestamp_millis();
-    let snapshot = state.circuit.snapshot().await;
-    let provider = if class == FailureClass::FallbackUnavailable {
-        Provider::DeepSeek
-    } else {
-        Provider::OpenCodeGo
-    };
+    let runtime = target_runtime(state, &candidate.target);
+    let snapshot = runtime.circuit.snapshot().await;
     let record = AlertRecord {
-        id: format!("{}:{}", provider.as_str(), class.as_str()),
-        provider,
+        id: format!(
+            "{}:{}:{}:{}",
+            candidate.target.provider,
+            candidate.target.credential,
+            candidate.target.model,
+            class.as_str()
+        ),
+        provider: candidate.target.provider.clone(),
+        provider_kind: Some(runtime.client.kind()),
+        credential: Some(candidate.target.credential.clone()),
         class,
         active: true,
         first_seen_ms: now,
@@ -1138,7 +1364,7 @@ fn apply_metadata(
     response: &mut Response,
     include: bool,
     request_id: &str,
-    provider: Provider,
+    candidate: &RouteCandidate,
     model: &str,
     fallback_reason: Option<FailureClass>,
     ingress: Protocol,
@@ -1151,11 +1377,21 @@ fn apply_metadata(
     let headers = response.headers_mut();
     for (name, value) in [
         ("x-relay-request-id", request_id.to_string()),
-        ("x-relay-provider", provider.as_str().into()),
+        ("x-relay-provider", candidate.target.provider.clone()),
+        ("x-relay-credential", candidate.target.credential.clone()),
+        ("x-relay-route-layer", candidate.layer_name.clone()),
+        (
+            "x-relay-route-layer-index",
+            candidate.layer_index.to_string(),
+        ),
+        (
+            "x-relay-selection-reason",
+            candidate.selection_reason.into(),
+        ),
         ("x-relay-upstream-model", model.into()),
         (
             "x-relay-fallback",
-            if provider == Provider::DeepSeek {
+            if candidate.layer_index > 0 {
                 "1".into()
             } else {
                 "0".into()
@@ -1204,7 +1440,6 @@ async fn attempts(State(state): State<Arc<AppState>>, Query(query): Query<LimitQ
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let circuit = state.circuit.snapshot().await;
     let alerts = state.store.alerts(100).unwrap_or_default();
     let balance = state.balance.read().await.clone();
     let display = balance
@@ -1219,9 +1454,44 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
                 v.get("currency")?.as_str()?
             ))
         });
-    Json(
-        json!({"active_provider":if circuit.mode==crate::circuit::CircuitMode::Closed{"opencode-go"}else{"deepseek"},"circuit":circuit,"providers":{"opencode-go":{"endpoint":safe_endpoint(state.primary.endpoint()),"model":state.primary.model(),"key_configured":true},"deepseek":{"endpoint":safe_endpoint(state.fallback.endpoint()),"model":state.fallback.model(),"key_configured":true}},"deepseek_balance":{"display":display,"raw":balance},"alerts":alerts}),
-    )
+    let mut target_rows = Vec::new();
+    let mut seen = HashSet::new();
+    for model in &state.config.models {
+        for layer in &model.layers {
+            for target in &layer.targets {
+                if seen.insert(target) {
+                    let runtime = target_runtime(&state, target);
+                    target_rows.push(json!({
+                        "provider":target.provider,
+                        "provider_kind":runtime.client.kind().as_str(),
+                        "credential":target.credential,
+                        "model":target.model,
+                        "protocols":runtime.client.protocols().iter().map(|protocol|protocol.as_str()).collect::<Vec<_>>(),
+                        "endpoint":safe_endpoint(runtime.client.endpoint()),
+                        "circuit":runtime.circuit.snapshot().await,
+                    }));
+                }
+            }
+        }
+    }
+    let active_provider = target_rows
+        .iter()
+        .find(|row| row.pointer("/circuit/mode").and_then(Value::as_str) == Some("closed"))
+        .and_then(|row| row.get("provider"))
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let circuit = target_rows
+        .first()
+        .and_then(|row| row.get("circuit"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Json(json!({
+        "active_provider":active_provider,
+        "circuit":circuit,
+        "targets":target_rows,
+        "deepseek_balance":{"display":display,"raw":balance},
+        "alerts":alerts
+    }))
 }
 
 fn safe_endpoint(endpoint: &str) -> String {
@@ -1248,10 +1518,14 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
     };
     let attempts = state.store.attempts(20000).unwrap_or_default();
     let mut providers: BTreeMap<String, Value> = BTreeMap::new();
-    for provider in [Provider::OpenCodeGo, Provider::DeepSeek] {
+    let provider_names = attempts
+        .iter()
+        .map(|attempt| attempt.provider.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for provider in provider_names {
         let rows = attempts
             .iter()
-            .filter(|a| a.provider == provider)
+            .filter(|attempt| attempt.provider == provider)
             .collect::<Vec<_>>();
         let total = rows.len() as u64;
         let successes = rows.iter().filter(|a| a.error_class.is_none()).count() as u64;
@@ -1259,7 +1533,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
         let hit = rows.iter().map(|a| a.usage.cache_hit_tokens).sum::<u64>();
         let miss = rows.iter().map(|a| a.usage.cache_miss_tokens).sum::<u64>();
         let cost = rows.iter().filter_map(|a| a.provider_cost_usd).sum::<f64>();
-        providers.insert(provider.as_str().into(),json!({"attempts":total,"successes":successes,"errors":total-successes,"cache_reported_attempts":cache_reported,"cache_hit_tokens":hit,"cache_miss_tokens":miss,"cost_usd":cost}));
+        providers.insert(provider,json!({"attempts":total,"successes":successes,"errors":total-successes,"cache_reported_attempts":cache_reported,"cache_hit_tokens":hit,"cache_miss_tokens":miss,"cost_usd":cost}));
     }
     let total = requests.len() as u64;
     let errors = requests.iter().filter(|r| r.error_class.is_some()).count() as u64;
@@ -1289,7 +1563,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            (provider_cost(Provider::DeepSeek, &Value::Null, &usage).unwrap() - 0.0028).abs()
+            (provider_cost(ProviderKind::DeepSeekOfficial, &Value::Null, &usage).unwrap() - 0.0028)
+                .abs()
                 < 1e-9
         );
     }
