@@ -25,8 +25,8 @@ protocol, never a provider, credential, route layer, or upstream model.
 ## Terminology and identities
 
 - `provider`: a configured upstream service such as DeepSeek Official,
-  Kimi Official, Alibaba Cloud Model Studio, Ollama Cloud, OpenCode Zen,
-  OpenCode Go, or a custom compatible endpoint.
+  Kimi Official, Kimi Code, Alibaba Cloud Model Studio, Ollama Cloud,
+  OpenCode Zen, OpenCode Go, or a custom compatible endpoint.
 - `credential`: one independently routable API key within a provider. Two keys
   of the same provider are two routing workers and may be separate cache
   domains.
@@ -51,13 +51,17 @@ Every provider has a stable user-defined `id`, a provider `kind`, one or more
 credentials, and an explicit list of enabled models. The enabled model name is
 always the provider's standard API identifier.
 
-The implemented provider adapters are currently `deepseek-official` and
-`opencode-go`. Their official base endpoints may be omitted, and endpoint
-overrides remain possible for local and integration tests.
+The production-accepted provider adapters are currently `deepseek-official`,
+`opencode-go`, `kimi-code`, and `kimi-official`. Both Kimi adapters have
+provider-specific URL, model identity, error, mock end-to-end, real streaming,
+and 300,095-input-token acceptance. Kimi Code additionally completed a live
+two-turn Codex Responses-to-Chat reasoning/tool loop. Official base endpoints
+may be omitted, and endpoint overrides remain possible for local and
+integration tests.
 
-The configuration enum also reserves `kimi-official`, `aliyun-bailian`,
-`ollama-cloud`, `opencode-zen`, `custom-chat-completions`, `custom-responses`,
-and `custom-anthropic`. These entries currently provide schema/default-endpoint
+The configuration enum also reserves `aliyun-bailian`, `ollama-cloud`,
+`opencode-zen`, `custom-chat-completions`, `custom-responses`, and
+`custom-anthropic`. These entries currently provide schema/default-endpoint
 scaffolding only. They are not supported provider adapters until they have
 provider-specific authentication, URL, stream, error, mock end-to-end, and
 (where applicable) real credential tests.
@@ -68,8 +72,7 @@ endpoints for Responses, Anthropic Messages, and Chat Completions models. The
 configuration is explicit even when QuotaMux can infer a default. Validation
 becomes provider-specific as each reserved adapter is implemented.
 
-These official references informed the schema and the planned adapters; they
-are not acceptance evidence for the reserved provider kinds:
+These official references define the external identities used by the adapters:
 
 - DeepSeek exposes model IDs from `/models` and currently documents
   `deepseek-v4-flash` and `deepseek-v4-pro`:
@@ -78,9 +81,13 @@ are not acceptance evidence for the reserved provider kinds:
   <https://opencode.ai/docs/go>
 - OpenCode Zen likewise mixes Responses, Anthropic, and Chat Completions models:
   <https://opencode.ai/docs/zen>
-- Kimi's official quick start uses the exact `kimi-k3` model ID and the
-  OpenAI-compatible Chat Completions API:
-  <https://platform.kimi.com/docs/overview>
+- Kimi's China Open Platform uses the exact `kimi-k3` model ID, a 1M context
+  window, and the OpenAI-compatible Chat Completions API:
+  <https://platform.kimi.com/docs/guide/kimi-k3-quickstart>
+- Kimi Code is a separate credential system at
+  `https://api.kimi.com/coding/v1`; API calls use model ID `k3`, and
+  Allegretto unlocks up to 1M context:
+  <https://www.kimi.com/code/docs/>
 - Alibaba Cloud Model Studio model IDs and endpoints vary by model and region:
   <https://help.aliyun.com/en/model-studio/models>
 - Ollama lists cloud models through `https://ollama.com/api/tags`; its official

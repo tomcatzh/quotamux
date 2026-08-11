@@ -131,7 +131,7 @@ impl ProviderClient {
         let body = response.bytes().await.unwrap_or_default();
         let body = &body[..body.len().min(MAX_ERROR_BYTES)];
         let safe_message = extract_error_message(body);
-        let class = classify_status(status, &safe_message);
+        let class = classify_provider_status(self.kind, status, &safe_message);
         Err(ProviderError {
             class,
             status: Some(status),
@@ -210,6 +210,33 @@ pub fn classify_status(status: StatusCode, message: &str) -> FailureClass {
     }
 }
 
+fn classify_provider_status(kind: ProviderKind, status: StatusCode, message: &str) -> FailureClass {
+    if kind == ProviderKind::KimiCode {
+        match status.as_u16() {
+            401 if contains_any(
+                message,
+                &[
+                    "does not have access",
+                    "supports only",
+                    "model id does not exist",
+                ],
+            ) =>
+            {
+                return FailureClass::ProviderConfiguration;
+            }
+            402 => return FailureClass::ProviderTransient,
+            403 if contains_any(message, &["usage limit", "quota", "billing cycle"]) => {
+                return FailureClass::ProviderBilling;
+            }
+            429 if contains_any(message, &["usage limit", "quota", "billing cycle"]) => {
+                return FailureClass::ProviderBilling;
+            }
+            _ => {}
+        }
+    }
+    classify_status(status, message)
+}
+
 fn classify_transport(error: &reqwest::Error) -> FailureClass {
     if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() {
         FailureClass::ProviderTransient
@@ -277,6 +304,44 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 mod tests {
     use super::*;
 
+    fn client_for(kind: ProviderKind, model: &str) -> ProviderClient {
+        let provider = ProviderConfig {
+            id: kind.as_str().into(),
+            kind,
+            endpoint: None,
+            credentials: vec![CredentialConfig {
+                id: "test-key".into(),
+                api_key: "secret".into(),
+            }],
+            models: vec![ProviderModelConfig {
+                name: model.into(),
+                protocols: vec![Protocol::OpenAiChat],
+            }],
+        };
+        ProviderClient::new(&provider, &provider.credentials[0], &provider.models[0]).unwrap()
+    }
+
+    #[test]
+    fn kimi_k3_provider_kinds_use_their_distinct_official_chat_urls() {
+        let code = client_for(ProviderKind::KimiCode, "k3");
+        assert_eq!(
+            code.url(Protocol::OpenAiChat),
+            "https://api.kimi.com/coding/v1/chat/completions"
+        );
+
+        let official = client_for(ProviderKind::KimiOfficial, "kimi-k3");
+        assert_eq!(
+            official.url(Protocol::OpenAiChat),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+
+        let go = client_for(ProviderKind::OpenCodeGo, "kimi-k3");
+        assert_eq!(
+            go.url(Protocol::OpenAiChat),
+            "https://opencode.ai/zen/go/v1/chat/completions"
+        );
+    }
+
     #[test]
     fn classifies_known_errors() {
         assert_eq!(
@@ -301,6 +366,42 @@ mod tests {
                 "model is hosted in China; enable region"
             ),
             FailureClass::ProviderConfiguration
+        );
+    }
+
+    #[test]
+    fn classifies_kimi_code_entitlement_and_quota_errors() {
+        assert_eq!(
+            classify_provider_status(
+                ProviderKind::KimiCode,
+                StatusCode::UNAUTHORIZED,
+                "Your current plan supports only kimi-k3 up to 256K context"
+            ),
+            FailureClass::ProviderConfiguration
+        );
+        assert_eq!(
+            classify_provider_status(
+                ProviderKind::KimiCode,
+                StatusCode::FORBIDDEN,
+                "You've reached your usage limit for this billing cycle"
+            ),
+            FailureClass::ProviderBilling
+        );
+        assert_eq!(
+            classify_provider_status(
+                ProviderKind::KimiCode,
+                StatusCode::PAYMENT_REQUIRED,
+                "unable to verify membership benefits"
+            ),
+            FailureClass::ProviderTransient
+        );
+        assert_eq!(
+            classify_provider_status(
+                ProviderKind::KimiCode,
+                StatusCode::TOO_MANY_REQUESTS,
+                "the engine is currently overloaded"
+            ),
+            FailureClass::ProviderCapacity
         );
     }
 }

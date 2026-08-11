@@ -324,6 +324,17 @@ fn test_provider_kind(
     kind: ProviderKind,
     protocol: Protocol,
 ) -> ProviderConfig {
+    test_provider_kind_model(id, credential, upstream, kind, protocol, UPSTREAM_MODEL)
+}
+
+fn test_provider_kind_model(
+    id: &str,
+    credential: &str,
+    upstream: &MockProvider,
+    kind: ProviderKind,
+    protocol: Protocol,
+    model: &str,
+) -> ProviderConfig {
     ProviderConfig {
         id: id.into(),
         kind,
@@ -333,17 +344,21 @@ fn test_provider_kind(
             api_key: format!("test-key-{credential}"),
         }],
         models: vec![ProviderModelConfig {
-            name: UPSTREAM_MODEL.into(),
+            name: model.into(),
             protocols: vec![protocol],
         }],
     }
 }
 
 fn target(provider: &str, credential: &str) -> RouteTargetConfig {
+    target_model(provider, credential, UPSTREAM_MODEL)
+}
+
+fn target_model(provider: &str, credential: &str, model: &str) -> RouteTargetConfig {
     RouteTargetConfig {
         provider: provider.into(),
         credential: credential.into(),
-        model: UPSTREAM_MODEL.into(),
+        model: model.into(),
     }
 }
 
@@ -870,6 +885,232 @@ async fn exhausts_every_target_in_a_layer_before_later_layer_fallback() {
 }
 
 #[tokio::test]
+async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallback() {
+    let go = MockProvider::start(vec![MockReply::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error":{"message":"go capacity exhausted"}}),
+    )])
+    .await;
+    let code = MockProvider::start(vec![MockReply::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error":{"message":"code capacity exhausted"}}),
+    )])
+    .await;
+    let official = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("official reasoning", "official answer"),
+    )])
+    .await;
+
+    let mut config = test_config(
+        vec![
+            test_provider_kind_model(
+                "opencode-go-kimi",
+                "go-plan",
+                &go,
+                ProviderKind::OpenCodeGo,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+            test_provider_kind_model(
+                "kimi-code",
+                "allegretto",
+                &code,
+                ProviderKind::KimiCode,
+                Protocol::OpenAiChat,
+                "k3",
+            ),
+            test_provider_kind_model(
+                "kimi-official",
+                "official-payg",
+                &official,
+                ProviderKind::KimiOfficial,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+        ],
+        vec![
+            (
+                "subscriptions",
+                vec![
+                    target_model("opencode-go-kimi", "go-plan", "kimi-k3"),
+                    target_model("kimi-code", "allegretto", "k3"),
+                ],
+            ),
+            (
+                "payg",
+                vec![target_model("kimi-official", "official-payg", "kimi-k3")],
+            ),
+        ],
+    );
+    config.models[0].name = "kimi-k3".into();
+    config.models[0].aliases = vec!["kimi-k3-1m".into()];
+    config.models[0].layers[0].strategy = RouteStrategy::PromptPrefixAffinity;
+
+    let gateway = Gateway::start_config(config, 0x31_000_000).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&json!({
+            "model":"kimi-k3-1m",
+            "reasoning_effort":"low",
+            "messages":[{"role":"user","content":"Reply with OK."}]
+        }))
+        .send()
+        .await
+        .expect("Kimi layered response");
+    let request_id = header_value(&response, "x-relay-request-id");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-provider"), "kimi-official");
+    assert_eq!(header_value(&response, "x-relay-route-layer"), "payg");
+    assert_eq!(header_value(&response, "x-relay-fallback"), "1");
+    assert_eq!(
+        header_value(&response, "x-relay-selection-reason"),
+        "single-target"
+    );
+    let body = response.json::<Value>().await.expect("Kimi response JSON");
+    assert_eq!(body["choices"][0]["message"]["content"], "official answer");
+
+    for (provider, expected_model) in [(&go, "kimi-k3"), (&code, "k3"), (&official, "kimi-k3")] {
+        let bodies = provider.request_bodies().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["model"], expected_model);
+        assert_eq!(bodies[0]["reasoning_effort"], "low");
+    }
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=10"))
+        .send()
+        .await
+        .expect("Kimi attempts response")
+        .json::<Value>()
+        .await
+        .expect("Kimi attempts JSON");
+    let attempts = attempts_for_request(&attempts, &request_id);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt["route_layer"] == "subscriptions")
+            .count(),
+        2
+    );
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt["route_layer"] == "payg")
+            .count(),
+        1
+    );
+    eprintln!(
+        "KIMI_LAYER_EVIDENCE {}",
+        json!({"plan_attempts":2,"payg_attempts":1,"models":{"opencode-go":"kimi-k3","kimi-code":"k3","kimi-official":"kimi-k3"}})
+    );
+}
+
+#[tokio::test]
+async fn kimi_code_and_opencode_go_compete_by_prefix_with_isolated_model_namespaces() {
+    let go = MockProvider::start(
+        (0..2)
+            .map(|_| MockReply::json(StatusCode::OK, chat_completion("go", "go")))
+            .collect(),
+    )
+    .await;
+    let code = MockProvider::start(
+        (0..2)
+            .map(|_| MockReply::json(StatusCode::OK, chat_completion("code", "code")))
+            .collect(),
+    )
+    .await;
+    let mut config = test_config(
+        vec![
+            test_provider_kind_model(
+                "opencode-go-kimi",
+                "go-plan",
+                &go,
+                ProviderKind::OpenCodeGo,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+            test_provider_kind_model(
+                "kimi-code",
+                "allegretto",
+                &code,
+                ProviderKind::KimiCode,
+                Protocol::OpenAiChat,
+                "k3",
+            ),
+        ],
+        vec![(
+            "subscriptions",
+            vec![
+                target_model("opencode-go-kimi", "go-plan", "kimi-k3"),
+                target_model("kimi-code", "allegretto", "k3"),
+            ],
+        )],
+    );
+    config.models[0].name = "kimi-k3".into();
+    config.models[0].aliases = vec!["kimi-k3-1m".into()];
+    config.models[0].layers[0].strategy = RouteStrategy::PromptPrefixAffinity;
+    config.affinity.checkpoint_bytes = 128;
+
+    let gateway = Gateway::start_config(config, 0x31_aff1).await;
+    let client = reqwest::Client::new();
+    let common = "Kimi K3 isolated affinity prefix. ".repeat(150);
+    let request = |suffix: &str| {
+        json!({
+            "model":"kimi-k3",
+            "messages":[{"role":"user","content":format!("{common}{suffix}")}]
+        })
+    };
+
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&request("cold branch"))
+        .send()
+        .await
+        .expect("cold mixed Kimi response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let warm_provider = header_value(&first, "x-relay-provider");
+    assert_eq!(header_value(&first, "x-relay-selection-reason"), "random");
+    let _ = first.json::<Value>().await.expect("cold mixed Kimi JSON");
+
+    let second = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&request("divergent branch"))
+        .send()
+        .await
+        .expect("warm mixed Kimi response");
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(header_value(&second, "x-relay-provider"), warm_provider);
+    assert_eq!(
+        header_value(&second, "x-relay-selection-reason"),
+        "prompt-prefix-affinity"
+    );
+    assert!(
+        header_value(&second, "x-relay-matched-prefix-bytes")
+            .parse::<u64>()
+            .expect("Kimi matched prefix bytes")
+            > 4_000
+    );
+    let _ = second.json::<Value>().await.expect("warm mixed Kimi JSON");
+
+    for body in go.request_bodies().await {
+        assert_eq!(body["model"], "kimi-k3");
+    }
+    for body in code.request_bodies().await {
+        assert_eq!(body["model"], "k3");
+    }
+    eprintln!(
+        "KIMI_AFFINITY_EVIDENCE {}",
+        json!({"warm_provider":warm_provider,"requests":2,"namespaces":["opencode-go/kimi-k3","kimi-code/k3"]})
+    );
+}
+
+#[tokio::test]
 async fn chat_client_uses_responses_only_provider_with_bidirectional_translation() {
     let upstream = MockProvider::start(vec![MockReply::json(
         StatusCode::OK,
@@ -1064,6 +1305,7 @@ async fn anthropic_provider_stream_is_translated_to_responses_stream() {
     assert_eq!(response.status(), StatusCode::OK);
     let stream = response.text().await.expect("translated Responses stream");
     assert!(stream.contains("event: response.created"));
+    assert!(stream.contains(&format!("\"model\":\"{LOGICAL_MODEL}\"")));
     assert!(stream.contains("event: response.reasoning_text.delta"));
     assert!(stream.contains("anthropic stream thought"));
     assert!(stream.contains("event: response.output_text.delta"));
@@ -1372,6 +1614,7 @@ async fn responses_nonstream_contains_translated_reasoning_output() {
         .expect("Responses response");
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.json::<Value>().await.expect("Responses JSON");
+    assert_eq!(body["model"], LOGICAL_MODEL);
     assert_eq!(body["output"][0]["type"], "reasoning");
     assert_eq!(
         body["output"][0]["content"][0]["text"],

@@ -365,12 +365,7 @@ fn affinity_context(
     let (_, _, prepared) =
         prepare_for_provider(egress, ingress, original, runtime.client.model()).ok()?;
     let bytes = canonical_prompt_bytes(prepared)?;
-    let namespace = format!(
-        "{}\0{}\0{}\0canonical-json-v1",
-        runtime.client.kind().as_str(),
-        egress.as_str(),
-        runtime.client.model()
-    );
+    let namespace = affinity_namespace(runtime.client.kind(), egress, runtime.client.model());
     let path = state
         .affinity
         .fingerprint(namespace.as_bytes(), [bytes.as_slice()]);
@@ -385,6 +380,15 @@ fn affinity_context(
         generation: "configured-target-v1".into(),
     };
     Some((path, domain))
+}
+
+fn affinity_namespace(kind: ProviderKind, egress: Protocol, model: &str) -> String {
+    format!(
+        "{}\0{}\0{}\0canonical-json-v1",
+        kind.as_str(),
+        egress.as_str(),
+        model
+    )
 }
 
 fn canonical_prompt_bytes(mut prepared: Value) -> Option<Vec<u8>> {
@@ -704,7 +708,12 @@ async fn execute_json_attempt(
         }
     };
     let body = if translated {
-        translate_nonstream(ingress, egress, &raw)
+        translate_nonstream(
+            ingress,
+            egress,
+            &raw,
+            protocol::model_name(original).unwrap_or(runtime.client.model()),
+        )
     } else {
         raw.clone()
     };
@@ -867,7 +876,8 @@ async fn handle_stream(
         let mut response_bytes = 0_u64;
         let mut usage = Usage::default();
         let mut stream_error = None;
-        let mut response_translator = responses::ChatToResponsesStream::new();
+        let mut response_translator =
+            responses::ChatToResponsesStream::new(requested_model.clone());
         let mut anthropic_translator = anthropic::ChatToAnthropicStream::new();
         let mut responses_source = responses::ResponsesToChatStream::new();
         let mut anthropic_source = anthropic::AnthropicToChatStream::new();
@@ -1226,7 +1236,12 @@ fn prepare_for_provider(
     Ok((egress, true, prepared))
 }
 
-fn translate_nonstream(ingress: Protocol, egress: Protocol, raw: &Value) -> Value {
+fn translate_nonstream(
+    ingress: Protocol,
+    egress: Protocol,
+    raw: &Value,
+    response_model: &str,
+) -> Value {
     if ingress == egress {
         return raw.clone();
     }
@@ -1237,7 +1252,7 @@ fn translate_nonstream(ingress: Protocol, egress: Protocol, raw: &Value) -> Valu
     };
     match ingress {
         Protocol::OpenAiChat => chat,
-        Protocol::OpenAiResponses => responses::chat_to_response(&chat),
+        Protocol::OpenAiResponses => responses::chat_to_response(&chat, response_model),
         Protocol::AnthropicMessages => anthropic::chat_to_message(&chat),
     }
 }
@@ -1744,6 +1759,31 @@ mod tests {
         ] {
             assert_ne!(baseline, canonical_prompt_bytes(changed).unwrap());
         }
+    }
+
+    #[test]
+    fn affinity_namespaces_isolate_provider_kind_protocol_and_upstream_model() {
+        let go_k3 = affinity_namespace(ProviderKind::OpenCodeGo, Protocol::OpenAiChat, "kimi-k3");
+        assert_ne!(
+            go_k3,
+            affinity_namespace(ProviderKind::KimiCode, Protocol::OpenAiChat, "k3")
+        );
+        assert_ne!(
+            go_k3,
+            affinity_namespace(
+                ProviderKind::OpenCodeGo,
+                Protocol::AnthropicMessages,
+                "kimi-k3"
+            )
+        );
+        assert_ne!(
+            go_k3,
+            affinity_namespace(
+                ProviderKind::OpenCodeGo,
+                Protocol::OpenAiChat,
+                "kimi-k3-256k"
+            )
+        );
     }
 
     #[test]

@@ -5,9 +5,9 @@ use crate::config::ProviderKind;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Protocol {
-    #[serde(rename = "openai-chat")]
+    #[serde(rename = "openai-chat", alias = "open-ai-chat")]
     OpenAiChat,
-    #[serde(rename = "openai-responses")]
+    #[serde(rename = "openai-responses", alias = "open-ai-responses")]
     OpenAiResponses,
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
@@ -281,6 +281,26 @@ pub struct AlertRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_reads_legacy_open_ai_spellings_but_writes_canonical_values() {
+        assert_eq!(
+            serde_json::from_str::<Protocol>(r#""open-ai-chat""#).unwrap(),
+            Protocol::OpenAiChat
+        );
+        assert_eq!(
+            serde_json::from_str::<Protocol>(r#""open-ai-responses""#).unwrap(),
+            Protocol::OpenAiResponses
+        );
+        assert_eq!(
+            serde_json::to_string(&Protocol::OpenAiChat).unwrap(),
+            r#""openai-chat""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Protocol::OpenAiResponses).unwrap(),
+            r#""openai-responses""#
+        );
+    }
 
     #[test]
     fn parses_go_cache_usage() {

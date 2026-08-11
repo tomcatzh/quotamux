@@ -537,7 +537,7 @@ fn copy_field(
     }
 }
 
-pub fn chat_to_response(chat: &Value) -> Value {
+pub fn chat_to_response(chat: &Value, response_model: &str) -> Value {
     let id = chat
         .get("id")
         .and_then(Value::as_str)
@@ -582,7 +582,7 @@ pub fn chat_to_response(chat: &Value) -> Value {
         "status":if finish == Some("length") {"incomplete"} else {"completed"},
         "error":Value::Null,
         "incomplete_details":if finish == Some("length") {json!({"reason":"max_output_tokens"})} else {Value::Null},
-        "instructions":Value::Null,"max_output_tokens":Value::Null,"model":LOGICAL_MODEL,
+        "instructions":Value::Null,"max_output_tokens":Value::Null,"model":response_model,
         "output":output,"parallel_tool_calls":true,"store":false,
         "usage":{"input_tokens":usage.input_tokens,"input_tokens_details":{"cached_tokens":usage.cache_hit_tokens},"output_tokens":usage.output_tokens,"output_tokens_details":{"reasoning_tokens":usage.reasoning_tokens},"total_tokens":usage.total_tokens}
     })
@@ -654,6 +654,7 @@ pub fn response_to_chat(response: &Value) -> Value {
 
 pub struct ChatToResponsesStream {
     response_id: String,
+    response_model: String,
     sequence: u64,
     reasoning_id: Option<String>,
     message_id: Option<String>,
@@ -664,12 +665,6 @@ pub struct ChatToResponsesStream {
     started: bool,
 }
 
-impl Default for ChatToResponsesStream {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 struct StreamCall {
     item_id: String,
     call_id: String,
@@ -678,9 +673,10 @@ struct StreamCall {
 }
 
 impl ChatToResponsesStream {
-    pub fn new() -> Self {
+    pub fn new(response_model: impl Into<String>) -> Self {
         Self {
             response_id: format!("resp_{}", Uuid::now_v7()),
+            response_model: response_model.into(),
             sequence: 0,
             reasoning_id: None,
             message_id: None,
@@ -860,7 +856,7 @@ impl ChatToResponsesStream {
 
     fn response_skeleton(&self, status: &str) -> Value {
         let usage = &self.usage;
-        json!({"id":self.response_id,"object":"response","created_at":chrono::Utc::now().timestamp(),"status":status,"error":Value::Null,"incomplete_details":Value::Null,"model":LOGICAL_MODEL,"output":[],"parallel_tool_calls":true,"store":false,"usage":{"input_tokens":usage.input_tokens,"input_tokens_details":{"cached_tokens":usage.cache_hit_tokens},"output_tokens":usage.output_tokens,"output_tokens_details":{"reasoning_tokens":usage.reasoning_tokens},"total_tokens":usage.total_tokens}})
+        json!({"id":self.response_id,"object":"response","created_at":chrono::Utc::now().timestamp(),"status":status,"error":Value::Null,"incomplete_details":Value::Null,"model":self.response_model,"output":[],"parallel_tool_calls":true,"store":false,"usage":{"input_tokens":usage.input_tokens,"input_tokens_details":{"cached_tokens":usage.cache_hit_tokens},"output_tokens":usage.output_tokens,"output_tokens_details":{"reasoning_tokens":usage.reasoning_tokens},"total_tokens":usage.total_tokens}})
     }
 }
 
@@ -1089,7 +1085,8 @@ mod tests {
     #[test]
     fn returns_reasoning_in_response_output() {
         let chat = json!({"id":"chatcmpl-x","choices":[{"finish_reason":"stop","message":{"reasoning_content":"r","content":"a"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}});
-        let response = chat_to_response(&chat);
+        let response = chat_to_response(&chat, "public-kimi-k3");
+        assert_eq!(response["model"], "public-kimi-k3");
         assert_eq!(response["output"][0]["type"], "reasoning");
         assert_eq!(response["output"][1]["type"], "message");
     }
@@ -1177,7 +1174,7 @@ mod tests {
 
     #[test]
     fn responses_destination_stream_preserves_canonical_usage() {
-        let mut stream = ChatToResponsesStream::new();
+        let mut stream = ChatToResponsesStream::new("public-kimi-k3");
         stream.translate(&json!({
             "choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}],
             "usage":{
@@ -1188,6 +1185,7 @@ mod tests {
         }));
         let completed = stream.finish().pop().expect("response.completed event");
         let completed: Value = serde_json::from_str(&completed.data).unwrap();
+        assert_eq!(completed["response"]["model"], "public-kimi-k3");
         assert_eq!(
             completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
             9

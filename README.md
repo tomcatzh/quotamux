@@ -170,6 +170,141 @@ targets = [
 ]
 ```
 
+## Complete Kimi K3 1M example
+
+This configuration exposes one public `kimi-k3` model through all three client
+protocols. OpenCode Go and Kimi Code Allegretto are equivalent subscription
+targets in the first layer. Kimi's China Open Platform is the single PAYG
+fallback in the second layer.
+
+The exact upstream IDs are intentionally different: OpenCode Go and the Open
+Platform use `kimi-k3`; Kimi Code API calls use `k3`. Do not send `k3[1m]` as an
+API model ID. Kimi documents that form only for a Claude Code environment
+variable; Allegretto unlocks the normal `k3` API ID up to 1M context.
+
+```toml
+config_version = 2
+
+[server]
+listen = "0.0.0.0:8080"
+data_dir = "./data"
+
+[affinity]
+checkpoint_bytes = 128
+max_checkpoints_per_path = 4096
+max_candidates_per_prefix = 8
+max_leases = 16384
+success_ttl_ms = 300000
+
+[[providers]]
+id = "opencode-go"
+kind = "opencode-go"
+
+[[providers.credentials]]
+id = "opencode-go-plan"
+api_key = "replace-with-opencode-go-key"
+
+[[providers.models]]
+name = "kimi-k3"
+protocols = ["openai-chat"]
+
+[[providers]]
+id = "kimi-code"
+kind = "kimi-code"
+
+[[providers.credentials]]
+id = "kimi-code-allegretto"
+api_key = "replace-with-kimi-code-key"
+
+[[providers.models]]
+name = "k3"
+protocols = ["openai-chat"]
+
+[[providers]]
+id = "kimi-official"
+kind = "kimi-official"
+
+[[providers.credentials]]
+id = "kimi-official-payg"
+api_key = "replace-with-kimi-open-platform-key"
+
+[[providers.models]]
+name = "kimi-k3"
+protocols = ["openai-chat"]
+
+[[models]]
+name = "kimi-k3"
+aliases = ["kimi-k3-1m"]
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+[[models.layers]]
+name = "subscriptions"
+strategy = "prompt-prefix-affinity"
+targets = [
+  { provider = "opencode-go", credential = "opencode-go-plan", model = "kimi-k3" },
+  { provider = "kimi-code", credential = "kimi-code-allegretto", model = "k3" },
+]
+
+[[models.layers]]
+name = "payg"
+strategy = "random"
+targets = [
+  { provider = "kimi-official", credential = "kimi-official-payg", model = "kimi-k3" },
+]
+```
+
+Provider kind, egress protocol, and exact upstream model ID form the affinity
+namespace. Consequently `opencode-go/kimi-k3` and `kimi-code/k3` have isolated
+prefix trees and cache evidence. On each request QuotaMux queries every eligible
+target in its own namespace and ranks candidates by the longest matched prefix.
+The single-target PAYG layer skips hashing and affinity bookkeeping.
+
+Official references:
+
+- [OpenCode Go Kimi K3 model ID and endpoint](https://opencode.ai/docs/go#endpoints)
+- [Kimi Code API endpoints and 1M Allegretto entitlement](https://www.kimi.com/code/docs/)
+- [Kimi Open Platform K3, 1M context, and recharge requirement](https://platform.kimi.com/docs/guide/kimi-k3-quickstart)
+
+### Codex worker through QuotaMux `/v1`
+
+Codex uses the Responses wire protocol for custom providers. Add this to the
+user-level Codex `config.toml`; the `/v1` suffix on `base_url` is required:
+
+```toml
+model = "kimi-k3"
+model_provider = "quotamux"
+model_reasoning_effort = "low"
+model_context_window = 1048576
+web_search = "disabled"
+
+[model_providers.quotamux]
+name = "QuotaMux"
+base_url = "http://127.0.0.1:8080/v1"
+env_key = "QUOTAMUX_WORKER_API_KEY"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+```
+
+Then define the credential variable before starting Codex:
+
+```sh
+export QUOTAMUX_WORKER_API_KEY=local-worker-test
+```
+
+QuotaMux does not currently authenticate inbound requests, so this value is a
+local placeholder required by Codex's custom-provider configuration; it is not
+one of the upstream Kimi keys. Keep `web_search = "disabled"`: Kimi is reached
+through Chat Completions and cannot execute the Responses API's hosted web
+search tool. Function tools such as Codex's local shell remain enabled and are
+translated normally.
+
+Codex 0.145 can warn that `kimi-k3` has no Codex-native model-catalog entry and
+fall back to generic metadata. The worker path is nevertheless accepted, and
+the explicit context-window setting preserves the intended 1M limit. QuotaMux
+continues to expose the standard OpenAI `GET /v1/models` shape rather than a
+Codex-private catalog shape.
+
 Validate before every restart:
 
 ```sh
@@ -209,15 +344,21 @@ keep it out of Git and restrict its file permissions:
 chmod 600 quotamux.toml
 ```
 
-### Implemented provider kinds
+### Production-accepted provider kinds
 
 The currently implemented provider adapters are intentionally narrower than
 the provider-kind enum in the configuration schema:
 
 | `kind` | Default endpoint | Current acceptance status |
 | --- | --- | --- |
-| `opencode-go` | `https://opencode.ai/zen/go/v1` | Implemented; `deepseek-v4-flash` over Chat Completions is covered by the real-worker test. Protocol remains model-specific. |
+| `opencode-go` | `https://opencode.ai/zen/go/v1` | Real-worker accepted for `deepseek-v4-flash`; real stream and 300,095-input-token acceptance also pass for `kimi-k3`. Protocol remains model-specific. |
 | `deepseek-official` | `https://api.deepseek.com` | Implemented as the PAYG/fallback adapter, including DeepSeek-specific balance, cost, and Anthropic path handling. |
+| `kimi-code` | `https://api.kimi.com/coding/v1` | Real Allegretto streaming and 300,095-input-token acceptance pass with exact model `k3`; a live Codex worker completed a two-turn Responses-to-Chat reasoning/tool loop through this adapter. |
+| `kimi-official` | `https://api.moonshot.cn/v1` | Real paid-account streaming and 300,095-input-token acceptance pass with exact model `kimi-k3`; layered fallback and provider-specific model rewrites are covered end to end. |
+
+Both Kimi adapters deliberately expose only `openai-chat` upstream for now. A
+served model can still expose Chat Completions, Responses, and Anthropic
+Messages; QuotaMux translates the latter two to Chat.
 
 For these kinds, `endpoint` is a base URL and QuotaMux appends the protocol
 path. An endpoint override is allowed for local tests.
@@ -233,7 +374,6 @@ shown by the provider rather than guessing from the marketing name:
 The following names are already reserved in the configuration enum, but their
 presence is scaffolding, not a support claim:
 
-- `kimi-official`
 - `aliyun-bailian`
 - `ollama-cloud`
 - `opencode-zen`
@@ -521,8 +661,32 @@ cache/route evidence:
 cargo test --test real_worker_affinity -- --ignored --nocapture
 ```
 
+Kimi has a separate ignored real suite. It uses the existing private
+`quotamux.toml`, directly smokes all three configured K3 targets, and verifies
+the mixed subscription layer's prompt-prefix affinity:
+
+```sh
+cargo test --test real_kimi_k3 -- --ignored --nocapture
+```
+
+The >256K confirmation is additionally gated because it deliberately sends a
+large paid prompt to every target:
+
+```sh
+QUOTAMUX_CONFIRM_1M=1 \
+  cargo test --test real_kimi_k3 \
+  each_kimi_k3_target_accepts_more_than_256k_prompt_tokens \
+  -- --ignored --nocapture
+```
+
 Captured test counts and real provider cache data are in
 [docs/test-evidence.md](docs/test-evidence.md).
+
+The verified Codex worker configuration above uses the official custom-provider
+keys `base_url`, `env_key`, and `wire_api = "responses"`, with web search
+disabled because that hosted Responses tool is not available on the translated
+Chat route. See the
+[Codex configuration reference](https://developers.openai.com/codex/config-reference).
 
 ## Design documentation
 

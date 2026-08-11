@@ -36,6 +36,8 @@ pub enum ProviderKind {
     DeepSeekOfficial,
     #[serde(rename = "kimi-official")]
     KimiOfficial,
+    #[serde(rename = "kimi-code")]
+    KimiCode,
     #[serde(rename = "aliyun-bailian")]
     AliyunBailian,
     #[serde(rename = "ollama-cloud")]
@@ -57,6 +59,7 @@ impl ProviderKind {
         match self {
             Self::DeepSeekOfficial => "deepseek-official",
             Self::KimiOfficial => "kimi-official",
+            Self::KimiCode => "kimi-code",
             Self::AliyunBailian => "aliyun-bailian",
             Self::OllamaCloud => "ollama-cloud",
             Self::OpenCodeZen => "opencode-zen",
@@ -71,6 +74,7 @@ impl ProviderKind {
         match self {
             Self::DeepSeekOfficial => Some("https://api.deepseek.com"),
             Self::KimiOfficial => Some("https://api.moonshot.cn/v1"),
+            Self::KimiCode => Some("https://api.kimi.com/coding/v1"),
             Self::OllamaCloud => Some("https://ollama.com/v1"),
             Self::OpenCodeZen => Some("https://opencode.ai/zen/v1"),
             Self::OpenCodeGo => Some("https://opencode.ai/zen/go/v1"),
@@ -83,7 +87,9 @@ impl ProviderKind {
 
     pub const fn fixed_protocol(self) -> Option<Protocol> {
         match self {
-            Self::KimiOfficial | Self::CustomChatCompletions => Some(Protocol::OpenAiChat),
+            Self::KimiOfficial | Self::KimiCode | Self::CustomChatCompletions => {
+                Some(Protocol::OpenAiChat)
+            }
             Self::CustomResponses => Some(Protocol::OpenAiResponses),
             Self::CustomAnthropic => Some(Protocol::AnthropicMessages),
             _ => None,
@@ -569,6 +575,29 @@ mod tests {
         config.providers[0].models[0].protocols =
             vec![Protocol::OpenAiChat, Protocol::OpenAiResponses];
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn kimi_code_has_its_own_chat_endpoint_and_rejects_other_egress_protocols() {
+        assert_eq!(
+            ProviderKind::KimiCode.default_endpoint(),
+            Some("https://api.kimi.com/coding/v1")
+        );
+        assert_eq!(
+            ProviderKind::KimiCode.fixed_protocol(),
+            Some(Protocol::OpenAiChat)
+        );
+
+        let mut config = valid();
+        config.providers[0].kind = ProviderKind::KimiCode;
+        config.providers[0].models[0].name = "k3".into();
+        config.models[0].layers[0].targets[0].model = "k3".into();
+        config.validate().unwrap();
+
+        config.providers[0].models[0].protocols = vec![Protocol::AnthropicMessages];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("must contain only openai-chat"));
+        assert!(error.contains("kimi-code"));
     }
 
     #[test]
