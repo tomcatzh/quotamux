@@ -66,6 +66,7 @@ fn translate_input_items(
     items: &[Value],
     messages: &mut Vec<Value>,
 ) -> Result<(), ValidationError> {
+    let mut pending_reasoning = String::new();
     for item in items {
         match item
             .get("type")
@@ -75,20 +76,25 @@ fn translate_input_items(
             "message" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let role = if role == "developer" { "system" } else { role };
-                messages.push(json!({"role":role,"content":content_text(item.get("content"))}));
+                let content = content_text(item.get("content"));
+                if role == "assistant" && content.is_empty() {
+                    continue;
+                }
+                let mut message = json!({"role":role,"content":content});
+                if role == "assistant" && !pending_reasoning.is_empty() {
+                    message.as_object_mut().unwrap().insert(
+                        "reasoning_content".into(),
+                        Value::String(std::mem::take(&mut pending_reasoning)),
+                    );
+                } else if role != "assistant" {
+                    pending_reasoning.clear();
+                }
+                messages.push(message);
             }
             "reasoning" => {
                 let text = reasoning_text(item);
-                if let Some(previous) = messages.last_mut().filter(|message| {
-                    message.get("role").and_then(Value::as_str) == Some("assistant")
-                }) {
-                    previous
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("reasoning_content".into(), Value::String(text));
-                } else {
-                    messages
-                        .push(json!({"role":"assistant","content":null,"reasoning_content":text}));
+                if !text.is_empty() {
+                    pending_reasoning.push_str(&text);
                 }
             }
             "function_call" => {
@@ -104,6 +110,12 @@ fn translate_input_items(
                     message.get("role").and_then(Value::as_str) == Some("assistant")
                 }) {
                     let object = previous.as_object_mut().unwrap();
+                    if !pending_reasoning.is_empty() {
+                        object.insert(
+                            "reasoning_content".into(),
+                            Value::String(std::mem::take(&mut pending_reasoning)),
+                        );
+                    }
                     object
                         .entry("tool_calls")
                         .or_insert_with(|| Value::Array(Vec::new()))
@@ -111,17 +123,63 @@ fn translate_input_items(
                         .unwrap()
                         .push(call);
                 } else {
-                    messages.push(json!({"role":"assistant","content":null,"tool_calls":[call]}));
+                    let reasoning = std::mem::take(&mut pending_reasoning);
+                    let mut message =
+                        json!({"role":"assistant","content":null,"tool_calls":[call]});
+                    if !reasoning.is_empty() {
+                        message
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("reasoning_content".into(), Value::String(reasoning));
+                    }
+                    messages.push(message);
                 }
             }
-            "function_call_output" => messages.push(json!({
-                "role":"tool",
-                "tool_call_id":item.get("call_id").cloned().unwrap_or(Value::String(String::new())),
-                "content":content_text(item.get("output")),
-            })),
+            "function_call_output" => {
+                pending_reasoning.clear();
+                messages.push(json!({
+                    "role":"tool",
+                    "tool_call_id":item.get("call_id").cloned().unwrap_or(Value::String(String::new())),
+                    "content":content_text(item.get("output")),
+                }));
+            }
+            "agent_message" => {
+                pending_reasoning.clear();
+                let author = item
+                    .get("author")
+                    .and_then(Value::as_str)
+                    .unwrap_or("agent");
+                let recipient = item
+                    .get("recipient")
+                    .and_then(Value::as_str)
+                    .unwrap_or("agent");
+                let content = content_text(item.get("content"));
+                if content.is_empty() {
+                    let detail = if item.get("encrypted_content").is_some() {
+                        "encrypted agent_message content cannot be translated by a third-party provider"
+                    } else {
+                        "agent_message content must not be empty"
+                    };
+                    return Err(ValidationError::invalid(detail, Some("input")));
+                }
+                messages.push(json!({
+                    "role":"user",
+                    "content":format!(
+                        "[Agent message from {author} to {recipient}]\n{}",
+                        content
+                    )
+                }));
+            }
             unsupported => {
+                let keys = item
+                    .as_object()
+                    .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+                    .unwrap_or_default();
+                let role = item.get("role").and_then(Value::as_str).unwrap_or_default();
                 return Err(ValidationError::invalid(
-                    format!("unsupported Responses input item type {unsupported}"),
+                    format!(
+                        "unsupported Responses input item type {unsupported} (keys={keys}; role={role})"
+                    ),
                     Some("input"),
                 ));
             }
@@ -191,17 +249,27 @@ fn translate_reasoning(body: &Value, chat: &mut Map<String, Value>) {
 
 fn translate_tools(body: &Value, chat: &mut Map<String, Value>) -> Result<(), ValidationError> {
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let translated = tools.iter().map(|tool| {
-            if tool.get("type").and_then(Value::as_str) != Some("function") {
-                return Err(ValidationError::invalid("only function tools are supported", Some("tools")));
+        let mut translated = Vec::new();
+        for tool in tools {
+            match tool.get("type").and_then(Value::as_str) {
+                Some("function") => translated.push(response_function_to_chat(tool)),
+                Some("namespace") => {
+                    let members = tool.get("tools").and_then(Value::as_array).ok_or_else(|| {
+                        ValidationError::invalid(
+                            "Responses namespace tool requires a tools array",
+                            Some("tools"),
+                        )
+                    })?;
+                    for member in members {
+                        if member.get("type").and_then(Value::as_str) != Some("function") {
+                            return Err(unsupported_tool(member));
+                        }
+                        translated.push(response_function_to_chat(member));
+                    }
+                }
+                _ => return Err(unsupported_tool(tool)),
             }
-            Ok(json!({"type":"function","function":{
-                "name":tool.get("name").cloned().unwrap_or(Value::String(String::new())),
-                "description":tool.get("description").cloned().unwrap_or(Value::String(String::new())),
-                "parameters":tool.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}})),
-                "strict":tool.get("strict").cloned().unwrap_or(Value::Bool(false))
-            }}))
-        }).collect::<Result<Vec<_>, _>>()?;
+        }
         chat.insert("tools".into(), Value::Array(translated));
     }
     if let Some(choice) = body.get("tool_choice") {
@@ -221,6 +289,31 @@ fn translate_tools(body: &Value, chat: &mut Map<String, Value>) -> Result<(), Va
         chat.insert("tool_choice".into(), translated);
     }
     Ok(())
+}
+
+fn response_function_to_chat(tool: &Value) -> Value {
+    json!({"type":"function","function":{
+        "name":tool.get("name").cloned().unwrap_or(Value::String(String::new())),
+        "description":tool.get("description").cloned().unwrap_or(Value::String(String::new())),
+        "parameters":tool.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+        "strict":tool.get("strict").cloned().unwrap_or(Value::Bool(false))
+    }})
+}
+
+fn unsupported_tool(tool: &Value) -> ValidationError {
+    let tool_type = tool
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let keys = tool
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+    ValidationError::invalid(
+        format!("unsupported Responses tool type {tool_type} (keys={keys}; name={name})"),
+        Some("tools"),
+    )
 }
 
 fn translate_text_format(body: &Value, chat: &mut Map<String, Value>) {
@@ -537,6 +630,96 @@ mod tests {
         assert_eq!(chat["messages"][1]["reasoning_content"], "think");
         assert_eq!(chat["messages"][1]["tool_calls"][0]["id"], "c1");
         assert_eq!(chat["messages"][2]["role"], "tool");
+    }
+
+    #[test]
+    fn flattens_response_tool_namespaces_for_chat() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "input":"delegate",
+            "tools":[{
+                "type":"namespace",
+                "name":"multi_agent_v1",
+                "description":"Agent tools",
+                "tools":[
+                    {"type":"function","name":"spawn_agent","description":"Spawn","parameters":{"type":"object"}},
+                    {"type":"function","name":"wait_agent","description":"Wait","parameters":{"type":"object"}}
+                ]
+            }]
+        });
+        let chat = prepare_for_chat(body, "deepseek-v4-flash").unwrap();
+        assert_eq!(chat["tools"][0]["function"]["name"], "spawn_agent");
+        assert_eq!(chat["tools"][1]["function"]["name"], "wait_agent");
+    }
+
+    #[test]
+    fn translates_agent_messages_to_user_messages_for_chat() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "input":[{
+                "type":"agent_message",
+                "author":"parent",
+                "recipient":"worker",
+                "content":"Read BRIEF.md"
+            }]
+        });
+        let chat = prepare_for_chat(body, "deepseek-v4-flash").unwrap();
+        assert_eq!(chat["messages"][0]["role"], "user");
+        assert_eq!(
+            chat["messages"][0]["content"],
+            "[Agent message from parent to worker]\nRead BRIEF.md"
+        );
+    }
+
+    #[test]
+    fn rejects_encrypted_agent_messages_instead_of_dropping_the_task() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "input":[{
+                "type":"agent_message",
+                "author":"parent",
+                "recipient":"worker",
+                "content":"",
+                "encrypted_content":"opaque"
+            }]
+        });
+        let error = prepare_for_chat(body, "deepseek-v4-flash").unwrap_err();
+        assert!(error.message.contains("encrypted agent_message"));
+    }
+
+    #[test]
+    fn ignores_reasoning_items_without_forwardable_text() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "input":[
+                {"type":"reasoning","id":"rs_encrypted","summary":[]},
+                {"type":"message","role":"user","content":"hello"}
+            ]
+        });
+        let chat = prepare_for_chat(body, "deepseek-v4-flash").unwrap();
+        assert_eq!(chat["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["messages"][0]["role"], "user");
+        assert_eq!(chat["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn merges_reasoning_with_following_assistant_message() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "input":[
+                {"type":"reasoning","content":[{"type":"reasoning_text","text":"plan"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will update the plan."}]},
+                {"type":"function_call","call_id":"c1","name":"update_plan","arguments":"{}"}
+            ]
+        });
+        let chat = prepare_for_chat(body, "deepseek-v4-flash").unwrap();
+        assert_eq!(chat["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["messages"][0]["content"], "I will update the plan.");
+        assert_eq!(chat["messages"][0]["reasoning_content"], "plan");
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "update_plan"
+        );
     }
 
     #[test]
