@@ -140,43 +140,6 @@ impl ProviderClient {
         })
     }
 
-    pub async fn balance(&self) -> Result<Value, ProviderError> {
-        debug_assert_eq!(self.kind, ProviderKind::DeepSeekOfficial);
-        let response = self
-            .client
-            .get(format!(
-                "{}/user/balance",
-                self.endpoint.trim_end_matches('/')
-            ))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .map_err(|error| ProviderError {
-                class: classify_transport(&error),
-                status: error.status(),
-                retry_after: None,
-                safe_message: sanitize_transport_error(&error),
-            })?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = response.bytes().await.unwrap_or_default();
-        if !status.is_success() {
-            let message = extract_error_message(&bytes);
-            return Err(ProviderError {
-                class: classify_status(status, &message),
-                status: Some(status),
-                retry_after: parse_retry_after(&headers),
-                safe_message: message,
-            });
-        }
-        serde_json::from_slice(&bytes).map_err(|_| ProviderError {
-            class: FailureClass::ProviderUnknown5xxOrTransport,
-            status: Some(status),
-            retry_after: None,
-            safe_message: "provider returned malformed balance JSON".into(),
-        })
-    }
-
     fn url(&self, protocol: Protocol) -> String {
         if self.kind.uses_exact_endpoint() {
             return self.endpoint.clone();

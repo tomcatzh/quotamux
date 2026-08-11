@@ -21,7 +21,6 @@ use bytes::Bytes;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
@@ -47,9 +46,7 @@ pub struct AppState {
     targets: HashMap<RouteTargetConfig, Arc<TargetRuntime>>,
     selector: RandomSelector,
     affinity: AffinityDirectory,
-    balance_client: Option<ProviderClient>,
     started_at_ms: i64,
-    balance: RwLock<Option<Value>>,
 }
 
 struct TargetRuntime {
@@ -79,7 +76,6 @@ impl AppState {
         let affinity =
             AffinityDirectory::new(config.affinity.clone()).map_err(std::io::Error::other)?;
         let mut targets = HashMap::new();
-        let mut balance_client = None;
         for served_model in &config.models {
             for layer in &served_model.layers {
                 for target in &layer.targets {
@@ -94,11 +90,6 @@ impl AppState {
                             .model(&target.model)
                             .expect("validated route model");
                         let client = ProviderClient::new(provider, credential, model)?;
-                        if balance_client.is_none()
-                            && provider.kind == ProviderKind::DeepSeekOfficial
-                        {
-                            balance_client = Some(client.clone());
-                        }
                         let circuit_key = format!(
                             "circuit:{}:{}:{}",
                             target.provider, target.credential, target.model
@@ -109,16 +100,13 @@ impl AppState {
                 }
             }
         }
-        let balance = store.get_state("deepseek-balance").unwrap_or(None);
         Ok(Self {
             config,
             store,
             targets,
             selector,
             affinity,
-            balance_client,
             started_at_ms: Utc::now().timestamp_millis(),
-            balance: RwLock::new(balance),
         })
     }
 
@@ -131,27 +119,6 @@ impl AppState {
                 affinity_state
                     .affinity
                     .expire(Utc::now().timestamp_millis());
-            }
-        });
-        let Some(balance_client) = self.balance_client.clone() else {
-            return;
-        };
-        let state = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(15 * 60));
-            loop {
-                interval.tick().await;
-                match balance_client.balance().await {
-                    Ok(balance) => {
-                        *state.balance.write().await = Some(balance.clone());
-                        if let Err(error) = state.store.put_state("deepseek-balance", &balance) {
-                            tracing::warn!(%error, "failed to persist DeepSeek balance snapshot");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(class=%error.class.as_str(), "DeepSeek balance refresh failed")
-                    }
-                }
             }
         });
     }
@@ -520,6 +487,8 @@ async fn handle_nonstream(
         return terminal_failure(
             &state,
             protocol,
+            protocol::model_name(&body).unwrap_or(&served_model.name),
+            &served_model.name,
             &request_id,
             started_at_ms,
             started,
@@ -542,6 +511,8 @@ async fn handle_nonstream(
         requested_model: protocol::model_name(&body)
             .unwrap_or(&served_model.name)
             .into(),
+        served_model: Some(served_model.name.clone()),
+        upstream_model: Some(outcome.candidate.target.model.clone()),
         streaming: false,
         status: 200,
         error_class: None,
@@ -834,6 +805,8 @@ async fn handle_stream(
         return terminal_failure(
             &state,
             protocol,
+            protocol::model_name(&body).unwrap_or(&served_model.name),
+            &served_model.name,
             &request_id,
             started_at_ms,
             started,
@@ -859,6 +832,7 @@ async fn handle_stream(
         .and_then(Value::as_str)
         .unwrap_or(&served_model.name)
         .to_string();
+    let configured_model = served_model.name.clone();
     let claude_session_id = header_text(&headers, "x-claude-code-session-id");
     let claude_agent_id = header_text(&headers, "x-claude-code-agent-id");
     let claude_parent_agent_id = header_text(&headers, "x-claude-code-parent-agent-id");
@@ -970,7 +944,7 @@ async fn handle_stream(
             route_layer_index:Some(candidate_for_stream.layer_index),
             selection_reason:Some(candidate_for_stream.selection_reason.clone()),
             matched_prefix_bytes:candidate_for_stream.matched_prefix_bytes,
-            upstream_model,
+            upstream_model:upstream_model.clone(),
             egress_protocol:egress,
             translated,
             probe,
@@ -995,6 +969,8 @@ async fn handle_stream(
             completed_at_ms,
             protocol,
             requested_model,
+            served_model:Some(configured_model),
+            upstream_model:Some(upstream_model),
             streaming:true,
             status:if stream_error.is_some(){502}else{200},
             error_class:stream_error,
@@ -1261,6 +1237,8 @@ fn translate_nonstream(
 async fn terminal_failure(
     state: &Arc<AppState>,
     protocol: Protocol,
+    requested_model: &str,
+    served_model: &str,
     request_id: &str,
     started_at_ms: i64,
     started: Instant,
@@ -1281,12 +1259,9 @@ async fn terminal_failure(
         started_at_ms,
         completed_at_ms: Utc::now().timestamp_millis(),
         protocol,
-        requested_model: state
-            .config
-            .models
-            .first()
-            .map(|model| model.name.clone())
-            .unwrap_or_default(),
+        requested_model: requested_model.into(),
+        served_model: Some(served_model.into()),
+        upstream_model: candidate.map(|candidate| candidate.target.model.clone()),
         streaming: false,
         status: status.as_u16(),
         error_class: Some(class),
@@ -1596,19 +1571,6 @@ async fn attempts(State(state): State<Arc<AppState>>, Query(query): Query<LimitQ
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let alerts = state.store.alerts(100).unwrap_or_default();
-    let balance = state.balance.read().await.clone();
-    let display = balance
-        .as_ref()
-        .and_then(|v| v.get("balance_infos"))
-        .and_then(Value::as_array)
-        .and_then(|v| v.first())
-        .and_then(|v| {
-            Some(format!(
-                "{} {}",
-                v.get("total_balance")?.as_str()?,
-                v.get("currency")?.as_str()?
-            ))
-        });
     let mut target_rows = Vec::new();
     let mut seen = HashSet::new();
     for model in &state.config.models {
@@ -1629,20 +1591,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
             }
         }
     }
-    let active_provider = target_rows
-        .iter()
-        .find(|row| row.pointer("/circuit/mode").and_then(Value::as_str) == Some("closed"))
-        .and_then(|row| row.get("provider"))
-        .and_then(Value::as_str)
-        .unwrap_or("none");
-    let circuit = target_rows
-        .first()
-        .and_then(|row| row.get("circuit"))
-        .cloned()
-        .unwrap_or(Value::Null);
     Json(json!({
-        "active_provider":active_provider,
-        "circuit":circuit,
+        "models":state.config.models.iter().map(|model|model.name.as_str()).collect::<Vec<_>>(),
         "targets":target_rows,
         "affinity":{
             "storage":"memory-only",
@@ -1653,7 +1603,6 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
             "max_candidates_per_prefix":state.config.affinity.max_candidates_per_prefix,
             "success_ttl_ms":state.config.affinity.success_ttl_ms,
         },
-        "deepseek_balance":{"display":display,"raw":balance},
         "alerts":alerts
     }))
 }
@@ -1691,14 +1640,61 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
             .iter()
             .filter(|attempt| attempt.provider == provider)
             .collect::<Vec<_>>();
-        let total = rows.len() as u64;
-        let successes = rows.iter().filter(|a| a.error_class.is_none()).count() as u64;
-        let cache_reported = rows.iter().filter(|a| a.usage.provider_reported).count() as u64;
-        let hit = rows.iter().map(|a| a.usage.cache_hit_tokens).sum::<u64>();
-        let miss = rows.iter().map(|a| a.usage.cache_miss_tokens).sum::<u64>();
-        let cost = rows.iter().filter_map(|a| a.provider_cost_usd).sum::<f64>();
-        providers.insert(provider,json!({"attempts":total,"successes":successes,"errors":total-successes,"cache_reported_attempts":cache_reported,"cache_hit_tokens":hit,"cache_miss_tokens":miss,"cost_usd":cost}));
+        let models = rows
+            .iter()
+            .map(|attempt| attempt.upstream_model.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let served_models = state
+            .config
+            .models
+            .iter()
+            .filter(|model| {
+                model.layers.iter().any(|layer| {
+                    layer
+                        .targets
+                        .iter()
+                        .any(|target| target.provider == provider)
+                })
+            })
+            .map(|model| model.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut summary = attempt_summary(&rows);
+        let summary = summary.as_object_mut().expect("attempt summary object");
+        summary.insert("models".into(), json!(models));
+        summary.insert("served_models".into(), json!(served_models));
+        providers.insert(provider, Value::Object(summary.clone()));
     }
+    let mut route_groups: BTreeMap<(String, String), Vec<&AttemptRecord>> = BTreeMap::new();
+    for attempt in &attempts {
+        route_groups
+            .entry((attempt.provider.clone(), attempt.upstream_model.clone()))
+            .or_default()
+            .push(attempt);
+    }
+    let routes = route_groups
+        .into_iter()
+        .map(|((provider, upstream_model), rows)| {
+            let served_models = state
+                .config
+                .models
+                .iter()
+                .filter(|model| {
+                    model.layers.iter().any(|layer| {
+                        layer.targets.iter().any(|target| {
+                            target.provider == provider && target.model == upstream_model
+                        })
+                    })
+                })
+                .map(|model| model.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut summary = attempt_summary(&rows);
+            let summary = summary.as_object_mut().expect("attempt summary object");
+            summary.insert("served_models".into(), json!(served_models));
+            summary.insert("provider".into(), Value::String(provider));
+            summary.insert("upstream_model".into(), Value::String(upstream_model));
+            Value::Object(summary.clone())
+        })
+        .collect::<Vec<_>>();
     let total = requests.len() as u64;
     let errors = requests.iter().filter(|r| r.error_class.is_some()).count() as u64;
     let fallbacks = requests.iter().filter(|r| r.fallback).count() as u64;
@@ -1707,7 +1703,32 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
         .iter()
         .map(|r| r.request_bytes + r.response_bytes)
         .sum::<u64>();
-    Json(json!({"requests":{"total":total,"errors":errors,"fallbacks":fallbacks,"output_tokens":output_tokens,"bytes":bytes},"providers":providers})).into_response()
+    Json(json!({"requests":{"total":total,"errors":errors,"fallbacks":fallbacks,"output_tokens":output_tokens,"bytes":bytes},"providers":providers,"routes":routes})).into_response()
+}
+
+fn attempt_summary(rows: &[&AttemptRecord]) -> Value {
+    let total = rows.len() as u64;
+    let successes = rows
+        .iter()
+        .filter(|attempt| attempt.error_class.is_none())
+        .count() as u64;
+    let cache_reported = rows
+        .iter()
+        .filter(|attempt| attempt.usage.provider_reported)
+        .count() as u64;
+    let hit = rows
+        .iter()
+        .map(|attempt| attempt.usage.cache_hit_tokens)
+        .sum::<u64>();
+    let miss = rows
+        .iter()
+        .map(|attempt| attempt.usage.cache_miss_tokens)
+        .sum::<u64>();
+    let cost = rows
+        .iter()
+        .filter_map(|attempt| attempt.provider_cost_usd)
+        .sum::<f64>();
+    json!({"attempts":total,"successes":successes,"errors":total-successes,"cache_reported_attempts":cache_reported,"cache_hit_tokens":hit,"cache_miss_tokens":miss,"cost_usd":cost})
 }
 
 #[cfg(test)]

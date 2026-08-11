@@ -10,7 +10,7 @@ prompt bodies, and model response bodies are excluded.
 
 | Suite | Result | Concrete coverage |
 | --- | ---: | --- |
-| Library/unit tests | 56 passed, 0 failed | configuration, provider URL/error adapters, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
+| Library/unit tests | 57 passed, 0 failed | configuration, provider URL/error adapters, model-aware dashboard output, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
 | Local gateway end-to-end | 23 passed, 0 failed | all three ingress protocols, streaming and non-streaming translation, attempts, fallback, random layers, affinity, expiry, single-target bypass, and Kimi's three-provider/two-layer route |
 | Real worker probe | 1 passed, 0 failed | OpenCode Go and DeepSeek configured as equivalent targets in one affinity layer |
 | Real Kimi K3 acceptance | 3 passed, 0 failed | three direct streams, mixed subscription affinity, and explicitly gated 300,095-input-token requests to all three targets |

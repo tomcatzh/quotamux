@@ -197,6 +197,10 @@ pub struct RequestRecord {
     pub completed_at_ms: i64,
     pub protocol: Protocol,
     pub requested_model: String,
+    #[serde(default)]
+    pub served_model: Option<String>,
+    #[serde(default)]
+    pub upstream_model: Option<String>,
     pub streaming: bool,
     pub status: u16,
     pub error_class: Option<FailureClass>,

@@ -427,6 +427,15 @@ fn attempts_for_request<'a>(body: &'a Value, request_id: &str) -> Vec<&'a Value>
         .collect()
 }
 
+fn status_target<'a>(body: &'a Value, provider: &str) -> &'a Value {
+    body["targets"]
+        .as_array()
+        .expect("status targets array")
+        .iter()
+        .find(|target| target["provider"].as_str() == Some(provider))
+        .unwrap_or_else(|| panic!("missing status target {provider}"))
+}
+
 #[tokio::test]
 async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
     let primary = MockProvider::start(vec![MockReply::json(
@@ -734,6 +743,10 @@ async fn single_target_affinity_layer_skips_hashing_and_bookkeeping() {
         .expect("single-target status JSON");
     assert_eq!(status["affinity"]["storage"], "memory-only");
     assert_eq!(status["affinity"]["leases"], 0);
+    assert_eq!(status["models"][0], LOGICAL_MODEL);
+    assert!(status.get("active_provider").is_none());
+    assert!(status.get("circuit").is_none());
+    assert!(status.get("deepseek_balance").is_none());
     eprintln!(
         "SINGLE_TARGET_EVIDENCE {}",
         json!({"selection_reason":"single-target","affinity_leases":0})
@@ -1003,6 +1016,54 @@ async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallb
             .count(),
         1
     );
+
+    let stats = client
+        .get(gateway.url("/api/stats"))
+        .send()
+        .await
+        .expect("Kimi stats response")
+        .json::<Value>()
+        .await
+        .expect("Kimi stats JSON");
+    assert_eq!(
+        stats["providers"]["opencode-go-kimi"]["models"][0],
+        "kimi-k3"
+    );
+    assert_eq!(stats["providers"]["kimi-code"]["models"][0], "k3");
+    assert_eq!(stats["providers"]["kimi-official"]["models"][0], "kimi-k3");
+    let routes = stats["routes"].as_array().expect("Kimi stats routes");
+    for (provider, upstream_model) in [
+        ("opencode-go-kimi", "kimi-k3"),
+        ("kimi-code", "k3"),
+        ("kimi-official", "kimi-k3"),
+    ] {
+        let route = routes
+            .iter()
+            .find(|route| {
+                route["provider"].as_str() == Some(provider)
+                    && route["upstream_model"].as_str() == Some(upstream_model)
+            })
+            .unwrap_or_else(|| panic!("missing Kimi route {provider}/{upstream_model}"));
+        assert_eq!(route["served_models"][0], "kimi-k3");
+    }
+
+    let requests = client
+        .get(gateway.url("/api/requests?limit=10"))
+        .send()
+        .await
+        .expect("Kimi requests response")
+        .json::<Value>()
+        .await
+        .expect("Kimi requests JSON");
+    let request = requests["requests"]
+        .as_array()
+        .expect("Kimi requests array")
+        .iter()
+        .find(|request| request["id"].as_str() == Some(&request_id))
+        .expect("Kimi request record");
+    assert_eq!(request["requested_model"], "kimi-k3-1m");
+    assert_eq!(request["served_model"], "kimi-k3");
+    assert_eq!(request["upstream_model"], "kimi-k3");
     eprintln!(
         "KIMI_LAYER_EVIDENCE {}",
         json!({"plan_attempts":2,"payg_attempts":1,"models":{"opencode-go":"kimi-k3","kimi-code":"k3","kimi-official":"kimi-k3"}})
@@ -1585,9 +1646,9 @@ async fn semantic_stream_eof_records_failure_without_fallback_and_opens_circuit(
         .json::<Value>()
         .await
         .expect("partial stream status JSON");
-    assert_eq!(status["active_provider"], "deepseek");
-    assert_eq!(status["circuit"]["mode"], "open");
-    assert_eq!(status["circuit"]["reason"], "stream_failure");
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["circuit"]["mode"], "open");
+    assert_eq!(target["circuit"]["reason"], "stream_failure");
 }
 
 #[tokio::test]
@@ -1787,9 +1848,9 @@ async fn circuit_recovers_primary_after_persisted_transient_failure() {
         .json::<Value>()
         .await
         .expect("status JSON");
-    assert_eq!(status["active_provider"], "opencode-go");
-    assert_eq!(status["circuit"]["mode"], "closed");
-    assert_eq!(status["circuit"]["consecutive_failures"], 0);
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["circuit"]["mode"], "closed");
+    assert_eq!(target["circuit"]["consecutive_failures"], 0);
 
     let attempts = client
         .get(gateway.url("/api/attempts?limit=20"))

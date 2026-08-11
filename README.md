@@ -352,7 +352,7 @@ the provider-kind enum in the configuration schema:
 | `kind` | Default endpoint | Current acceptance status |
 | --- | --- | --- |
 | `opencode-go` | `https://opencode.ai/zen/go/v1` | Real-worker accepted for `deepseek-v4-flash`; real stream and 300,095-input-token acceptance also pass for `kimi-k3`. Protocol remains model-specific. |
-| `deepseek-official` | `https://api.deepseek.com` | Implemented as the PAYG/fallback adapter, including DeepSeek-specific balance, cost, and Anthropic path handling. |
+| `deepseek-official` | `https://api.deepseek.com` | Implemented as an optional PAYG/fallback adapter, including cost estimation and Anthropic path handling. |
 | `kimi-code` | `https://api.kimi.com/coding/v1` | Real Allegretto streaming and 300,095-input-token acceptance pass with exact model `k3`; a live Codex worker completed a two-turn Responses-to-Chat reasoning/tool loop through this adapter. |
 | `kimi-official` | `https://api.moonshot.cn/v1` | Real paid-account streaming and 300,095-input-token acceptance pass with exact model `kimi-k3`; layered fallback and provider-specific model rewrites are covered end to end. |
 
@@ -617,18 +617,26 @@ Operational endpoints:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /` | Local dashboard. |
+| `GET /` | Local dashboard with provider-level totals and recent request routes. |
 | `GET /healthz` | Health, models, and uptime. |
 | `GET /v1/models` | Public served names and aliases. |
-| `GET /api/status` | Targets, safe endpoints, circuits, affinity limits/count, balance, and alerts. |
-| `GET /api/stats` | Aggregate requests, errors, fallbacks, provider cache tokens, and cost. |
-| `GET /api/requests?limit=100` | Recent request metadata; maximum limit 1000. |
+| `GET /api/status` | Served models, targets, safe endpoints, per-target circuits, affinity limits/count, and alerts. |
+| `GET /api/stats` | Aggregate requests, errors, fallbacks, provider totals, and provider/upstream-model route totals. |
+| `GET /api/requests?limit=100` | Recent request metadata, including served model, provider, and exact upstream model; maximum limit 1000. |
 | `GET /api/attempts?limit=100` | Recent per-target attempts; maximum limit 1000. |
+
+The dashboard's **Providers** table is deliberately aggregated to one row per
+provider and does not list models. The **Recent requests** table shows the full
+route for each newly recorded request as `served model -> provider -> upstream
+model`. Records written by an older QuotaMux version show `-` for model fields
+that were not captured at the time. Circuit state remains available per target
+through `/api/status`; the dashboard does not present a misleading singleton
+provider or circuit. Provider balance polling is not currently enabled.
 
 ## Storage and privacy
 
 - `server.data_dir/quotamux.redb` stores request/attempt metadata, target circuit
-  state, balance snapshots, and alerts.
+  state, and alerts.
 - Prompt bodies, model response bodies, and API keys are not written to that
   database.
 - Prompt-prefix-affinity metadata is never written to redb. It is pure memory
