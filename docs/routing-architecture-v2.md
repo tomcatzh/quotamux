@@ -1,6 +1,6 @@
 # QuotaMux configuration and routing architecture v2
 
-Status: implemented and verified
+Status: layered routing and affinity implemented; provider expansion partially scaffolded
 
 This document records the product decisions for the first general-purpose
 QuotaMux configuration and routing system. It replaces the version-one
@@ -51,32 +51,25 @@ Every provider has a stable user-defined `id`, a provider `kind`, one or more
 credentials, and an explicit list of enabled models. The enabled model name is
 always the provider's standard API identifier.
 
-Official provider kinds supply safe default endpoints and authentication rules.
-The endpoint therefore does not need to be repeated in ordinary configuration.
-Providers whose endpoint depends on region/workspace, and custom providers,
-must configure it explicitly. Endpoint overrides remain possible for local and
-integration tests.
+The implemented provider adapters are currently `deepseek-official` and
+`opencode-go`. Their official base endpoints may be omitted, and endpoint
+overrides remain possible for local and integration tests.
 
-The first implementation recognizes these provider kinds:
-
-- `deepseek-official`
-- `kimi-official`
-- `aliyun-bailian`
-- `ollama-cloud`
-- `opencode-zen`
-- `opencode-go`
-- `custom-chat-completions`
-- `custom-responses`
-- `custom-anthropic`
+The configuration enum also reserves `kimi-official`, `aliyun-bailian`,
+`ollama-cloud`, `opencode-zen`, `custom-chat-completions`, `custom-responses`,
+and `custom-anthropic`. These entries currently provide schema/default-endpoint
+scaffolding only. They are not supported provider adapters until they have
+provider-specific authentication, URL, stream, error, mock end-to-end, and
+(where applicable) real credential tests.
 
 Each enabled model records every provider protocol that actually serves it.
 This is model-specific: for example, OpenCode currently documents different
 endpoints for Responses, Anthropic Messages, and Chat Completions models. The
-configuration is explicit even when QuotaMux can infer a default, so validation
-can reject an impossible route before startup.
+configuration is explicit even when QuotaMux can infer a default. Validation
+becomes provider-specific as each reserved adapter is implemented.
 
-Current official references confirm why model IDs and provider protocols cannot
-be guessed:
+These official references informed the schema and the planned adapters; they
+are not acceptance evidence for the reserved provider kinds:
 
 - DeepSeek exposes model IDs from `/models` and currently documents
   `deepseek-v4-flash` and `deepseek-v4-pro`:

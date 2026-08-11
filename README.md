@@ -209,34 +209,43 @@ keep it out of Git and restrict its file permissions:
 chmod 600 quotamux.toml
 ```
 
-Supported provider kinds:
+### Implemented provider kinds
 
-| `kind` | Default endpoint | Protocol rule |
+The currently implemented provider adapters are intentionally narrower than
+the provider-kind enum in the configuration schema:
+
+| `kind` | Default endpoint | Current acceptance status |
 | --- | --- | --- |
-| `deepseek-official` | `https://api.deepseek.com` | Declare the protocols supported by the enabled model. |
-| `kimi-official` | `https://api.moonshot.cn/v1` | `openai-chat` only. |
-| `aliyun-bailian` | none; `endpoint` required | Declare protocols supported by the configured compatible endpoint. |
-| `ollama-cloud` | `https://ollama.com/v1` | Commonly `openai-chat` and/or `openai-responses`. |
-| `opencode-zen` | `https://opencode.ai/zen/v1` | Protocol is model-specific. |
-| `opencode-go` | `https://opencode.ai/zen/go/v1` | Protocol is model-specific. |
-| `custom-chat-completions` | none; full `endpoint` required | `openai-chat` only. |
-| `custom-responses` | none; full `endpoint` required | `openai-responses` only. |
-| `custom-anthropic` | none; full `endpoint` required | `anthropic-messages` only. |
+| `opencode-go` | `https://opencode.ai/zen/go/v1` | Implemented; `deepseek-v4-flash` over Chat Completions is covered by the real-worker test. Protocol remains model-specific. |
+| `deepseek-official` | `https://api.deepseek.com` | Implemented as the PAYG/fallback adapter, including DeepSeek-specific balance, cost, and Anthropic path handling. |
 
-For official/non-custom kinds, `endpoint` is a base URL and QuotaMux appends
-the protocol path. An endpoint override is allowed. For custom kinds,
-`endpoint` is the complete request URL and is used exactly as written.
+For these kinds, `endpoint` is a base URL and QuotaMux appends the protocol
+path. An endpoint override is allowed for local tests.
 
 Provider model lists change over time. Configure the exact ID and protocol
-shown by the provider rather than guessing from the marketing name. Useful
-official references:
+shown by the provider rather than guessing from the marketing name:
 
 - [DeepSeek model API](https://api-docs.deepseek.com/api/list-models/)
 - [OpenCode Go model IDs and endpoints](https://opencode.ai/docs/go#endpoints)
-- [OpenCode Zen model IDs and endpoints](https://opencode.ai/docs/zen#models)
-- [Kimi platform documentation](https://platform.kimi.com/docs/overview)
-- [Alibaba Cloud Model Studio models](https://help.aliyun.com/en/model-studio/models)
-- [Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility)
+
+### Reserved provider kinds — not supported yet
+
+The following names are already reserved in the configuration enum, but their
+presence is scaffolding, not a support claim:
+
+- `kimi-official`
+- `aliyun-bailian`
+- `ollama-cloud`
+- `opencode-zen`
+- `custom-chat-completions`
+- `custom-responses`
+- `custom-anthropic`
+
+They currently have no provider-specific end-to-end acceptance suite or real
+worker evidence. Do not use them as production routes yet. Each one must receive
+its authentication/URL/stream/error compatibility tests and, for official
+providers, a real credential smoke test before moving into the implemented
+table. The parser may recognize these names while that work is in progress.
 
 ### Multiple credentials on one provider
 
@@ -271,60 +280,12 @@ name = "deepseek-v4-flash"
 protocols = ["openai-chat"]
 
 [[providers.models]]
-name = "gpt-5.6-luna"
-protocols = ["openai-responses"]
+name = "another-upstream-model"
+protocols = ["openai-chat"]
 ```
 
 Only explicitly listed models can be referenced by route targets. QuotaMux does
 not silently enable everything returned by an upstream `/models` endpoint.
-
-### Custom endpoint examples
-
-Custom endpoints use the full final request URL:
-
-```toml
-[[providers]]
-id = "local-chat"
-kind = "custom-chat-completions"
-endpoint = "http://127.0.0.1:11434/v1/chat/completions"
-
-[[providers.credentials]]
-id = "local-chat-key"
-api_key = "unused-but-must-be-non-empty"
-
-[[providers.models]]
-name = "my-local-model"
-protocols = ["openai-chat"]
-
-[[providers]]
-id = "company-responses"
-kind = "custom-responses"
-endpoint = "https://llm.example.com/v1/responses"
-
-[[providers.credentials]]
-id = "company-key"
-api_key = "..."
-
-[[providers.models]]
-name = "company-model-v2"
-protocols = ["openai-responses"]
-
-[[providers]]
-id = "company-anthropic"
-kind = "custom-anthropic"
-endpoint = "https://llm.example.com/v1/messages"
-
-[[providers.credentials]]
-id = "company-anthropic-key"
-api_key = "..."
-
-[[providers.models]]
-name = "company-claude-compatible"
-protocols = ["anthropic-messages"]
-```
-
-QuotaMux sends bearer authentication for Chat/Responses custom endpoints and
-`x-api-key` plus `anthropic-version` for `custom-anthropic`.
 
 ## Served models and protocol conversion
 
