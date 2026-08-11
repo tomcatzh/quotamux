@@ -1,7 +1,8 @@
 use std::{fs, path::Path, sync::Arc};
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 use crate::types::{AlertRecord, AttemptRecord, RequestRecord};
 
@@ -75,6 +76,23 @@ impl Store {
         self.put(ALERTS, &record.id, record)
     }
 
+    pub fn rename_provider(&self, old: &str, new: &str) -> Result<usize, String> {
+        if old == new {
+            return Ok(0);
+        }
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let mut changed = 0;
+        changed += rewrite_provider_field(&transaction, REQUESTS, old, new)?;
+        changed += rewrite_provider_field(&transaction, ATTEMPTS, old, new)?;
+        changed += rewrite_provider_field(&transaction, ALERTS, old, new)?;
+        changed += rename_circuit_state_keys(&transaction, old, new)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed)
+    }
+
     pub fn requests(&self, limit: usize) -> Result<Vec<RequestRecord>, String> {
         self.list(REQUESTS, limit)
     }
@@ -135,6 +153,83 @@ impl Store {
     }
 }
 
+fn rewrite_provider_field(
+    transaction: &WriteTransaction,
+    definition: TableDefinition<&str, &[u8]>,
+    old: &str,
+    new: &str,
+) -> Result<usize, String> {
+    let mut table = transaction
+        .open_table(definition)
+        .map_err(|error| error.to_string())?;
+    let mut updates = Vec::new();
+    {
+        let entries = table.iter().map_err(|error| error.to_string())?;
+        for entry in entries {
+            let (key, value) = entry.map_err(|error| error.to_string())?;
+            let mut record: Value =
+                serde_json::from_slice(value.value()).map_err(|error| error.to_string())?;
+            if record.get("provider").and_then(Value::as_str) != Some(old) {
+                continue;
+            }
+            record["provider"] = Value::String(new.to_string());
+            updates.push((
+                key.value().to_string(),
+                serde_json::to_vec(&record).map_err(|error| error.to_string())?,
+            ));
+        }
+    }
+    for (key, value) in &updates {
+        table
+            .insert(key.as_str(), value.as_slice())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(updates.len())
+}
+
+fn rename_circuit_state_keys(
+    transaction: &WriteTransaction,
+    old: &str,
+    new: &str,
+) -> Result<usize, String> {
+    let mut table = transaction
+        .open_table(STATE)
+        .map_err(|error| error.to_string())?;
+    let old_prefix = format!("circuit:{old}:");
+    let new_prefix = format!("circuit:{new}:");
+    let mut moves = Vec::new();
+    {
+        let entries = table.iter().map_err(|error| error.to_string())?;
+        for entry in entries {
+            let (key, value) = entry.map_err(|error| error.to_string())?;
+            let key = key.value();
+            let Some(suffix) = key.strip_prefix(&old_prefix) else {
+                continue;
+            };
+            moves.push((
+                key.to_string(),
+                format!("{new_prefix}{suffix}"),
+                value.value().to_vec(),
+            ));
+        }
+    }
+    for (old_key, new_key, value) in &moves {
+        let destination_exists = table
+            .get(new_key.as_str())
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if !destination_exists {
+            table
+                .insert(new_key.as_str(), value.as_slice())
+                .map_err(|error| error.to_string())?;
+        }
+        table
+            .remove(old_key.as_str())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(moves.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +248,77 @@ mod tests {
         assert_eq!(
             store.get_state::<Example>("example").unwrap(),
             Some(Example { value: 7 })
+        );
+    }
+
+    #[test]
+    fn renames_provider_records_and_circuit_keys_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .put(
+                REQUESTS,
+                "request",
+                &serde_json::json!({"provider":"open-code-go"}),
+            )
+            .unwrap();
+        store
+            .put(
+                ATTEMPTS,
+                "attempt",
+                &serde_json::json!({"provider":"open-code-go"}),
+            )
+            .unwrap();
+        store
+            .put(
+                ALERTS,
+                "alert",
+                &serde_json::json!({"provider":"open-code-go"}),
+            )
+            .unwrap();
+        store
+            .put_state(
+                "circuit:open-code-go:key:model",
+                &serde_json::json!({"mode":"closed"}),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .rename_provider("open-code-go", "opencode-go")
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            store
+                .rename_provider("open-code-go", "opencode-go")
+                .unwrap(),
+            0
+        );
+
+        for (definition, key) in [
+            (REQUESTS, "request"),
+            (ATTEMPTS, "attempt"),
+            (ALERTS, "alert"),
+        ] {
+            let transaction = store.database.begin_read().unwrap();
+            let table = transaction.open_table(definition).unwrap();
+            let record: Value =
+                serde_json::from_slice(table.get(key).unwrap().unwrap().value()).unwrap();
+            assert_eq!(record["provider"], "opencode-go");
+        }
+        assert!(
+            store
+                .get_state::<Value>("circuit:open-code-go:key:model")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_state::<Value>("circuit:opencode-go:key:model")
+                .unwrap()
+                .unwrap()["mode"],
+            "closed"
         );
     }
 }

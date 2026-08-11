@@ -73,6 +73,12 @@ impl AppState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         config.validate()?;
         let store = Store::open(&config.server.data_dir)?;
+        if config.provider("opencode-go").is_some() && config.provider("open-code-go").is_none() {
+            let migrated = store.rename_provider("open-code-go", "opencode-go")?;
+            if migrated > 0 {
+                tracing::info!(migrated, "merged legacy open-code-go provider data");
+            }
+        }
         let affinity =
             AffinityDirectory::new(config.affinity.clone()).map_err(std::io::Error::other)?;
         let mut targets = HashMap::new();
@@ -1631,9 +1637,12 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
     };
     let attempts = state.store.attempts(20000).unwrap_or_default();
     let mut providers: BTreeMap<String, Value> = BTreeMap::new();
-    let provider_names = attempts
+    let provider_names = state
+        .config
+        .providers
         .iter()
-        .map(|attempt| attempt.provider.clone())
+        .map(|provider| provider.id.clone())
+        .chain(attempts.iter().map(|attempt| attempt.provider.clone()))
         .collect::<std::collections::BTreeSet<_>>();
     for provider in provider_names {
         let rows = attempts

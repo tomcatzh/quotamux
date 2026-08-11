@@ -625,13 +625,15 @@ Operational endpoints:
 | `GET /api/requests?limit=100` | Recent request metadata, including served model, provider, and exact upstream model; maximum limit 1000. |
 | `GET /api/attempts?limit=100` | Recent per-target attempts; maximum limit 1000. |
 
-The dashboard's **Providers** table is deliberately aggregated to one row per
-provider and does not list models. The **Recent requests** table shows the full
-route for each newly recorded request as `served model -> provider -> upstream
-model`. Records written by an older QuotaMux version show `-` for model fields
-that were not captured at the time. Circuit state remains available per target
-through `/api/status`; the dashboard does not present a misleading singleton
-provider or circuit. Provider balance polling is not currently enabled.
+The dashboard's **Providers** table has one row for every configured provider,
+including providers with zero attempts, and does not list models. Historical
+attempts are merged into the matching current provider ID. The **Recent
+requests** table shows the full route for each newly recorded request as `served
+model -> provider -> upstream model`. Records written by an older QuotaMux
+version show `-` for model fields that were not captured at the time. Circuit
+state remains available per target through `/api/status`; the dashboard does not
+present a misleading singleton provider or circuit. Provider balance polling is
+not currently enabled.
 
 ## Storage and privacy
 

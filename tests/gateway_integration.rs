@@ -706,8 +706,12 @@ async fn single_target_affinity_layer_skips_hashing_and_bookkeeping() {
         chat_completion("single", "single-worker"),
     )])
     .await;
+    let unused = MockProvider::start(vec![]).await;
     let mut config = test_config(
-        vec![test_provider("single-worker", "single-key", &worker)],
+        vec![
+            test_provider("single-worker", "single-key", &worker),
+            test_provider("unused-worker", "unused-key", &unused),
+        ],
         vec![("plan", vec![target("single-worker", "single-key")])],
     );
     config.models[0].layers[0].strategy = RouteStrategy::PromptPrefixAffinity;
@@ -747,9 +751,19 @@ async fn single_target_affinity_layer_skips_hashing_and_bookkeeping() {
     assert!(status.get("active_provider").is_none());
     assert!(status.get("circuit").is_none());
     assert!(status.get("deepseek_balance").is_none());
+    let stats = client
+        .get(gateway.url("/api/stats"))
+        .send()
+        .await
+        .expect("single-target stats")
+        .json::<Value>()
+        .await
+        .expect("single-target stats JSON");
+    assert_eq!(stats["providers"]["single-worker"]["attempts"], 1);
+    assert_eq!(stats["providers"]["unused-worker"]["attempts"], 0);
     eprintln!(
         "SINGLE_TARGET_EVIDENCE {}",
-        json!({"selection_reason":"single-target","affinity_leases":0})
+        json!({"selection_reason":"single-target","affinity_leases":0,"unused_provider_attempts":0})
     );
 }
 
