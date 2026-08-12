@@ -34,7 +34,7 @@
               <button type="button" id="request-older" disabled>Older</button>
             </nav>
           </div>
-          <div class="scroll"><table><caption>Most recent logical requests</caption><thead><tr><th scope="col">Time</th><th scope="col">Served model</th><th scope="col">Layer</th><th scope="col">Provider</th><th scope="col">Key</th><th scope="col">Upstream model</th><th scope="col" class="numeric">Status</th><th scope="col">Fallback</th><th scope="col" class="numeric">Latency</th><th scope="col" class="numeric">Tokens</th></tr></thead><tbody id="request-rows"></tbody></table></div>
+          <div class="scroll request-scroll"><table class="request-table"><caption>Most recent logical requests</caption><colgroup><col class="request-time"><col class="request-model"><col class="request-layer"><col class="request-target"><col class="request-result"><col class="request-latency"><col class="request-tokens"></colgroup><thead><tr><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Layer</th><th scope="col">Target</th><th scope="col">Result</th><th scope="col" class="numeric">Latency</th><th scope="col" class="numeric">Tokens</th></tr></thead><tbody id="request-rows"></tbody></table></div>
         </section>
         <section>
           <div class="section-heading"><h2>Active alerts</h2></div>

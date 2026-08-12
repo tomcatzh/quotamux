@@ -60,6 +60,29 @@ function renderRequestPagination() {
   $('#request-older').disabled = state.requestLoading || !state.requestNextCursor;
 }
 
+function compactTime(value) {
+  if (value == null) return '<span class="cell-main">—</span>';
+  const date = new Date(value);
+  const full = date.toLocaleString();
+  const day = date.toLocaleDateString(undefined, { month: '2-digit', day: '2-digit' });
+  const time = date.toLocaleTimeString(undefined, { hour12: false });
+  return `<span class="cell-main" title="${esc(full)}">${esc(time)}</span><span class="cell-sub">${esc(day)}</span>`;
+}
+
+function modelCell(row) {
+  const served = row.served_model || '—';
+  const upstream = row.upstream_model || '—';
+  const detail = upstream !== '—' && upstream !== served ? `<span class="cell-sub">→ ${esc(upstream)}</span>` : '';
+  return `<span class="cell-main">${esc(served)}</span>${detail}`;
+}
+
+function targetCell(row) {
+  const provider = row.provider || '—';
+  const key = row.credential || '—';
+  const detail = key !== '—' && key !== provider ? `<span class="cell-sub">${esc(key)}</span>` : '';
+  return `<span class="cell-main">${esc(provider)}</span>${detail}`;
+}
+
 function renderOverview(stats, status, recent) {
   const requests = stats.requests || {};
   const cards = [
@@ -78,7 +101,7 @@ function renderOverview(stats, status, recent) {
     const cache = reported ? (hit + miss ? `${(100 * hit / (hit + miss)).toFixed(1)}%` : '0.0%') : '—';
     return `<tr><th scope="row">${esc(provider)}</th><td>${list(row.served_models)}</td><td>${list(row.models)}</td><td class="numeric">${num(row.attempts)}</td><td class="numeric good">${num(row.successes)}</td><td class="numeric ${row.errors ? 'bad' : ''}">${num(row.errors)}</td><td class="numeric">${cache}</td><td class="numeric">$${Number(row.cost_usd || 0).toFixed(6)}</td></tr>`;
   }).join('') || emptyRow(8, 'No provider attempts recorded');
-  $('#request-rows').innerHTML = (recent.requests || []).map((row) => `<tr><td>${when(row.started_at_ms)}</td><td>${esc(row.served_model || '—')}</td><td>${esc(row.route_layer || '—')}</td><td>${esc(row.provider || '—')}</td><td>${esc(row.credential || '—')}</td><td>${esc(row.upstream_model || '—')}</td><td class="numeric ${row.status >= 400 ? 'bad' : 'good'}">${num(row.status)}</td><td>${row.fallback ? 'Yes' : 'No'}</td><td class="numeric">${num(row.total_ms)} ms</td><td class="numeric">${num(row.usage?.total_tokens)}</td></tr>`).join('') || emptyRow(10, 'No requests recorded');
+  $('#request-rows').innerHTML = (recent.requests || []).map((row) => `<tr><td>${compactTime(row.started_at_ms)}</td><td class="request-name">${modelCell(row)}</td><td class="request-name"><span class="cell-main">${esc(row.route_layer || '—')}</span></td><td class="request-name">${targetCell(row)}</td><td><span class="cell-main ${row.status >= 400 ? 'bad' : 'good'}">${num(row.status)}</span><span class="cell-sub">Fallback: ${row.fallback ? 'Yes' : 'No'}</span></td><td class="numeric">${num(row.total_ms)} ms</td><td class="numeric">${num(row.usage?.total_tokens)}</td></tr>`).join('') || emptyRow(7, 'No requests recorded');
   const alerts = (status.alerts || []).filter((row) => row.active);
   $('#alert-rows').innerHTML = alerts.map((row) => `<tr><th scope="row">${esc(row.provider)}</th><td>${esc(row.credential || '—')}</td><td class="bad">${esc(row.class)}</td><td>${when(row.last_seen_ms)}</td><td>${when(row.next_probe_at_ms)}</td></tr>`).join('') || emptyRow(5, 'No active alerts');
 }
