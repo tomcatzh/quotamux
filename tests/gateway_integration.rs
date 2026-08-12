@@ -465,6 +465,20 @@ async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
     assert_eq!(body["choices"][0]["message"]["content"], "primary answer");
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 0);
+
+    let stats = client
+        .get(gateway.url("/api/stats"))
+        .send()
+        .await
+        .expect("provider stats response")
+        .json::<Value>()
+        .await
+        .expect("provider stats JSON");
+    assert_eq!(stats["providers"]["deepseek"]["attempts"], 0);
+    assert_eq!(
+        stats["providers"]["deepseek"]["models"],
+        json!([UPSTREAM_MODEL])
+    );
 }
 
 #[tokio::test]

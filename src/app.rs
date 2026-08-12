@@ -1848,9 +1848,16 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
             .iter()
             .filter(|((row_provider, _), _)| row_provider == &provider)
             .collect::<Vec<_>>();
-        let models = rows
+        let models = state
+            .config
+            .providers
             .iter()
-            .map(|((_, upstream_model), _)| upstream_model.as_str())
+            .filter(|configured| configured.id == provider)
+            .flat_map(|configured| configured.models.iter().map(|model| model.name.as_str()))
+            .chain(
+                rows.iter()
+                    .map(|((_, upstream_model), _)| upstream_model.as_str()),
+            )
             .collect::<std::collections::BTreeSet<_>>();
         let served_models = state
             .config
