@@ -97,6 +97,12 @@ pub struct OverviewRollup {
     pub attempts: BTreeMap<(String, String), AttemptRollup>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RequestPage {
+    pub requests: Vec<RequestRecord>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum StatsPhase {
@@ -296,6 +302,14 @@ impl Store {
 
     pub fn requests(&self, limit: usize) -> Result<Vec<RequestRecord>, String> {
         self.list(REQUESTS, limit)
+    }
+
+    pub fn request_page(&self, limit: usize, before: Option<&str>) -> Result<RequestPage, String> {
+        let (requests, next_cursor) = self.list_page(REQUESTS, limit, before)?;
+        Ok(RequestPage {
+            requests,
+            next_cursor,
+        })
     }
 
     pub fn attempts(&self, limit: usize) -> Result<Vec<AttemptRecord>, String> {
@@ -545,6 +559,44 @@ impl Store {
             items.push(item);
         }
         Ok(items)
+    }
+
+    fn list_page<T: DeserializeOwned>(
+        &self,
+        definition: TableDefinition<&str, &[u8]>,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<(Vec<T>, Option<String>), String> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|error| error.to_string())?;
+        let table = transaction
+            .open_table(definition)
+            .map_err(|error| error.to_string())?;
+        let entries = if let Some(before) = before {
+            table
+                .range::<&str>((Unbounded, Excluded(before)))
+                .map_err(|error| error.to_string())?
+        } else {
+            table.iter().map_err(|error| error.to_string())?
+        };
+        let mut items = Vec::with_capacity(limit);
+        let mut last_key = None;
+        let mut has_more = false;
+        for (index, entry) in entries.rev().take(limit.saturating_add(1)).enumerate() {
+            let (key, value) = entry.map_err(|error| error.to_string())?;
+            if index == limit {
+                has_more = true;
+                break;
+            }
+            last_key = Some(key.value().to_string());
+            items.push(serde_json::from_slice(value.value()).map_err(|error| error.to_string())?);
+        }
+        Ok((items, has_more.then_some(last_key).flatten()))
     }
 }
 
@@ -1373,6 +1425,52 @@ mod tests {
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["0003", "0002"]
         );
+    }
+
+    #[test]
+    fn request_pages_use_exclusive_bounded_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for id in ["0001", "0002", "0003", "0004", "0005"] {
+            let request = request_record(id, Utc::now().timestamp_millis());
+            store.put(REQUESTS, id, &request).unwrap();
+        }
+
+        let first = store.request_page(2, None).unwrap();
+        assert_eq!(
+            first
+                .requests
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["0005", "0004"]
+        );
+        assert_eq!(first.next_cursor.as_deref(), Some("0004"));
+
+        let newest = request_record("0006", Utc::now().timestamp_millis());
+        store.put(REQUESTS, "0006", &newest).unwrap();
+        let second = store.request_page(2, first.next_cursor.as_deref()).unwrap();
+        assert_eq!(
+            second
+                .requests
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["0003", "0002"]
+        );
+        assert_eq!(second.next_cursor.as_deref(), Some("0002"));
+
+        let last = store
+            .request_page(2, second.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(
+            last.requests
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["0001"]
+        );
+        assert_eq!(last.next_cursor, None);
     }
 
     fn request_record(id: &str, started_at_ms: i64) -> RequestRecord {

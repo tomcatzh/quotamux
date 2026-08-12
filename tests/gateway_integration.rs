@@ -468,6 +468,87 @@ async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
 }
 
 #[tokio::test]
+async fn requests_api_paginates_with_exclusive_cursors() {
+    let primary = MockProvider::start(
+        (0..5)
+            .map(|index| {
+                MockReply::json(
+                    StatusCode::OK,
+                    chat_completion("reasoning", &format!("answer-{index}")),
+                )
+            })
+            .collect(),
+    )
+    .await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    for _ in 0..5 {
+        let response = client
+            .post(gateway.url("/v1/chat/completions"))
+            .json(&chat_request())
+            .send()
+            .await
+            .expect("chat response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let first = client
+        .get(gateway.url("/api/requests?limit=2"))
+        .send()
+        .await
+        .expect("first request page")
+        .json::<Value>()
+        .await
+        .expect("first request page JSON");
+    assert_eq!(first["limit"], 2);
+    let first_rows = first["requests"].as_array().expect("first request rows");
+    assert_eq!(first_rows.len(), 2);
+    let first_cursor = first["next_cursor"]
+        .as_str()
+        .expect("first page next cursor");
+    assert_eq!(first_cursor, first_rows[1]["id"].as_str().unwrap());
+
+    let second = client
+        .get(gateway.url(&format!("/api/requests?limit=2&before={first_cursor}")))
+        .send()
+        .await
+        .expect("second request page")
+        .json::<Value>()
+        .await
+        .expect("second request page JSON");
+    let second_rows = second["requests"].as_array().expect("second request rows");
+    assert_eq!(second_rows.len(), 2);
+    let second_cursor = second["next_cursor"]
+        .as_str()
+        .expect("second page next cursor");
+    assert_eq!(second_cursor, second_rows[1]["id"].as_str().unwrap());
+
+    let last = client
+        .get(gateway.url(&format!("/api/requests?limit=2&before={second_cursor}")))
+        .send()
+        .await
+        .expect("last request page")
+        .json::<Value>()
+        .await
+        .expect("last request page JSON");
+    let last_rows = last["requests"].as_array().expect("last request rows");
+    assert_eq!(last_rows.len(), 1);
+    assert!(last["next_cursor"].is_null());
+
+    let mut ids = first_rows
+        .iter()
+        .chain(second_rows)
+        .chain(last_rows)
+        .map(|row| row["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 5);
+}
+
+#[tokio::test]
 async fn random_strategy_distributes_requests_within_one_layer() {
     const REQUESTS: usize = 200;
     let worker_a = MockProvider::start(

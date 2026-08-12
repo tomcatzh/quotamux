@@ -642,12 +642,14 @@ Operational endpoints:
 | `GET /api/stats` | All-time request, provider, and provider/upstream-model totals from aggregate tables. |
 | `GET /api/routing` | Current served-model, layer, strategy, target, and per-target circuit hierarchy. |
 | `GET /api/routing/stats?model=NAME&window=1d` | Calls and token totals by final target/key for `1h`, `1d`, `1w`, `1m`, or `all`. |
-| `GET /api/requests?limit=100` | Recent request metadata, including served model, provider, and exact upstream model; maximum limit 1000. |
+| `GET /api/requests?limit=20&before=CURSOR` | Recent request metadata in newest-first cursor pages; default limit 100, maximum 1000, and `next_cursor` is null on the last page. |
 | `GET /api/attempts?limit=100` | Recent per-target attempts; maximum limit 1000. |
 
 The **Overview** page keeps provider totals, recent logical requests, and active
-alerts together. A recorded route is shown as `served model -> layer -> provider
-(key) -> upstream model`; protocol is not a visible routing dimension. The
+alerts together. Recent requests are shown 20 at a time with Newer and Older
+controls backed by exclusive record-key cursors, not offsets. A recorded route
+is shown as `served model -> layer -> provider (key) -> upstream model`;
+protocol is not a visible routing dimension. The
 **Routing** page shows the configured ordered layers and each target's real
 circuit state, reason, and next-probe time. Aliases appear only in parentheses
 beside their canonical served model.

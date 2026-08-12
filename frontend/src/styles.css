@@ -87,6 +87,19 @@ section + section { margin-top: 30px; }
   text-transform: uppercase;
   letter-spacing: .1em;
 }
+.pagination { display: flex; align-items: center; gap: 8px; }
+.page-label { margin-right: 2px; color: var(--muted); font-size: 12px; }
+.pagination button {
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+.pagination button:hover:not(:disabled) { border-color: var(--muted); }
+.pagination button:disabled { color: #606b79; cursor: default; }
 .scroll { overflow: auto; border: 1px solid var(--line); background: var(--panel); }
 table { width: 100%; border-collapse: collapse; }
 caption {

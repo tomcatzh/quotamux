@@ -26,7 +26,14 @@
           <div class="scroll"><table><caption>Provider attempt totals</caption><thead><tr><th scope="col">Provider</th><th scope="col">Served models</th><th scope="col">Upstream models</th><th scope="col" class="numeric">Attempts</th><th scope="col" class="numeric">Success</th><th scope="col" class="numeric">Errors</th><th scope="col" class="numeric">Cache hit</th><th scope="col" class="numeric">Cost estimate</th></tr></thead><tbody id="provider-rows"></tbody></table></div>
         </section>
         <section>
-          <div class="section-heading"><h2>Recent requests</h2></div>
+          <div class="section-heading">
+            <h2>Recent requests</h2>
+            <nav class="pagination" aria-label="Recent requests pages">
+              <span id="request-page" class="page-label" aria-live="polite">Page 1</span>
+              <button type="button" id="request-newer" disabled>Newer</button>
+              <button type="button" id="request-older" disabled>Older</button>
+            </nav>
+          </div>
           <div class="scroll"><table><caption>Most recent logical requests</caption><thead><tr><th scope="col">Time</th><th scope="col">Served model</th><th scope="col">Layer</th><th scope="col">Provider</th><th scope="col">Key</th><th scope="col">Upstream model</th><th scope="col" class="numeric">Status</th><th scope="col">Fallback</th><th scope="col" class="numeric">Latency</th><th scope="col" class="numeric">Tokens</th></tr></thead><tbody id="request-rows"></tbody></table></div>
         </section>
         <section>

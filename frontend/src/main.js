@@ -6,6 +6,11 @@ const state = {
   window: '1h',
   metric: 'calls',
   statsData: null,
+  requestCursor: null,
+  requestCursorStack: [],
+  requestNextCursor: null,
+  requestLoading: false,
+  requestLoadId: 0,
 };
 const windows = [['1h','1 hour'],['1d','1 day'],['1w','1 week'],['1m','1 month'],['all','All time']];
 const metrics = [['calls','Calls'],['total_tokens','Total tokens'],['input_tokens','Input tokens'],['output_tokens','Output tokens']];
@@ -47,6 +52,12 @@ function aliases(model) {
 
 function activeModel() {
   return state.models.find((model) => model.name === state.model) || state.models[0];
+}
+
+function renderRequestPagination() {
+  $('#request-page').textContent = `Page ${state.requestCursorStack.length + 1}`;
+  $('#request-newer').disabled = state.requestLoading || state.requestCursorStack.length === 0;
+  $('#request-older').disabled = state.requestLoading || !state.requestNextCursor;
 }
 
 function renderOverview(stats, status, recent) {
@@ -149,12 +160,26 @@ function renderStatistics(data) {
 }
 
 async function loadOverview() {
-  const [status, stats, recent] = await Promise.all([
-    api('/api/status'),
-    api('/api/stats'),
-    api('/api/requests?limit=50'),
-  ]);
-  renderOverview(stats, status, recent);
+  const cursor = state.requestCursor;
+  const loadId = ++state.requestLoadId;
+  const before = cursor ? `&before=${encodeURIComponent(cursor)}` : '';
+  state.requestLoading = true;
+  renderRequestPagination();
+  try {
+    const [status, stats, recent] = await Promise.all([
+      api('/api/status'),
+      api('/api/stats'),
+      api(`/api/requests?limit=20${before}`),
+    ]);
+    if (loadId !== state.requestLoadId || cursor !== state.requestCursor) return;
+    state.requestNextCursor = recent.next_cursor || null;
+    renderOverview(stats, status, recent);
+  } finally {
+    if (loadId === state.requestLoadId && cursor === state.requestCursor) {
+      state.requestLoading = false;
+      renderRequestPagination();
+    }
+  }
 }
 
 async function loadRouting() {
@@ -207,6 +232,22 @@ function selectRouteView(view) {
 
 document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => selectView(button.dataset.view)));
 document.querySelectorAll('[data-route-view]').forEach((button) => button.addEventListener('click', () => selectRouteView(button.dataset.routeView)));
+$('#request-newer').addEventListener('click', () => {
+  if (state.requestLoading || state.requestCursorStack.length === 0) return;
+  clearError();
+  state.requestCursor = state.requestCursorStack.pop() ?? null;
+  state.requestNextCursor = null;
+  loadOverview().catch(showError);
+});
+$('#request-older').addEventListener('click', () => {
+  if (state.requestLoading || !state.requestNextCursor) return;
+  clearError();
+  state.requestCursorStack.push(state.requestCursor);
+  state.requestCursor = state.requestNextCursor;
+  state.requestNextCursor = null;
+  loadOverview().catch(showError);
+});
 renderControls();
+renderRequestPagination();
 refresh();
 setInterval(refresh, 5000);

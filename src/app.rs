@@ -1574,12 +1574,27 @@ fn apply_metadata(
 }
 
 #[derive(Deserialize)]
+struct RequestPageQuery {
+    limit: Option<usize>,
+    before: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct LimitQuery {
     limit: Option<usize>,
 }
-async fn requests(State(state): State<Arc<AppState>>, Query(query): Query<LimitQuery>) -> Response {
-    match state.store.requests(query.limit.unwrap_or(100).min(1000)) {
-        Ok(requests) => Json(json!({"requests":requests})).into_response(),
+async fn requests(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RequestPageQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(100).min(1000);
+    match state.store.request_page(limit, query.before.as_deref()) {
+        Ok(page) => Json(json!({
+            "requests":page.requests,
+            "next_cursor":page.next_cursor,
+            "limit":limit,
+        }))
+        .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":error})),
