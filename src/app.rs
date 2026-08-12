@@ -14,7 +14,7 @@ use axum::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE},
     },
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use bytes::Bytes;
@@ -29,12 +29,12 @@ use crate::{
     },
     circuit::{CircuitBreaker, RouteDecision},
     config::{Config, ProviderKind, RouteStrategy, RouteTargetConfig, ServedModelConfig},
-    dashboard::INDEX_HTML,
+    dashboard::serve_spa,
     protocol::{self, ValidationError, anthropic, chat, responses},
     provider::{ProviderClient, ProviderError},
     routing::RandomSelector,
     sse::{SseDecoder, SseEvent},
-    store::Store,
+    store::{AttemptRollup, RequestRollup, RouteRollupKey, Store},
     types::{AlertRecord, AttemptRecord, FailureClass, Protocol, RequestRecord, Usage},
 };
 
@@ -79,6 +79,7 @@ impl AppState {
                 tracing::info!(migrated, "merged legacy open-code-go provider data");
             }
         }
+        store.ensure_stats_schema()?;
         let affinity =
             AffinityDirectory::new(config.affinity.clone()).map_err(std::io::Error::other)?;
         let mut targets = HashMap::new();
@@ -127,27 +128,49 @@ impl AppState {
                     .expire(Utc::now().timestamp_millis());
             }
         });
+        let stats_store = self.store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let store = stats_store.clone();
+                match tokio::task::spawn_blocking(move || store.prune_expired_stats()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::error!(%error, "failed to prune statistics buckets"),
+                    Err(error) => tracing::error!(%error, "statistics pruning task failed"),
+                }
+            }
+        });
     }
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
+    let v1 = Router::new()
+        .route("/models", get(models))
+        .route("/chat/completions", post(chat_completions))
+        .route("/responses", post(openai_responses))
+        .route("/messages", post(anthropic_messages))
+        .route("/messages/count_tokens", post(count_tokens))
+        .fallback(api_not_found);
+    let api = Router::new()
+        .route("/status", get(status))
+        .route("/stats", get(stats))
+        .route("/routing", get(routing))
+        .route("/routing/stats", get(routing_stats))
+        .route("/requests", get(requests))
+        .route("/attempts", get(attempts))
+        .fallback(api_not_found);
     Router::new()
-        .route("/", get(index))
         .route("/healthz", get(health))
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(openai_responses))
-        .route("/v1/messages", post(anthropic_messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
-        .route("/api/status", get(status))
-        .route("/api/stats", get(stats))
-        .route("/api/requests", get(requests))
-        .route("/api/attempts", get(attempts))
+        .nest("/v1", v1)
+        .nest("/api", api)
+        .fallback(serve_spa)
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -1575,6 +1598,167 @@ async fn attempts(State(state): State<Arc<AppState>>, Query(query): Query<LimitQ
     }
 }
 
+async fn routing(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let mut models = Vec::with_capacity(state.config.models.len());
+    for model in &state.config.models {
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for (layer_index, layer) in model.layers.iter().enumerate() {
+            let mut targets = Vec::with_capacity(layer.targets.len());
+            for target in &layer.targets {
+                targets.push(json!({
+                    "provider": target.provider,
+                    "credential": target.credential,
+                    "upstream_model": target.model,
+                    "circuit": target_runtime(&state, target).circuit.snapshot().await,
+                }));
+            }
+            layers.push(json!({
+                "index": layer_index,
+                "name": layer.name,
+                "strategy": layer.strategy.as_str(),
+                "targets": targets,
+            }));
+        }
+        models.push(json!({
+            "name": model.name,
+            "aliases": model.aliases,
+            "layers": layers,
+        }));
+    }
+    Json(json!({"models": models}))
+}
+
+#[derive(Deserialize)]
+struct RoutingStatsQuery {
+    model: String,
+    window: String,
+}
+
+async fn routing_stats(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RoutingStatsQuery>,
+) -> Response {
+    let Some(model) = state.config.resolve_model(&query.model) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"unknown served model","code":"unknown_model"})),
+        )
+            .into_response();
+    };
+    let now = Utc::now().timestamp_millis();
+    let (window_id, from_ms, to_ms) = match routing_window(&query.window, now) {
+        Ok(window) => window,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":error,"code":"invalid_window"})),
+            )
+                .into_response();
+        }
+    };
+    let rollup = match state.store.routing_rollup(&model.name, from_ms, to_ms) {
+        Ok(rollup) => rollup,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":error,"code":"statistics_query_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let mut remaining = rollup.targets;
+    let mut layers = Vec::with_capacity(model.layers.len());
+    for (layer_index, layer) in model.layers.iter().enumerate() {
+        let mut layer_total = RequestRollup::default();
+        let mut targets = Vec::with_capacity(layer.targets.len());
+        for target in &layer.targets {
+            let key = RouteRollupKey {
+                layer_index: layer_index as u32,
+                layer_name: layer.name.clone(),
+                provider: target.provider.clone(),
+                credential: target.credential.clone(),
+                upstream_model: target.model.clone(),
+            };
+            let value = remaining.remove(&key).unwrap_or_default();
+            if let Err(error) = layer_total.checked_add_assign(value) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":error,"code":"statistics_overflow"})),
+                )
+                    .into_response();
+            }
+            targets.push(json!({
+                "provider": target.provider,
+                "credential": target.credential,
+                "upstream_model": target.model,
+                "configured": true,
+                "totals": request_metric_json(value),
+            }));
+        }
+        layers.push(json!({
+            "index": layer_index,
+            "name": layer.name,
+            "strategy": layer.strategy.as_str(),
+            "totals": request_metric_json(layer_total),
+            "targets": targets,
+        }));
+    }
+    let historical_targets = remaining
+        .into_iter()
+        .filter(|(_, value)| value.calls > 0 || value.total_tokens > 0)
+        .map(|(key, value)| {
+            json!({
+                "layer_index": key.layer_index,
+                "layer_name": key.layer_name,
+                "provider": key.provider,
+                "credential": key.credential,
+                "upstream_model": key.upstream_model,
+                "configured": false,
+                "totals": request_metric_json(value),
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "model": {"name":model.name,"aliases":model.aliases},
+        "window": {"id":window_id,"from_ms":from_ms,"to_ms":to_ms},
+        "totals": request_metric_json(rollup.total),
+        "layers": layers,
+        "historical_targets": historical_targets,
+        "unattributed": request_metric_json(rollup.unattributed),
+    }))
+    .into_response()
+}
+
+fn routing_window(
+    window: &str,
+    now_ms: i64,
+) -> Result<(&'static str, Option<i64>, Option<i64>), String> {
+    let to_ms = now_ms.div_euclid(60_000) * 60_000;
+    let normalized = window.trim().to_ascii_lowercase();
+    let (id, duration_ms) = match normalized.as_str() {
+        "1h" => ("1H", Some(60 * 60_000)),
+        "1d" => ("1D", Some(24 * 60 * 60_000)),
+        "1w" => ("1W", Some(7 * 24 * 60 * 60_000)),
+        "1m" => ("1M", Some(30 * 24 * 60 * 60_000)),
+        "all" => return Ok(("All", None, None)),
+        _ => return Err("window must be one of 1h, 1d, 1w, 1m, or all".into()),
+    };
+    Ok((
+        id,
+        duration_ms.map(|duration| to_ms - duration),
+        Some(to_ms),
+    ))
+}
+
+fn request_metric_json(value: RequestRollup) -> Value {
+    json!({
+        "calls": value.calls,
+        "input_tokens": value.input_tokens,
+        "output_tokens": value.output_tokens,
+        "total_tokens": value.total_tokens,
+    })
+}
+
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let alerts = state.store.alerts(100).unwrap_or_default();
     let mut target_rows = Vec::new();
@@ -1625,8 +1809,8 @@ fn safe_endpoint(endpoint: &str) -> String {
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Response {
-    let requests = match state.store.requests(10000) {
-        Ok(v) => v,
+    let rollup = match state.store.overview_rollup() {
+        Ok(rollup) => rollup,
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1635,23 +1819,23 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
                 .into_response();
         }
     };
-    let attempts = state.store.attempts(20000).unwrap_or_default();
     let mut providers: BTreeMap<String, Value> = BTreeMap::new();
     let provider_names = state
         .config
         .providers
         .iter()
         .map(|provider| provider.id.clone())
-        .chain(attempts.iter().map(|attempt| attempt.provider.clone()))
+        .chain(rollup.attempts.keys().map(|(provider, _)| provider.clone()))
         .collect::<std::collections::BTreeSet<_>>();
     for provider in provider_names {
-        let rows = attempts
+        let rows = rollup
+            .attempts
             .iter()
-            .filter(|attempt| attempt.provider == provider)
+            .filter(|((row_provider, _), _)| row_provider == &provider)
             .collect::<Vec<_>>();
         let models = rows
             .iter()
-            .map(|attempt| attempt.upstream_model.as_str())
+            .map(|((_, upstream_model), _)| upstream_model.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         let served_models = state
             .config
@@ -1667,22 +1851,26 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
             })
             .map(|model| model.name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut summary = attempt_summary(&rows);
-        let summary = summary.as_object_mut().expect("attempt summary object");
+        let mut aggregate = AttemptRollup::default();
+        for (_, value) in rows {
+            if let Err(error) = aggregate.checked_add_assign(*value) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":error})),
+                )
+                    .into_response();
+            }
+        }
+        let mut summary = attempt_rollup_json(aggregate);
+        let summary = summary.as_object_mut().expect("attempt rollup object");
         summary.insert("models".into(), json!(models));
         summary.insert("served_models".into(), json!(served_models));
         providers.insert(provider, Value::Object(summary.clone()));
     }
-    let mut route_groups: BTreeMap<(String, String), Vec<&AttemptRecord>> = BTreeMap::new();
-    for attempt in &attempts {
-        route_groups
-            .entry((attempt.provider.clone(), attempt.upstream_model.clone()))
-            .or_default()
-            .push(attempt);
-    }
-    let routes = route_groups
-        .into_iter()
-        .map(|((provider, upstream_model), rows)| {
+    let routes = rollup
+        .attempts
+        .iter()
+        .map(|((provider, upstream_model), value)| {
             let served_models = state
                 .config
                 .models
@@ -1690,54 +1878,49 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
                 .filter(|model| {
                     model.layers.iter().any(|layer| {
                         layer.targets.iter().any(|target| {
-                            target.provider == provider && target.model == upstream_model
+                            target.provider.as_str() == provider.as_str()
+                                && target.model.as_str() == upstream_model.as_str()
                         })
                     })
                 })
                 .map(|model| model.name.as_str())
                 .collect::<std::collections::BTreeSet<_>>();
-            let mut summary = attempt_summary(&rows);
-            let summary = summary.as_object_mut().expect("attempt summary object");
+            let mut summary = attempt_rollup_json(*value);
+            let summary = summary.as_object_mut().expect("attempt rollup object");
             summary.insert("served_models".into(), json!(served_models));
-            summary.insert("provider".into(), Value::String(provider));
-            summary.insert("upstream_model".into(), Value::String(upstream_model));
+            summary.insert("provider".into(), Value::String(provider.clone()));
+            summary.insert(
+                "upstream_model".into(),
+                Value::String(upstream_model.clone()),
+            );
             Value::Object(summary.clone())
         })
         .collect::<Vec<_>>();
-    let total = requests.len() as u64;
-    let errors = requests.iter().filter(|r| r.error_class.is_some()).count() as u64;
-    let fallbacks = requests.iter().filter(|r| r.fallback).count() as u64;
-    let output_tokens = requests.iter().map(|r| r.usage.output_tokens).sum::<u64>();
-    let bytes = requests
-        .iter()
-        .map(|r| r.request_bytes + r.response_bytes)
-        .sum::<u64>();
-    Json(json!({"requests":{"total":total,"errors":errors,"fallbacks":fallbacks,"output_tokens":output_tokens,"bytes":bytes},"providers":providers,"routes":routes})).into_response()
+    let requests = rollup.requests;
+    Json(json!({
+        "requests":{
+            "total":requests.calls,
+            "errors":requests.errors,
+            "fallbacks":requests.fallbacks,
+            "output_tokens":requests.output_tokens,
+            "bytes":requests.bytes,
+        },
+        "providers":providers,
+        "routes":routes
+    }))
+    .into_response()
 }
 
-fn attempt_summary(rows: &[&AttemptRecord]) -> Value {
-    let total = rows.len() as u64;
-    let successes = rows
-        .iter()
-        .filter(|attempt| attempt.error_class.is_none())
-        .count() as u64;
-    let cache_reported = rows
-        .iter()
-        .filter(|attempt| attempt.usage.provider_reported)
-        .count() as u64;
-    let hit = rows
-        .iter()
-        .map(|attempt| attempt.usage.cache_hit_tokens)
-        .sum::<u64>();
-    let miss = rows
-        .iter()
-        .map(|attempt| attempt.usage.cache_miss_tokens)
-        .sum::<u64>();
-    let cost = rows
-        .iter()
-        .filter_map(|attempt| attempt.provider_cost_usd)
-        .sum::<f64>();
-    json!({"attempts":total,"successes":successes,"errors":total-successes,"cache_reported_attempts":cache_reported,"cache_hit_tokens":hit,"cache_miss_tokens":miss,"cost_usd":cost})
+fn attempt_rollup_json(value: AttemptRollup) -> Value {
+    json!({
+        "attempts":value.attempts,
+        "successes":value.successes,
+        "errors":value.errors,
+        "cache_reported_attempts":value.cache_reported_attempts,
+        "cache_hit_tokens":value.cache_hit_tokens,
+        "cache_miss_tokens":value.cache_miss_tokens,
+        "cost_usd":value.cost_usd,
+    })
 }
 
 #[cfg(test)]

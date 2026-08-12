@@ -4,6 +4,7 @@
 /quotamux.toml
 /data/
 /target/
+/frontend/node_modules/
 /.DS_Store
 /coverage/
 *.profraw

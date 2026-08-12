@@ -1,8 +1,12 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.97-alpine AS builder
 WORKDIR /src
-RUN apk add --no-cache build-base ca-certificates cmake make perl
+RUN apk add --no-cache build-base ca-certificates cmake make nodejs npm perl
 COPY Cargo.toml Cargo.lock ./
+COPY frontend/package.json frontend/package-lock.json ./frontend/
+RUN cd frontend && npm ci
+COPY frontend ./frontend
+RUN cd frontend && npm run build
 COPY src ./src
 RUN cargo build --release --locked --bin quotamux --bin quotamux-smoke
 RUN mkdir -p /runtime-data

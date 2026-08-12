@@ -1458,6 +1458,38 @@ async fn transient_primary_failure_falls_back_before_commit_and_persists_attempt
     assert_eq!(fallback_attempt["sequence"], 2);
     assert_eq!(fallback_attempt["committed"], true);
     assert_eq!(fallback_attempt["error_class"], Value::Null);
+
+    let routing_stats = client
+        .get(gateway.url(&format!(
+            "/api/routing/stats?model={LOGICAL_MODEL}&window=all"
+        )))
+        .send()
+        .await
+        .expect("fallback routing statistics")
+        .json::<Value>()
+        .await
+        .expect("fallback routing statistics JSON");
+    assert_eq!(routing_stats["totals"]["calls"], 1);
+    assert_eq!(routing_stats["layers"][0]["totals"]["calls"], 0);
+    assert_eq!(routing_stats["layers"][1]["totals"]["calls"], 1);
+    assert_eq!(
+        routing_stats["layers"][1]["targets"][0]["credential"],
+        "deepseek-payg"
+    );
+    assert_eq!(
+        routing_stats["layers"][1]["targets"][0]["totals"]["calls"],
+        1
+    );
+    let overview = client
+        .get(gateway.url("/api/stats"))
+        .send()
+        .await
+        .expect("fallback overview statistics")
+        .json::<Value>()
+        .await
+        .expect("fallback overview statistics JSON");
+    assert_eq!(overview["providers"]["opencode-go"]["attempts"], 1);
+    assert_eq!(overview["providers"]["deepseek"]["attempts"], 1);
 }
 
 #[tokio::test]
@@ -1941,4 +1973,227 @@ async fn unused_later_layer_does_not_claim_a_half_open_probe() {
     assert_eq!(header_value(&third, "x-relay-provider"), "deepseek");
     assert_eq!(primary.calls().await, 3);
     assert_eq!(fallback.calls().await, 2);
+}
+
+#[tokio::test]
+async fn routing_endpoints_report_configured_hierarchy_and_final_key_usage() {
+    let primary = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("reasoning", "answer"),
+    )])
+    .await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("routing statistics request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let routing = client
+        .get(gateway.url("/api/routing"))
+        .send()
+        .await
+        .expect("routing response")
+        .json::<Value>()
+        .await
+        .expect("routing JSON");
+    assert_eq!(routing["models"][0]["name"], LOGICAL_MODEL);
+    assert_eq!(routing["models"][0]["aliases"][0], UPSTREAM_MODEL);
+    assert_eq!(routing["models"][0]["layers"][0]["name"], "plan");
+    assert_eq!(routing["models"][0]["layers"][0]["strategy"], "random");
+    assert_eq!(
+        routing["models"][0]["layers"][0]["targets"][0]["credential"],
+        "go-plan"
+    );
+    assert!(
+        routing["models"][0]["layers"][0]["targets"][0]
+            .get("protocols")
+            .is_none()
+    );
+
+    let stats = client
+        .get(gateway.url(&format!(
+            "/api/routing/stats?model={LOGICAL_MODEL}&window=all"
+        )))
+        .send()
+        .await
+        .expect("routing stats response")
+        .json::<Value>()
+        .await
+        .expect("routing stats JSON");
+    assert_eq!(stats["totals"]["calls"], 1);
+    assert_eq!(stats["totals"]["input_tokens"], 11);
+    assert_eq!(stats["totals"]["output_tokens"], 7);
+    assert_eq!(stats["totals"]["total_tokens"], 18);
+    assert_eq!(stats["layers"][0]["totals"]["calls"], 1);
+    assert_eq!(stats["layers"][0]["targets"][0]["totals"]["calls"], 1);
+    assert_eq!(stats["layers"][1]["totals"]["calls"], 0);
+    assert_eq!(stats["unattributed"]["calls"], 0);
+    assert_eq!(stats["historical_targets"].as_array().unwrap().len(), 0);
+
+    let alias_stats = client
+        .get(gateway.url(&format!(
+            "/api/routing/stats?model={UPSTREAM_MODEL}&window=all"
+        )))
+        .send()
+        .await
+        .expect("routing stats alias response")
+        .json::<Value>()
+        .await
+        .expect("routing stats alias JSON");
+    assert_eq!(alias_stats["model"]["name"], LOGICAL_MODEL);
+    assert_eq!(alias_stats["totals"], stats["totals"]);
+
+    let overview = client
+        .get(gateway.url("/api/stats"))
+        .send()
+        .await
+        .expect("overview stats response")
+        .json::<Value>()
+        .await
+        .expect("overview stats JSON");
+    assert_eq!(overview["requests"]["total"], 1);
+    assert_eq!(overview["providers"]["opencode-go"]["attempts"], 1);
+    assert_eq!(overview["providers"]["opencode-go"]["successes"], 1);
+
+    let unknown = client
+        .get(gateway.url("/api/routing/stats?model=missing&window=all"))
+        .send()
+        .await
+        .expect("unknown model response");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        unknown.json::<Value>().await.unwrap()["code"],
+        "unknown_model"
+    );
+    let invalid_window = client
+        .get(gateway.url(&format!(
+            "/api/routing/stats?model={LOGICAL_MODEL}&window=year"
+        )))
+        .send()
+        .await
+        .expect("invalid window response");
+    assert_eq!(invalid_window.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_window.json::<Value>().await.unwrap()["code"],
+        "invalid_window"
+    );
+}
+
+#[tokio::test]
+async fn embedded_dashboard_preserves_api_404s_and_cache_correct_assets() {
+    let primary = MockProvider::start(Vec::new()).await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    let index = client
+        .get(gateway.url("/"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .expect("embedded index response");
+    assert_eq!(index.status(), StatusCode::OK);
+    assert_eq!(
+        index.headers().get("cache-control").unwrap(),
+        "public, max-age=0, s-maxage=60, must-revalidate"
+    );
+    let index_etag = index
+        .headers()
+        .get("etag")
+        .expect("index ETag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let index_html = index.text().await.expect("embedded index HTML");
+    assert!(index_html.contains("QuotaMux"));
+    let asset_start = index_html.find("/assets/").expect("hashed asset path");
+    let asset_end = index_html[asset_start..]
+        .find('"')
+        .expect("hashed asset path end");
+    let asset_path = &index_html[asset_start..asset_start + asset_end];
+
+    let identity_asset = client
+        .get(gateway.url(asset_path))
+        .header("accept-encoding", "identity")
+        .send()
+        .await
+        .expect("identity asset response");
+    assert_eq!(identity_asset.status(), StatusCode::OK);
+    assert_eq!(
+        identity_asset.headers().get("cache-control").unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    let identity_etag = identity_asset.headers().get("etag").unwrap().clone();
+    assert!(identity_asset.headers().get("content-encoding").is_none());
+
+    let gzip_asset = client
+        .get(gateway.url(asset_path))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .expect("gzip asset response");
+    assert_eq!(gzip_asset.status(), StatusCode::OK);
+    assert_eq!(
+        gzip_asset.headers().get("content-encoding").unwrap(),
+        "gzip"
+    );
+    assert_ne!(gzip_asset.headers().get("etag").unwrap(), &identity_etag);
+
+    let brotli_asset = client
+        .get(gateway.url(asset_path))
+        .header("accept-encoding", "br")
+        .send()
+        .await
+        .expect("Brotli asset response");
+    assert_eq!(brotli_asset.status(), StatusCode::OK);
+    assert_eq!(
+        brotli_asset.headers().get("content-encoding").unwrap(),
+        "br"
+    );
+    assert_ne!(brotli_asset.headers().get("etag").unwrap(), &identity_etag);
+    assert_ne!(
+        brotli_asset.headers().get("etag").unwrap(),
+        gzip_asset.headers().get("etag").unwrap()
+    );
+
+    let revalidated = client
+        .get(gateway.url("/"))
+        .header("accept", "text/html")
+        .header("if-none-match", index_etag)
+        .send()
+        .await
+        .expect("revalidated index response");
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(revalidated.bytes().await.unwrap().len(), 0);
+
+    let html_fallback = client
+        .get(gateway.url("/routing"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .expect("HTML fallback response");
+    assert_eq!(html_fallback.status(), StatusCode::OK);
+
+    let missing_api = client
+        .get(gateway.url("/api/missing"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .expect("missing API response");
+    assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
+    assert!(!missing_api.text().await.unwrap().contains("QuotaMux"));
+
+    let missing_asset = client
+        .get(gateway.url("/assets/missing-deadbeef.js"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .expect("missing immutable asset response");
+    assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
 }

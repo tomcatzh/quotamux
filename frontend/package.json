@@ -1,0 +1,11 @@
+{
+  "name": "quotamux-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && node scripts/precompress.mjs dist"
+  },
+  "devDependencies": {
+    "vite": "8.1.5"
+  }
+}

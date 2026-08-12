@@ -69,6 +69,24 @@ QUOTAMUX_CONFIG=/path/to/quotamux.toml cargo run --release --bin quotamux
 `QUOTAMUX_DATA_DIR` overrides `server.data_dir`. `RUST_LOG` controls logging,
 for example `RUST_LOG=quotamux=debug`.
 
+### Frontend build
+
+The dashboard source is under `frontend/`. Vite builds hashed static assets and
+the precompression step creates gzip and Brotli siblings in `frontend/dist/`:
+
+```sh
+cd frontend
+npm ci
+npm run build
+cd ..
+cargo build --release --locked
+```
+
+The Rust binary embeds `frontend/dist/` through `embedded-spa` v0.1.1. The
+Docker build runs these steps automatically. API routes have explicit 404
+fallbacks before the SPA handler, while missing browser routes that accept HTML
+receive `index.html`.
+
 ## Configuration model
 
 QuotaMux configuration has three independent levels:
@@ -617,40 +635,58 @@ Operational endpoints:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /` | Local dashboard with provider-level totals and recent request routes. |
+| `GET /` | Local Overview and Routing dashboard. |
 | `GET /healthz` | Health, models, and uptime. |
 | `GET /v1/models` | Public served names and aliases. |
 | `GET /api/status` | Served models, targets, safe endpoints, per-target circuits, affinity limits/count, and alerts. |
-| `GET /api/stats` | Aggregate requests, errors, fallbacks, provider totals, and provider/upstream-model route totals. |
+| `GET /api/stats` | All-time request, provider, and provider/upstream-model totals from aggregate tables. |
+| `GET /api/routing` | Current served-model, layer, strategy, target, and per-target circuit hierarchy. |
+| `GET /api/routing/stats?model=NAME&window=1d` | Calls and token totals by final target/key for `1h`, `1d`, `1w`, `1m`, or `all`. |
 | `GET /api/requests?limit=100` | Recent request metadata, including served model, provider, and exact upstream model; maximum limit 1000. |
 | `GET /api/attempts?limit=100` | Recent per-target attempts; maximum limit 1000. |
 
-The dashboard's **Providers** table has one row for every configured provider,
-including providers with zero attempts, and does not list models. Historical
-attempts are merged into the matching current provider ID. The **Recent
-requests** table shows the full route for each newly recorded request as `served
-model -> provider -> upstream model`. Records written by an older QuotaMux
-version show `-` for model fields that were not captured at the time. Circuit
-state remains available per target through `/api/status`; the dashboard does not
-present a misleading singleton provider or circuit. Provider balance polling is
-not currently enabled.
+The **Overview** page keeps provider totals, recent logical requests, and active
+alerts together. A recorded route is shown as `served model -> layer -> provider
+(key) -> upstream model`; protocol is not a visible routing dimension. The
+**Routing** page shows the configured ordered layers and each target's real
+circuit state, reason, and next-probe time. Aliases appear only in parentheses
+beside their canonical served model.
+
+Routing statistics are a plain ledger rather than a proportional chart. The
+page switches between Calls, Total tokens, Input tokens, and Output tokens and
+between rolling 1-hour, 1-day, 1-week, 30-day, and all-time windows. A Call is
+one persisted logical request attributed to its final recorded target/key;
+failed intermediate targets remain attempts and are not counted as additional
+Calls. Historical targets and requests missing a complete final target identity
+are kept as separate reconciliation rows when present.
 
 ## Storage and privacy
 
 - `server.data_dir/quotamux.redb` stores request/attempt metadata, target circuit
-  state, and alerts.
+  state, alerts, and versioned fixed-width statistics rollups.
+- New request and attempt records update their raw audit row and rollup counters
+  atomically in one redb transaction. Statistics queries read bounded
+  minute/hour aggregate ranges or compact all-time tables rather than scanning
+  the raw audit tables.
+- Existing databases are backfilled automatically in restartable batches before
+  the listener starts. A new database creates the complete current schema
+  directly; there is no separate one-time migration script to retain or run.
 - Prompt bodies, model response bodies, and API keys are not written to that
   database.
 - Prompt-prefix-affinity metadata is never written to redb. It is pure memory
   and disappears on restart.
-- `quotamux.toml`, `AGENTS.md`, `CLAUDE.md`, `data/`, and build outputs are
-  ignored by this repository.
+- `quotamux.toml`, `AGENTS.md`, `CLAUDE.md`, `data/`, Rust build outputs, and
+  `frontend/node_modules/` are ignored by this repository. The generated
+  `frontend/dist/` files are committed so debug and release Cargo builds remain
+  reproducible without running Node first.
 
 ## Tests
 
-Run the complete offline/local suite:
+Run the complete local suite:
 
 ```sh
+npm --prefix frontend ci
+npm --prefix frontend run build
 cargo test --all-targets
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings

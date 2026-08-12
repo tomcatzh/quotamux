@@ -170,6 +170,15 @@ pub enum RouteStrategy {
     PromptPrefixAffinity,
 }
 
+impl RouteStrategy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::PromptPrefixAffinity => "prompt-prefix-affinity",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteLayerConfig {

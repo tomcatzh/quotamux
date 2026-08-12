@@ -2,6 +2,7 @@
 .github
 .llmwiki
 target
+frontend/node_modules
 data
 quotamux.toml
 AGENTS.md
