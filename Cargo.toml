@@ -3,7 +3,7 @@ name = "quotamux"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "A quota-aware local gateway for DeepSeek V4 Flash"
+description = "A quota-aware local gateway for DeepSeek V4"
 repository = "https://github.com/tomcatzh/quotamux"
 
 [dependencies]

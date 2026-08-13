@@ -234,6 +234,7 @@ fn legacy_provider(
         models: vec![ProviderModelConfig {
             name: text_at(document, &["providers", legacy_id, "model"]),
             protocols: vec![Protocol::OpenAiChat],
+            pricing: None,
         }],
     }
 }

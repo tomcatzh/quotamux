@@ -7,7 +7,9 @@ use reqwest::{
 use serde_json::Value;
 
 use crate::{
-    config::{CredentialConfig, ProviderConfig, ProviderKind, ProviderModelConfig},
+    config::{
+        CredentialConfig, ModelPricingConfig, ProviderConfig, ProviderKind, ProviderModelConfig,
+    },
     types::{FailureClass, Protocol},
 };
 
@@ -22,6 +24,7 @@ pub struct ProviderClient {
     api_key: String,
     model: String,
     protocols: Vec<Protocol>,
+    pricing: Option<ModelPricingConfig>,
     client: reqwest::Client,
 }
 
@@ -58,6 +61,7 @@ impl ProviderClient {
             api_key: credential.api_key.clone(),
             model: model.name.clone(),
             protocols: model.protocols.clone(),
+            pricing: model.pricing,
             client,
         })
     }
@@ -79,6 +83,9 @@ impl ProviderClient {
     }
     pub fn protocols(&self) -> &[Protocol] {
         &self.protocols
+    }
+    pub const fn pricing(&self) -> Option<&ModelPricingConfig> {
+        self.pricing.as_ref()
     }
     pub fn protocol_for(&self, ingress: Protocol) -> Protocol {
         if self.protocols.contains(&ingress) {
@@ -279,6 +286,7 @@ mod tests {
             models: vec![ProviderModelConfig {
                 name: model.into(),
                 protocols: vec![Protocol::OpenAiChat],
+                pricing: None,
             }],
         };
         ProviderClient::new(&provider, &provider.credentials[0], &provider.models[0]).unwrap()

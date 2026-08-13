@@ -718,7 +718,7 @@ async fn execute_json_attempt(
         raw.clone()
     };
     let usage = usage_for(egress, &raw);
-    let cost = provider_cost(runtime.client.kind(), &raw, &usage);
+    let cost = provider_cost(runtime.client.pricing(), &usage);
     let record = AttemptRecord {
         id: attempt_id,
         request_id: Some(request_id.into()),
@@ -873,6 +873,7 @@ async fn handle_stream(
     let attempt_started_at_ms = prepared.attempt_started_at_ms;
     let upstream_request_bytes = prepared.request_bytes;
     let upstream_model = prepared.runtime.client.model().to_string();
+    let upstream_pricing = prepared.runtime.client.pricing().copied();
     let runtime_for_stream = prepared.runtime.clone();
     let candidate_for_stream = candidate.clone();
     let stream = stream! {
@@ -988,7 +989,7 @@ async fn handle_stream(
             first_byte_ms:Some(first_byte_ms),
             total_ms:started.elapsed().as_millis() as u64,
             usage:usage.clone(),
-            provider_cost_usd:provider_cost(provider_kind,&Value::Null,&usage),
+            provider_cost_usd:provider_cost(upstream_pricing.as_ref(),&usage),
             sanitized_error:stream_error.map(|_|"upstream stream ended unexpectedly".into())
         };
         persist_attempt(&state_for_stream,&attempt);
@@ -1425,25 +1426,20 @@ fn usage_for(protocol: Protocol, value: &Value) -> Usage {
     }
 }
 
-fn provider_cost(provider: ProviderKind, raw: &Value, usage: &Usage) -> Option<f64> {
-    if matches!(
-        provider,
-        ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen
-    ) {
-        return raw
-            .get("cost")
-            .and_then(Value::as_f64)
-            .or_else(|| raw.get("cost").and_then(Value::as_str)?.parse().ok());
+fn provider_cost(
+    pricing: Option<&crate::config::ModelPricingConfig>,
+    usage: &Usage,
+) -> Option<f64> {
+    let pricing = pricing?;
+    if !usage.provider_reported {
+        return None;
     }
-    if provider == ProviderKind::DeepSeekOfficial {
-        return Some(
-            (usage.cache_hit_tokens as f64 * 0.0028
-                + usage.cache_miss_tokens as f64 * 0.14
-                + usage.output_tokens as f64 * 0.28)
-                / 1_000_000.0,
-        );
-    }
-    None
+    Some(
+        (usage.cache_hit_tokens as f64 * pricing.cache_hit_input_usd_per_million
+            + usage.cache_miss_tokens as f64 * pricing.cache_miss_input_usd_per_million
+            + usage.output_tokens as f64 * pricing.output_usd_per_million)
+            / 1_000_000.0,
+    )
 }
 fn persist_request(state: &AppState, record: &RequestRecord) {
     if let Err(error) = state.store.record_request(record) {
@@ -2029,15 +2025,22 @@ mod tests {
         ));
     }
     #[test]
-    fn calculates_deepseek_cost() {
+    fn calculates_cost_from_model_pricing_only() {
         let usage = Usage {
             cache_hit_tokens: 1_000_000,
+            cache_miss_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            provider_reported: true,
             ..Default::default()
         };
-        assert!(
-            (provider_cost(ProviderKind::DeepSeekOfficial, &Value::Null, &usage).unwrap() - 0.0028)
-                .abs()
-                < 1e-9
-        );
+        let pricing = crate::config::ModelPricingConfig {
+            cache_hit_input_usd_per_million: 1.0,
+            cache_miss_input_usd_per_million: 2.0,
+            output_usd_per_million: 3.0,
+        };
+        assert!((provider_cost(Some(&pricing), &usage).unwrap() - 6.0).abs() < 1e-9);
+        assert!(provider_cost(None, &usage).is_none());
+        let missing_usage = Usage::default();
+        assert!(provider_cost(Some(&pricing), &missing_usage).is_none());
     }
 }

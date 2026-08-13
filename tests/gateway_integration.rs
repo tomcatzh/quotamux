@@ -18,9 +18,9 @@ use quotamux::{
     AppState, Config,
     app::build_app,
     config::{
-        CredentialConfig, LOGICAL_MODEL, ProviderConfig, ProviderKind, ProviderModelConfig,
-        RouteLayerConfig, RouteStrategy, RouteTargetConfig, ServedModelConfig, ServerConfig,
-        UPSTREAM_MODEL,
+        CredentialConfig, LOGICAL_MODEL, ModelPricingConfig, ProviderConfig, ProviderKind,
+        ProviderModelConfig, RouteLayerConfig, RouteStrategy, RouteTargetConfig, ServedModelConfig,
+        ServerConfig, UPSTREAM_MODEL,
     },
     types::Protocol,
 };
@@ -174,6 +174,7 @@ impl Gateway {
                     models: vec![ProviderModelConfig {
                         name: UPSTREAM_MODEL.into(),
                         protocols: vec![Protocol::OpenAiChat],
+                        pricing: None,
                     }],
                 },
                 ProviderConfig {
@@ -191,6 +192,7 @@ impl Gateway {
                             Protocol::OpenAiResponses,
                             Protocol::AnthropicMessages,
                         ],
+                        pricing: None,
                     }],
                 },
             ],
@@ -283,7 +285,8 @@ fn chat_completion(reasoning: &str, content: &str) -> Value {
             "prompt_cache_hit_tokens": 3,
             "prompt_cache_miss_tokens": 8,
             "completion_tokens_details": {"reasoning_tokens": 4}
-        }
+        },
+        "system_fingerprint": "fp-upstream-test"
     })
 }
 
@@ -346,6 +349,7 @@ fn test_provider_kind_model(
         models: vec![ProviderModelConfig {
             name: model.into(),
             protocols: vec![protocol],
+            pricing: None,
         }],
     }
 }
@@ -463,6 +467,7 @@ async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
         "primary reasoning"
     );
     assert_eq!(body["choices"][0]["message"]["content"], "primary answer");
+    assert_eq!(body["system_fingerprint"], "fp-upstream-test");
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 0);
 
@@ -479,6 +484,54 @@ async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
         stats["providers"]["deepseek"]["models"],
         json!([UPSTREAM_MODEL])
     );
+}
+
+#[tokio::test]
+async fn configured_model_pricing_drives_cost_for_any_provider_kind() {
+    let upstream = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("priced reasoning", "priced answer"),
+    )])
+    .await;
+    let mut config = test_config(
+        vec![test_provider_kind(
+            "priced-custom",
+            "priced-key",
+            &upstream,
+            ProviderKind::CustomChatCompletions,
+            Protocol::OpenAiChat,
+        )],
+        vec![("priced", vec![target("priced-custom", "priced-key")])],
+    );
+    config.providers[0].models[0].pricing = Some(ModelPricingConfig {
+        cache_hit_input_usd_per_million: 1.0,
+        cache_miss_input_usd_per_million: 2.0,
+        output_usd_per_million: 3.0,
+    });
+    let gateway = Gateway::start_config(config, 0x0c057).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("priced response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let stats = client
+        .get(gateway.url("/api/stats"))
+        .send()
+        .await
+        .expect("priced stats response")
+        .json::<Value>()
+        .await
+        .expect("priced stats JSON");
+    let expected = (3.0 * 1.0 + 8.0 * 2.0 + 7.0 * 3.0) / 1_000_000.0;
+    let actual = stats["providers"]["priced-custom"]["cost_usd"]
+        .as_f64()
+        .expect("configured cost");
+    assert!((actual - expected).abs() < 1e-12);
 }
 
 #[tokio::test]

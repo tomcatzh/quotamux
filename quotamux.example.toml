@@ -29,6 +29,12 @@ api_key = ""
 [[providers.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat"]
+pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
+
+[[providers.models]]
+name = "deepseek-v4-pro"
+protocols = ["openai-chat"]
+pricing = { cache_hit_input_usd_per_million = 0.003625, cache_miss_input_usd_per_million = 0.435, output_usd_per_million = 0.87 }
 
 [[providers]]
 id = "deepseek"
@@ -41,6 +47,12 @@ api_key = ""
 [[providers.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
+
+[[providers.models]]
+name = "deepseek-v4-pro"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+pricing = { cache_hit_input_usd_per_million = 0.003625, cache_miss_input_usd_per_million = 0.435, output_usd_per_million = 0.87 }
 
 # QuotaMux owns this public model name and its explicit compatibility alias.
 [[models]]
@@ -63,4 +75,22 @@ name = "payg"
 strategy = "random"
 targets = [
   { provider = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
+]
+
+[[models]]
+name = "deepseek-v4-pro"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+[[models.layers]]
+name = "plan"
+strategy = "random"
+targets = [
+  { provider = "opencode-go", credential = "go-plan", model = "deepseek-v4-pro" },
+]
+
+[[models.layers]]
+name = "payg"
+strategy = "random"
+targets = [
+  { provider = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-pro" },
 ]

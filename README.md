@@ -153,6 +153,7 @@ api_key = "replace-with-second-go-key"
 # Always use the exact upstream model ID.
 name = "deepseek-v4-flash"
 protocols = ["openai-chat"]
+pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
 [[providers]]
 id = "deepseek"
@@ -165,6 +166,7 @@ api_key = "replace-with-deepseek-key"
 [[providers.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
 [[models]]
 # Public QuotaMux name. It does not need to equal an upstream model ID.
@@ -225,6 +227,7 @@ api_key = "replace-with-opencode-go-key"
 [[providers.models]]
 name = "kimi-k3"
 protocols = ["openai-chat"]
+pricing = { cache_hit_input_usd_per_million = 0.30, cache_miss_input_usd_per_million = 3.00, output_usd_per_million = 15.00 }
 
 [[providers]]
 id = "kimi-code"
@@ -249,6 +252,7 @@ api_key = "replace-with-kimi-open-platform-key"
 [[providers.models]]
 name = "kimi-k3"
 protocols = ["openai-chat"]
+pricing = { cache_hit_input_usd_per_million = 0.30, cache_miss_input_usd_per_million = 3.00, output_usd_per_million = 15.00 }
 
 [[models]]
 name = "kimi-k3"
@@ -351,7 +355,22 @@ api_key = "plaintext-secret"
 [[providers.models]]
 name = "exact-upstream-model-id"
 protocols = ["openai-chat"]
+pricing = { cache_hit_input_usd_per_million = 0.0, cache_miss_input_usd_per_million = 0.0, output_usd_per_million = 0.0 }
 ```
+
+`pricing` is optional and belongs to this exact provider/model pair. When it is
+present, QuotaMux estimates cost from provider-reported cache-hit input,
+cache-miss input, and output tokens. The three values are USD per one million
+tokens; they must be finite and non-negative. When it is absent, QuotaMux
+records usage but does not invent a cost. No provider or model price is built
+into the binary, so price changes require only a private configuration update.
+Subscription-only routes may omit pricing when a per-token estimate is not
+meaningful.
+
+Kimi's China platform bills K3 in CNY (`¥2 / ¥20 / ¥100` per million tokens),
+while its official English pricing publishes the corresponding USD estimate
+(`$0.30 / $3 / $15`). Because the dashboard aggregates `cost_usd`, use the USD
+values in these fields rather than copying the CNY numbers.
 
 `id` values are local routing identities. They are visible in metadata and
 statistics, so use useful names such as `go-plan-a` or `bailian-payg-cn` but do
@@ -369,8 +388,8 @@ the provider-kind enum in the configuration schema:
 
 | `kind` | Default endpoint | Current acceptance status |
 | --- | --- | --- |
-| `opencode-go` | `https://opencode.ai/zen/go/v1` | Real-worker accepted for `deepseek-v4-flash`; real stream and 300,095-input-token acceptance also pass for `kimi-k3`. Protocol remains model-specific. |
-| `deepseek-official` | `https://api.deepseek.com` | Implemented as an optional PAYG/fallback adapter, including cost estimation and Anthropic path handling. |
+| `opencode-go` | `https://opencode.ai/zen/go/v1` | Real-worker accepted for `deepseek-v4-flash` and `deepseek-v4-pro`; real stream and 300,095-input-token acceptance also pass for `kimi-k3`. The Pro response omitted `system_fingerprint`. Protocol remains model-specific. |
+| `deepseek-official` | `https://api.deepseek.com` | Real V4 Pro acceptance returns `system_fingerprint`; the adapter also supports configured cost estimation and Anthropic path handling. |
 | `kimi-code` | `https://api.kimi.com/coding/v1` | Real Allegretto streaming and 300,095-input-token acceptance pass with exact model `k3`; a live Codex worker completed a two-turn Responses-to-Chat reasoning/tool loop through this adapter. |
 | `kimi-official` | `https://api.moonshot.cn/v1` | Real paid-account streaming and 300,095-input-token acceptance pass with exact model `kimi-k3`; layered fallback and provider-specific model rewrites are covered end to end. |
 
@@ -385,7 +404,9 @@ Provider model lists change over time. Configure the exact ID and protocol
 shown by the provider rather than guessing from the marketing name:
 
 - [DeepSeek model API](https://api-docs.deepseek.com/api/list-models/)
+- [DeepSeek model pricing](https://api-docs.deepseek.com/quick_start/pricing/)
 - [OpenCode Go model IDs and endpoints](https://opencode.ai/docs/go#endpoints)
+- [Kimi K3 pricing](https://www.kimi.com/resources/kimi-k3-pricing)
 
 ### Reserved provider kinds — not supported yet
 
@@ -707,6 +728,13 @@ cache/route evidence:
 
 ```sh
 cargo test --test real_worker_affinity -- --ignored --nocapture
+```
+
+The V4 Pro probe makes one low-output request to each configured DeepSeek target
+and records whether the provider returns `system_fingerprint`:
+
+```sh
+cargo test --test real_deepseek_v4_pro -- --ignored --nocapture
 ```
 
 Kimi has a separate ignored real suite. It uses the existing private

@@ -145,6 +145,16 @@ pub struct CredentialConfig {
 pub struct ProviderModelConfig {
     pub name: String,
     pub protocols: Vec<Protocol>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricingConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricingConfig {
+    pub cache_hit_input_usd_per_million: f64,
+    pub cache_miss_input_usd_per_million: f64,
+    pub output_usd_per_million: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -394,6 +404,25 @@ fn validate_provider(path: &str, provider: &ProviderConfig) -> Result<(), Config
                 )));
             }
         }
+        if let Some(pricing) = model.pricing {
+            for (field, value) in [
+                (
+                    "cache_hit_input_usd_per_million",
+                    pricing.cache_hit_input_usd_per_million,
+                ),
+                (
+                    "cache_miss_input_usd_per_million",
+                    pricing.cache_miss_input_usd_per_million,
+                ),
+                ("output_usd_per_million", pricing.output_usd_per_million),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(invalid(format!(
+                        "{model_path}.pricing.{field} must be a finite non-negative USD amount"
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -487,6 +516,7 @@ mod tests {
                     models: vec![ProviderModelConfig {
                         name: UPSTREAM_MODEL.into(),
                         protocols: vec![Protocol::OpenAiChat],
+                        pricing: None,
                     }],
                 },
                 ProviderConfig {
@@ -504,6 +534,7 @@ mod tests {
                             Protocol::OpenAiResponses,
                             Protocol::AnthropicMessages,
                         ],
+                        pricing: None,
                     }],
                 },
             ],
@@ -578,6 +609,26 @@ mod tests {
     }
 
     #[test]
+    fn validates_optional_model_pricing_as_finite_non_negative_usd_rates() {
+        let mut config = valid();
+        config.providers[0].models[0].pricing = Some(ModelPricingConfig {
+            cache_hit_input_usd_per_million: 1.0,
+            cache_miss_input_usd_per_million: 2.0,
+            output_usd_per_million: 3.0,
+        });
+        config.validate().unwrap();
+
+        config.providers[0].models[0]
+            .pricing
+            .as_mut()
+            .unwrap()
+            .output_usd_per_million = f64::NAN;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("output_usd_per_million"));
+        assert!(error.contains("finite non-negative"));
+    }
+
+    #[test]
     fn ollama_cloud_models_may_enable_chat_and_responses() {
         let mut config = valid();
         config.providers[0].kind = ProviderKind::OllamaCloud;
@@ -642,6 +693,7 @@ api_key = "secret"
 [[providers.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat"]
+pricing = { cache_hit_input_usd_per_million = 1.0, cache_miss_input_usd_per_million = 2.0, output_usd_per_million = 3.0 }
 [[models]]
 name = "deepseek-v4-flash-0731"
 aliases = ["deepseek-v4-flash"]
@@ -657,6 +709,14 @@ targets = [{ provider = "go", credential = "go-a", model = "deepseek-v4-flash" }
         assert_eq!(config.affinity.checkpoint_bytes, 256);
         assert_eq!(config.affinity.max_checkpoints_per_path, 1024);
         assert_eq!(config.affinity.max_leases, 2048);
+        assert_eq!(
+            config.providers[0].models[0].pricing,
+            Some(ModelPricingConfig {
+                cache_hit_input_usd_per_million: 1.0,
+                cache_miss_input_usd_per_million: 2.0,
+                output_usd_per_million: 3.0,
+            })
+        );
         assert_eq!(
             config.models[0].layers[0].strategy,
             RouteStrategy::PromptPrefixAffinity

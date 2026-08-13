@@ -1,6 +1,6 @@
 # QuotaMux routing verification evidence
 
-Date: 2026-08-11 (Asia/Shanghai)
+Date: 2026-08-13 (Asia/Shanghai)
 
 This report records the data produced by the configuration-v2, layered-routing,
 protocol-translation, and memory-only prompt-prefix-affinity test runs. API keys,
@@ -10,9 +10,10 @@ prompt bodies, and model response bodies are excluded.
 
 | Suite | Result | Concrete coverage |
 | --- | ---: | --- |
-| Library/unit tests | 58 passed, 0 failed | configuration, provider URL/error adapters, model-aware dashboard output, legacy provider-data migration, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
-| Local gateway end-to-end | 23 passed, 0 failed | all three ingress protocols, streaming and non-streaming translation, attempts, fallback, random layers, affinity, expiry, single-target bypass, and Kimi's three-provider/two-layer route |
+| Library/unit tests | 71 passed, 0 failed | configuration (including optional model pricing validation), provider URL/error adapters, model-aware dashboard output, legacy provider-data migration, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
+| Local gateway end-to-end | 28 passed, 0 failed | all three ingress protocols, streaming and non-streaming translation, configured provider/model pricing, `system_fingerprint` passthrough, attempts, fallback, random layers, affinity, expiry, single-target bypass, and Kimi's three-provider/two-layer route |
 | Real worker probe | 1 passed, 0 failed | OpenCode Go and DeepSeek configured as equivalent targets in one affinity layer |
+| Real DeepSeek V4 Pro probe | 1 passed, 0 failed | exact `deepseek-v4-pro` calls to OpenCode Go and DeepSeek Official; fingerprint presence recorded per provider |
 | Real Kimi K3 acceptance | 3 passed, 0 failed | three direct streams, mixed subscription affinity, and explicitly gated 300,095-input-token requests to all three targets |
 | Codex CLI worker | passed, 2 gateway turns | Codex 0.145 through `http://127.0.0.1:8080/v1`, Responses-to-Chat streaming, shell tool execution, reasoning history, provider cache usage, and same-target prefix affinity |
 | Static checks | passed | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `git diff --check` |
@@ -61,6 +62,17 @@ The first request was cold. The second request was selected by prefix affinity,
 returned to the same real worker, and the provider reported that 1,280 of its
 1,352 input tokens were cache hits. This is direct provider data, not an
 estimate derived by QuotaMux.
+
+## Real DeepSeek V4 Pro and fingerprint evidence
+
+Both configured V4 Pro targets accepted the exact upstream model ID
+`deepseek-v4-pro` in low-output, non-streaming Chat Completions requests.
+DeepSeek Official returned a non-empty `system_fingerprint`
+(`a307abda487cd1b463329ccb945ce396`). OpenCode Go returned the requested model
+but omitted `system_fingerprint`. DeepSeek documents that response field;
+OpenCode Go documents the model and endpoint but does not promise fingerprint
+passthrough. The credential-free gateway test separately proves that QuotaMux
+preserves a top-level fingerprint when an upstream sends one.
 
 ## Kimi real acceptance evidence
 
