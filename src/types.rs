@@ -166,8 +166,12 @@ impl Usage {
         let Some(usage) = value.get("usage") else {
             return Self::default();
         };
-        let input = usage
+        let uncached_input = usage
             .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_creation = usage
+            .get("cache_creation_input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let output = usage
@@ -178,15 +182,45 @@ impl Usage {
             .get("cache_read_input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let cache_miss = uncached_input.saturating_add(cache_creation);
+        let input = cache_miss.saturating_add(cache_hit);
         Self {
             input_tokens: input,
             cache_hit_tokens: cache_hit,
-            cache_miss_tokens: input.saturating_sub(cache_hit),
+            cache_miss_tokens: cache_miss,
             reasoning_tokens: 0,
             output_tokens: output,
-            total_tokens: input + output,
+            total_tokens: input.saturating_add(output),
             provider_reported: true,
         }
+    }
+
+    pub fn observe_anthropic_stream_event(&mut self, event: &Value) {
+        let event_type = event.get("type").and_then(Value::as_str);
+        let usage = if event_type == Some("message_start") {
+            event.pointer("/message/usage")
+        } else {
+            event.get("usage")
+        };
+        let Some(usage) = usage.filter(|usage| !usage.is_null()) else {
+            return;
+        };
+
+        if usage.get("input_tokens").is_some()
+            || usage.get("cache_creation_input_tokens").is_some()
+            || usage.get("cache_read_input_tokens").is_some()
+        {
+            let observed = Self::from_anthropic(&json!({"usage":usage}));
+            self.input_tokens = observed.input_tokens;
+            self.cache_hit_tokens = observed.cache_hit_tokens;
+            self.cache_miss_tokens = observed.cache_miss_tokens;
+        }
+        if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.output_tokens = output;
+        }
+
+        self.total_tokens = self.input_tokens.saturating_add(self.output_tokens);
+        self.provider_reported = true;
     }
 }
 
@@ -332,5 +366,46 @@ mod tests {
         let usage = Usage::from_openai(&value);
         assert_eq!(usage.cache_hit_tokens, 40);
         assert_eq!(usage.cache_miss_tokens, 10);
+    }
+
+    #[test]
+    fn parses_anthropic_cache_usage_as_total_input() {
+        let value = json!({"usage": {
+            "input_tokens": 5,
+            "cache_creation_input_tokens": 3,
+            "cache_read_input_tokens": 40,
+            "output_tokens": 7
+        }});
+        let usage = Usage::from_anthropic(&value);
+        assert_eq!(usage.input_tokens, 48);
+        assert_eq!(usage.cache_hit_tokens, 40);
+        assert_eq!(usage.cache_miss_tokens, 8);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.total_tokens, 55);
+    }
+
+    #[test]
+    fn accumulates_anthropic_stream_usage_without_clearing_on_terminal_events() {
+        let mut usage = Usage::default();
+        for event in [
+            json!({"type":"message_start","message":{"usage":{
+                "input_tokens":0,"cache_creation_input_tokens":0,
+                "cache_read_input_tokens":93,"output_tokens":0
+            }}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}),
+            json!({"type":"message_delta","usage":{
+                "input_tokens":0,"cache_creation_input_tokens":0,
+                "cache_read_input_tokens":93,"output_tokens":32
+            }}),
+            json!({"type":"message_stop"}),
+        ] {
+            usage.observe_anthropic_stream_event(&event);
+        }
+        assert_eq!(usage.input_tokens, 93);
+        assert_eq!(usage.cache_hit_tokens, 93);
+        assert_eq!(usage.cache_miss_tokens, 0);
+        assert_eq!(usage.output_tokens, 32);
+        assert_eq!(usage.total_tokens, 125);
+        assert!(usage.provider_reported);
     }
 }

@@ -848,6 +848,95 @@ async fn kimi_code_anthropic_ingress_uses_native_messages_protocol() {
 }
 
 #[tokio::test]
+async fn native_anthropic_stream_persists_accumulated_usage() {
+    let upstream_stream = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-native-stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"k3\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":20,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":12,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"native stream ok\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let upstream = MockProvider::start(vec![MockReply::sse(upstream_stream)]).await;
+    let mut config = test_config(
+        vec![test_provider_kind_model(
+            "kimi-code",
+            "allegretto",
+            &upstream,
+            ProviderKind::KimiCode,
+            Protocol::AnthropicMessages,
+            "k3",
+        )],
+        vec![(
+            "native",
+            vec![target_model("kimi-code", "allegretto", "k3")],
+        )],
+    );
+    config.models[0].name = "kimi-k3".into();
+    config.models[0].protocols = vec![Protocol::AnthropicMessages];
+    let gateway = Gateway::start_config(config, 0xa117_0002).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model":"kimi-k3",
+            "max_tokens":128,
+            "stream":true,
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .send()
+        .await
+        .expect("native Anthropic stream response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let stream = response.text().await.expect("native Anthropic stream body");
+    assert!(stream.contains("native stream ok"));
+    assert!(stream.contains("event: message_stop"));
+
+    let requests = client
+        .get(gateway.url("/api/requests?limit=10"))
+        .send()
+        .await
+        .expect("native Anthropic request records")
+        .json::<Value>()
+        .await
+        .expect("native Anthropic request records JSON");
+    let request = &requests["requests"][0];
+    assert_eq!(request["streaming"], true);
+    assert_eq!(request["translated"], false);
+    assert_eq!(request["usage"]["input_tokens"], 35);
+    assert_eq!(request["usage"]["cache_hit_tokens"], 12);
+    assert_eq!(request["usage"]["cache_miss_tokens"], 23);
+    assert_eq!(request["usage"]["output_tokens"], 7);
+    assert_eq!(request["usage"]["total_tokens"], 42);
+    assert_eq!(request["usage"]["provider_reported"], true);
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=10"))
+        .send()
+        .await
+        .expect("native Anthropic attempt records")
+        .json::<Value>()
+        .await
+        .expect("native Anthropic attempt records JSON");
+    assert_eq!(attempts["attempts"][0]["usage"], request["usage"]);
+
+    let stats = client
+        .get(gateway.url("/api/routing/stats?model=kimi-k3&window=all"))
+        .send()
+        .await
+        .expect("native Anthropic routing stats")
+        .json::<Value>()
+        .await
+        .expect("native Anthropic routing stats JSON");
+    assert_eq!(stats["totals"]["calls"], 1);
+    assert_eq!(stats["totals"]["input_tokens"], 35);
+    assert_eq!(stats["totals"]["output_tokens"], 7);
+    assert_eq!(stats["totals"]["total_tokens"], 42);
+}
+
+#[tokio::test]
 async fn semantic_validation_is_deferred_upstream_for_every_ingress_protocol() {
     let primary = MockProvider::start(
         (0..3)

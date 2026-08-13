@@ -12,6 +12,9 @@ type AnyError = Box<dyn std::error::Error + Send + Sync>;
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     base_url: String,
+
+    #[arg(long, default_value = "deepseek-v4-flash")]
+    model: String,
 }
 
 #[tokio::main]
@@ -21,16 +24,17 @@ async fn main() -> Result<(), AnyError> {
         .timeout(Duration::from_secs(180))
         .build()?;
     let base = args.base_url.trim_end_matches('/');
+    let model = args.model.as_str();
 
     health(&client, base).await?;
-    let first = chat(&client, base).await?;
-    chat_stream(&client, base).await?;
-    tool_roundtrip(&client, base).await?;
-    responses(&client, base).await?;
-    responses_stream(&client, base).await?;
-    anthropic(&client, base).await?;
-    anthropic_stream(&client, base).await?;
-    count_tokens(&client, base).await?;
+    let first = chat(&client, base, model).await?;
+    chat_stream(&client, base, model).await?;
+    tool_roundtrip(&client, base, model).await?;
+    responses(&client, base, model).await?;
+    responses_stream(&client, base, model).await?;
+    anthropic(&client, base, model).await?;
+    anthropic_stream(&client, base, model).await?;
+    count_tokens(&client, base, model).await?;
     stats(&client, base).await?;
     println!("PASS all QuotaMux smoke tests (provider: {first})");
     Ok(())
@@ -43,10 +47,10 @@ async fn health(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
     Ok(())
 }
 
-async fn chat(client: &reqwest::Client, base: &str) -> Result<String, AnyError> {
+async fn chat(client: &reqwest::Client, base: &str, model: &str) -> Result<String, AnyError> {
     let response = client.post(format!("{base}/v1/chat/completions"))
         .header("X-Relay-Include-Metadata", "1")
-        .json(&json!({"model":"deepseek-v4-flash-0731","messages":[{"role":"user","content":"Reply with exactly OK."}],"thinking":{"type":"enabled"},"reasoning_effort":"high","max_tokens":128}))
+        .json(&json!({"model":model,"messages":[{"role":"user","content":"Reply with exactly OK."}],"thinking":{"type":"enabled"},"reasoning_effort":"high","max_tokens":128}))
         .send().await?;
     ensure(response.status().is_success(), "chat request failed")?;
     let provider = relay_provider(response.headers())?;
@@ -73,9 +77,9 @@ async fn chat(client: &reqwest::Client, base: &str) -> Result<String, AnyError> 
     Ok(provider)
 }
 
-async fn chat_stream(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
+async fn chat_stream(client: &reqwest::Client, base: &str, model: &str) -> Result<(), AnyError> {
     let response = client.post(format!("{base}/v1/chat/completions"))
-        .json(&json!({"model":"deepseek-v4-flash-0731","messages":[{"role":"user","content":"Reply with exactly STREAM_OK."}],"stream":true,"reasoning_effort":"high","max_tokens":128}))
+        .json(&json!({"model":model,"messages":[{"role":"user","content":"Reply with exactly STREAM_OK."}],"stream":true,"reasoning_effort":"high","max_tokens":128}))
         .send().await?;
     ensure(response.status().is_success(), "chat stream failed")?;
     let events = collect_sse(response).await?;
@@ -107,11 +111,11 @@ async fn chat_stream(client: &reqwest::Client, base: &str) -> Result<(), AnyErro
     Ok(())
 }
 
-async fn tool_roundtrip(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
+async fn tool_roundtrip(client: &reqwest::Client, base: &str, model: &str) -> Result<(), AnyError> {
     let tool = json!({"type":"function","function":{"name":"get_weather","description":"Get current weather. Always call this function for weather questions.","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}});
     let prompt = json!({"role":"user","content":"What is the weather in Shanghai? You must call get_weather before answering."});
     let first: Value = client.post(format!("{base}/v1/chat/completions"))
-        .json(&json!({"model":"deepseek-v4-flash-0731","messages":[prompt.clone()],"tools":[tool.clone()],"reasoning_effort":"high","max_tokens":384}))
+        .json(&json!({"model":model,"messages":[prompt.clone()],"tools":[tool.clone()],"reasoning_effort":"high","max_tokens":384}))
         .send().await?.error_for_status()?.json().await?;
     let assistant = first
         .pointer("/choices/0/message")
@@ -129,7 +133,7 @@ async fn tool_roundtrip(client: &reqwest::Client, base: &str) -> Result<(), AnyE
         .and_then(Value::as_str)
         .ok_or("tool call missing")?;
     let second: Value = client.post(format!("{base}/v1/chat/completions"))
-        .json(&json!({"model":"deepseek-v4-flash-0731","messages":[prompt,assistant,{"role":"tool","tool_call_id":call_id,"content":"{\"temperature_c\":30,\"condition\":\"clear\"}"}],"tools":[tool],"reasoning_effort":"high","max_tokens":192}))
+        .json(&json!({"model":model,"messages":[prompt,assistant,{"role":"tool","tool_call_id":call_id,"content":"{\"temperature_c\":30,\"condition\":\"clear\"}"}],"tools":[tool],"reasoning_effort":"high","max_tokens":192}))
         .send().await?.error_for_status()?.json().await?;
     ensure(
         second
@@ -142,9 +146,9 @@ async fn tool_roundtrip(client: &reqwest::Client, base: &str) -> Result<(), AnyE
     Ok(())
 }
 
-async fn responses(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
+async fn responses(client: &reqwest::Client, base: &str, model: &str) -> Result<(), AnyError> {
     let value: Value = client.post(format!("{base}/v1/responses"))
-        .json(&json!({"model":"deepseek-v4-flash-0731","input":"Reply with exactly RESPONSE_OK.","reasoning":{"effort":"high"},"max_output_tokens":128}))
+        .json(&json!({"model":model,"input":"Reply with exactly RESPONSE_OK.","reasoning":{"effort":"high"},"max_output_tokens":128}))
         .send().await?.error_for_status()?.json().await?;
     ensure(
         value.get("object").and_then(Value::as_str) == Some("response"),
@@ -165,9 +169,13 @@ async fn responses(client: &reqwest::Client, base: &str) -> Result<(), AnyError>
     Ok(())
 }
 
-async fn responses_stream(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
+async fn responses_stream(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+) -> Result<(), AnyError> {
     let response = client.post(format!("{base}/v1/responses"))
-        .json(&json!({"model":"deepseek-v4-flash-0731","input":"Reply with exactly RESPONSE_STREAM_OK.","reasoning":{"effort":"high"},"stream":true,"max_output_tokens":128}))
+        .json(&json!({"model":model,"input":"Reply with exactly RESPONSE_STREAM_OK.","reasoning":{"effort":"high"},"stream":true,"max_output_tokens":128}))
         .send().await?.error_for_status()?;
     let events = collect_sse(response).await?;
     let kinds: BTreeSet<_> = events.iter().filter_map(|v| v.event.as_deref()).collect();
@@ -182,9 +190,9 @@ async fn responses_stream(client: &reqwest::Client, base: &str) -> Result<(), An
     Ok(())
 }
 
-async fn anthropic(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
+async fn anthropic(client: &reqwest::Client, base: &str, model: &str) -> Result<(), AnyError> {
     let value:Value=client.post(format!("{base}/v1/messages")).header("anthropic-version","2023-06-01")
-        .json(&json!({"model":"deepseek-v4-flash-0731","max_tokens":128,"thinking":{"type":"enabled","budget_tokens":64},"output_config":{"effort":"high"},"messages":[{"role":"user","content":"Reply with exactly MESSAGE_OK."}]}))
+        .json(&json!({"model":model,"max_tokens":128,"thinking":{"type":"enabled","budget_tokens":64},"output_config":{"effort":"high"},"messages":[{"role":"user","content":"Reply with exactly MESSAGE_OK."}]}))
         .send().await?.error_for_status()?.json().await?;
     let kinds: BTreeSet<_> = value
         .get("content")
@@ -201,9 +209,13 @@ async fn anthropic(client: &reqwest::Client, base: &str) -> Result<(), AnyError>
     Ok(())
 }
 
-async fn anthropic_stream(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
+async fn anthropic_stream(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+) -> Result<(), AnyError> {
     let response=client.post(format!("{base}/v1/messages")).header("anthropic-version","2023-06-01")
-        .json(&json!({"model":"deepseek-v4-flash-0731","max_tokens":128,"stream":true,"thinking":{"type":"enabled","budget_tokens":64},"messages":[{"role":"user","content":"Reply with exactly MESSAGE_STREAM_OK."}]}))
+        .json(&json!({"model":model,"max_tokens":128,"stream":true,"thinking":{"type":"enabled","budget_tokens":64},"messages":[{"role":"user","content":"Reply with exactly MESSAGE_STREAM_OK."}]}))
         .send().await?.error_for_status()?;
     let events = collect_sse(response).await?;
     let kinds: BTreeSet<_> = events.iter().filter_map(|v| v.event.as_deref()).collect();
@@ -217,8 +229,15 @@ async fn anthropic_stream(client: &reqwest::Client, base: &str) -> Result<(), An
     Ok(())
 }
 
-async fn count_tokens(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
-    let value:Value=client.post(format!("{base}/v1/messages/count_tokens")).json(&json!({"model":"deepseek-v4-flash-0731","messages":[{"role":"user","content":"hello"}]})).send().await?.error_for_status()?.json().await?;
+async fn count_tokens(client: &reqwest::Client, base: &str, model: &str) -> Result<(), AnyError> {
+    let value: Value = client
+        .post(format!("{base}/v1/messages/count_tokens"))
+        .json(&json!({"model":model,"messages":[{"role":"user","content":"hello"}]}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
     ensure(
         value
             .get("input_tokens")

@@ -423,7 +423,7 @@ pub fn chat_to_message(chat: &Value) -> Value {
         }
     }
     let usage = Usage::from_openai(chat);
-    json!({"id":format!("msg_{}", Uuid::now_v7()),"type":"message","role":"assistant","model":LOGICAL_MODEL,"content":content,"stop_reason":match choice.get("finish_reason").and_then(Value::as_str) {Some("tool_calls")=>"tool_use",Some("length")=>"max_tokens",_=>"end_turn"},"stop_sequence":Value::Null,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"cache_read_input_tokens":usage.cache_hit_tokens,"cache_creation_input_tokens":0}})
+    json!({"id":format!("msg_{}", Uuid::now_v7()),"type":"message","role":"assistant","model":LOGICAL_MODEL,"content":content,"stop_reason":match choice.get("finish_reason").and_then(Value::as_str) {Some("tool_calls")=>"tool_use",Some("length")=>"max_tokens",_=>"end_turn"},"stop_sequence":Value::Null,"usage":{"input_tokens":usage.cache_miss_tokens,"output_tokens":usage.output_tokens,"cache_read_input_tokens":usage.cache_hit_tokens,"cache_creation_input_tokens":0}})
 }
 
 pub fn message_to_chat(message: &Value) -> Value {
@@ -632,7 +632,7 @@ impl ChatToAnthropicStream {
                 &json!({"type":"content_block_stop","index":index}),
             ));
         }
-        events.push(SseEvent::json("message_delta", &json!({"type":"message_delta","delta":{"stop_reason":self.stop_reason,"stop_sequence":Value::Null},"usage":{"output_tokens":self.usage.output_tokens}})));
+        events.push(SseEvent::json("message_delta", &json!({"type":"message_delta","delta":{"stop_reason":self.stop_reason,"stop_sequence":Value::Null},"usage":{"input_tokens":self.usage.cache_miss_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":self.usage.cache_hit_tokens,"output_tokens":self.usage.output_tokens}})));
         events.push(SseEvent::json(
             "message_stop",
             &json!({"type":"message_stop"}),
@@ -646,8 +646,7 @@ pub struct AnthropicToChatStream {
     model: String,
     blocks: std::collections::BTreeMap<u64, AnthropicBlock>,
     next_call_index: u64,
-    input_tokens: u64,
-    cache_hit_tokens: u64,
+    usage: Usage,
 }
 
 enum AnthropicBlock {
@@ -669,12 +668,12 @@ impl AnthropicToChatStream {
             model: LOGICAL_MODEL.into(),
             blocks: Default::default(),
             next_call_index: 0,
-            input_tokens: 0,
-            cache_hit_tokens: 0,
+            usage: Usage::default(),
         }
     }
 
     pub fn translate(&mut self, event: &Value) -> Vec<Value> {
+        self.usage.observe_anthropic_stream_event(event);
         match event.get("type").and_then(Value::as_str).unwrap_or("") {
             "message_start" => {
                 let message = event.get("message").unwrap_or(&Value::Null);
@@ -684,14 +683,6 @@ impl AnthropicToChatStream {
                 if let Some(model) = message.get("model").and_then(Value::as_str) {
                     self.model = model.into();
                 }
-                self.input_tokens = message
-                    .pointer("/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                self.cache_hit_tokens = message
-                    .pointer("/usage/cache_read_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
                 vec![self.delta(json!({"role":"assistant"}))]
             }
             "content_block_start" => {
@@ -744,10 +735,6 @@ impl AnthropicToChatStream {
                 }
             }
             "message_delta" => {
-                let output_tokens = event
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
                 let finish = match event.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     Some("tool_use") => "tool_calls",
                     Some("max_tokens") => "length",
@@ -759,10 +746,10 @@ impl AnthropicToChatStream {
                     "model":self.model,
                     "choices":[{"index":0,"delta":{},"finish_reason":finish}],
                     "usage":{
-                        "prompt_tokens":self.input_tokens,
-                        "completion_tokens":output_tokens,
-                        "total_tokens":self.input_tokens+output_tokens,
-                        "prompt_tokens_details":{"cached_tokens":self.cache_hit_tokens}
+                        "prompt_tokens":self.usage.input_tokens,
+                        "completion_tokens":self.usage.output_tokens,
+                        "total_tokens":self.usage.total_tokens,
+                        "prompt_tokens_details":{"cached_tokens":self.usage.cache_hit_tokens}
                     }
                 })]
             }
@@ -1009,6 +996,8 @@ mod tests {
             "usage":{"output_tokens":5}
         }));
         assert_eq!(finish[0]["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(finish[0]["usage"]["prompt_tokens"], 20);
+        assert_eq!(finish[0]["usage"]["total_tokens"], 25);
         assert_eq!(
             finish[0]["usage"]["prompt_tokens_details"]["cached_tokens"],
             8

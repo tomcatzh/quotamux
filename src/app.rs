@@ -949,7 +949,7 @@ async fn handle_stream(
                         }
                     } else {
                         let parsed=serde_json::from_str::<Value>(&event.data).ok();
-                        if let Some(value)=parsed.as_ref() { usage = usage_for(protocol, value); }
+                        if let Some(value)=parsed.as_ref() { observe_stream_usage(protocol, &mut usage, value); }
                         let event_type=event.event.as_deref().or_else(||parsed.as_ref()?.get("type")?.as_str());
                         let bytes=event.encode(); response_bytes+=bytes.len() as u64; yield Ok::<Bytes, Infallible>(bytes);
                         if protocol == Protocol::OpenAiResponses && matches!(event_type, Some("response.completed"|"response.incomplete"|"response.failed")) { break; }
@@ -1424,6 +1424,17 @@ fn usage_for(protocol: Protocol, value: &Value) -> Usage {
         Protocol::OpenAiChat => Usage::from_openai(value),
         Protocol::OpenAiResponses => Usage::from_responses(value),
         Protocol::AnthropicMessages => Usage::from_anthropic(value),
+    }
+}
+
+fn observe_stream_usage(protocol: Protocol, current: &mut Usage, value: &Value) {
+    if protocol == Protocol::AnthropicMessages {
+        current.observe_anthropic_stream_event(value);
+    } else {
+        let observed = usage_for(protocol, value);
+        if observed.provider_reported {
+            *current = observed;
+        }
     }
 }
 
