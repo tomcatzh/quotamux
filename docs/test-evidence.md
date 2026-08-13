@@ -21,6 +21,7 @@ prompt bodies, and model response bodies are excluded.
 | pi native workers | passed | pi 0.84.1 completed high-reasoning sequential Bash loops for Kimi K3 and DeepSeek V4 Pro through both official native Chat and OpenCode Go native Chat on isolated `8081`. The earlier production Kimi acceptance remains valid. |
 | Upstream semantic ownership | passed | high thinking plus named tool choice reached Kimi Code, DeepSeek Official, and OpenCode Go; each selected upstream returned its own HTTP 400 without QuotaMux pre-rejection, fallback, retry, or circuit impact |
 | DeepSeek native protocol matrix | passed, 3 real requests | Chat Completions, Responses, and Anthropic Messages all reached DeepSeek Official without translation and returned HTTP 200 |
+| Production `a4c49b2` promotion | passed | Docker Compose rebuilt and recreated `127.0.0.1:8080`; Kimi/DeepSeek Claude Code and Pi high-reasoning sequential-tool loops passed, health remained OK, restart count stayed 0, and `restart: unless-stopped` remained active |
 | Static and frontend checks | passed | `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `git diff --check`, clean frontend dependency installation, and the Vite production build |
 
 The real-provider test is ignored during ordinary `cargo test` because it needs
@@ -73,8 +74,20 @@ reached OpenCode Go and received HTTP 400 because that endpoint rejected the
 OpenAI `developer` role. With Pi's documented compatibility flag, it emitted a
 `system` role and all four Kimi/DeepSeek official/Go tool loops passed.
 
-All new client runs used isolated `127.0.0.1:8081` configurations and separate
-temporary data. Production `8080` was not changed by this acceptance pass.
+The initial expanded client matrix used isolated `127.0.0.1:8081`
+configurations and separate temporary data. Commit `a4c49b2` was subsequently
+promoted to production `127.0.0.1:8080`. Production reruns completed Kimi and
+DeepSeek Claude Code plus Pi high-reasoning sequential-tool loops. Kimi Claude
+Code used native Anthropic; DeepSeek Claude Code used the configured Go
+Anthropic-to-Chat route; Pi used native Chat for both selected targets. All
+primary loop rows returned HTTP 200 without fallback.
+
+One concurrent, sessionless request at DeepSeek Claude Code startup asked Go
+for a response-format type it currently does not provide and received upstream
+HTTP 400. The main Claude Code session still completed. QuotaMux recorded that
+auxiliary-looking request as translated client semantics, did not fall back,
+and left the circuit closed; the attribution to an auxiliary Claude Code task
+is an inference from timing and the missing session ID.
 
 ## Real OpenCode Go + DeepSeek evidence
 
