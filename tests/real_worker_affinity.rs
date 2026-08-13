@@ -175,7 +175,7 @@ fn first_chat_target(config: &Config, kind: ProviderKind) -> RouteTargetConfig {
     let model = provider
         .models
         .iter()
-        .find(|model| model.protocols.contains(&Protocol::OpenAiChat))
+        .find(|model| model.native_protocols().contains(&Protocol::OpenAiChat))
         .expect("provider OpenAI Chat model");
     RouteTargetConfig {
         provider: provider.id.clone(),
@@ -233,7 +233,12 @@ fn legacy_provider(
         }],
         models: vec![ProviderModelConfig {
             name: text_at(document, &["providers", legacy_id, "model"]),
-            protocols: vec![Protocol::OpenAiChat],
+            endpoint_protocol: (kind == ProviderKind::OpenCodeGo).then_some(Protocol::OpenAiChat),
+            protocols: if kind == ProviderKind::OpenCodeGo {
+                Vec::new()
+            } else {
+                vec![Protocol::OpenAiChat]
+            },
             pricing: None,
         }],
     }

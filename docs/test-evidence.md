@@ -10,16 +10,18 @@ prompt bodies, and model response bodies are excluded.
 
 | Suite | Result | Concrete coverage |
 | --- | ---: | --- |
-| Library/unit tests | 79 passed, 0 failed | configuration (including official protocol matrices and warning-and-ignore startup normalization), provider URL/error adapters, model-aware dashboard output, legacy provider-data migration, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
+| Library/unit tests | 81 passed, 0 failed | configuration (including official protocol matrices, the singular OpenCode Go per-model endpoint, and warning-and-ignore startup normalization), provider URL/error adapters, model-aware dashboard output, legacy provider-data migration, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
 | Local gateway end-to-end | 31 passed, 0 failed | all three ingress protocols, native Kimi Anthropic passthrough, mixed tool-result/text ordering, streaming and non-streaming translation, configured provider/model pricing, `system_fingerprint` passthrough, attempts, fallback, random layers, affinity, expiry, single-target bypass, and Kimi's three-provider/two-layer route |
 | Real worker probe | 1 passed, 0 failed | OpenCode Go and DeepSeek configured as equivalent targets in one affinity layer |
 | Real DeepSeek V4 Pro probe | 1 passed, 0 failed | exact `deepseek-v4-pro` calls to OpenCode Go and DeepSeek Official; fingerprint presence recorded per provider |
 | Real Kimi K3 acceptance | 3 passed, 0 failed | three direct streams, mixed subscription affinity, and explicitly gated 300,095-input-token requests to all three targets |
 | Codex CLI worker | passed, 2 gateway turns | Codex 0.145 through `http://127.0.0.1:8080/v1`, Responses-to-Chat streaming, shell tool execution, reasoning history, provider cache usage, and same-target prefix affinity |
-| Claude Code native worker | passed, 4 agent turns | Claude Code 2.1.231 passed through isolated `8081` and again after promotion to `8080`, using native Kimi Anthropic Messages, one Skill result, two Bash results, thinking history, and exact final output |
-| pi native worker | passed, 3 gateway turns | pi 0.84.1 passed through isolated `8081` and again after promotion to `8080`, using native Kimi Chat Completions, two sequential Bash tool results, reasoning history, and exact final output |
+| Claude Code native workers | passed | Claude Code 2.1.231 used native Anthropic Messages for Kimi K3 and DeepSeek V4 Pro on isolated `8081`; both high-reasoning sequential Bash loops completed with `translated = false`. The earlier production Kimi acceptance remains valid. |
+| Claude Code translated workers | passed | Kimi K3 and DeepSeek V4 Pro were each forced through their OpenCode Go Chat endpoint; both high-reasoning sequential Bash loops completed with Anthropic ingress and `translated = true`. |
+| pi native workers | passed | pi 0.84.1 completed high-reasoning sequential Bash loops for Kimi K3 and DeepSeek V4 Pro through both official native Chat and OpenCode Go native Chat on isolated `8081`. The earlier production Kimi acceptance remains valid. |
+| Upstream semantic ownership | passed | high thinking plus named tool choice reached Kimi Code, DeepSeek Official, and OpenCode Go; each selected upstream returned its own HTTP 400 without QuotaMux pre-rejection, fallback, retry, or circuit impact |
 | DeepSeek native protocol matrix | passed, 3 real requests | Chat Completions, Responses, and Anthropic Messages all reached DeepSeek Official without translation and returned HTTP 200 |
-| Static checks | passed | `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check` |
+| Static and frontend checks | passed | `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `git diff --check`, clean frontend dependency installation, and the Vite production build |
 
 The real-provider test is ignored during ordinary `cargo test` because it needs
 the local ignored configuration and consumes live provider quota. It is run
@@ -45,6 +47,34 @@ cargo test --test real_worker_affinity -- --ignored --nocapture
 | Claude Code native Kimi loop | Five recorded requests in one Claude session used Kimi Code `k3`, Anthropic ingress and egress, HTTP 200, and `translated = false`; the agent completed Skill plus two sequential Bash calls |
 | pi native Kimi loop | Three recorded requests used Kimi Code `k3`, Chat ingress and egress, HTTP 200, and `translated = false`; both Bash marker directories were created |
 | DeepSeek official native matrix | V4 Pro returned exact markers over Chat, Responses, and Anthropic; all three attempt records used the matching egress protocol with `translated = false` |
+| Claude Code native Kimi and DeepSeek loops | Each model completed three high-reasoning model turns with two sequential Bash results; Kimi Code `k3` and DeepSeek Official V4 Pro used Anthropic ingress/egress with `translated = false` |
+| Claude Code Go-translation loops | Kimi K3 and DeepSeek V4 Pro each completed the same three-turn sequence through OpenCode Go Chat; records used Anthropic ingress and `translated = true` |
+| pi official and Go loops | Both models completed high-reasoning sequential Bash loops through official Chat and Go Chat; all matching Chat routes recorded `translated = false` |
+
+## Model-specific endpoint and client compatibility evidence
+
+OpenCode Go now uses one `endpoint_protocol` per configured model. The current
+Kimi K3 and DeepSeek V4 models declare `openai-chat`; provider kinds whose exact
+models expose several official API families continue to use `protocols`. The
+private configuration, documented example, runtime client construction, and
+real-test target discovery all use this distinction.
+
+Claude Code's Anthropic-to-Chat conversion preserves assistant thinking as
+`reasoning_content`, maps every `tool_use` ID to the matching function
+`tool_call`, and emits all returned tool messages before any later user text.
+The forced-Go Kimi and DeepSeek runs exercised this history across two
+sequential tool results without an unmatched tool-call or missing-thinking
+error.
+
+Pi was configured as an `openai-completions` client for QuotaMux. Its custom
+provider must set `supportsDeveloperRole = false` and
+`maxTokensField = "max_tokens"`. The first unadjusted Pi request transparently
+reached OpenCode Go and received HTTP 400 because that endpoint rejected the
+OpenAI `developer` role. With Pi's documented compatibility flag, it emitted a
+`system` role and all four Kimi/DeepSeek official/Go tool loops passed.
+
+All new client runs used isolated `127.0.0.1:8081` configurations and separate
+temporary data. Production `8080` was not changed by this acceptance pass.
 
 ## Real OpenCode Go + DeepSeek evidence
 

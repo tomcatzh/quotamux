@@ -28,12 +28,13 @@ api_key = ""
 
 [[providers.models]]
 name = "deepseek-v4-flash"
-protocols = ["openai-chat"]
+# OpenCode Go documents one endpoint family for each individual model.
+endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
 [[providers.models]]
 name = "deepseek-v4-pro"
-protocols = ["openai-chat"]
+endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 0.003625, cache_miss_input_usd_per_million = 0.435, output_usd_per_million = 0.87 }
 
 [[providers]]

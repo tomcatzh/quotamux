@@ -36,7 +36,7 @@ async fn configured_deepseek_v4_pro_targets_report_system_fingerprints() {
             )
         });
         assert!(
-            model.protocols.contains(&Protocol::OpenAiChat),
+            model.native_protocols().contains(&Protocol::OpenAiChat),
             "private {CONFIG_PATH} provider {} model {MODEL} must enable OpenAI Chat",
             target.provider
         );

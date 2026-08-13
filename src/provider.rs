@@ -60,7 +60,7 @@ impl ProviderClient {
                 .to_string(),
             api_key: credential.api_key.clone(),
             model: model.name.clone(),
-            protocols: model.protocols.clone(),
+            protocols: model.native_protocols().to_vec(),
             pricing: model.pricing,
             client,
         })
@@ -286,7 +286,13 @@ mod tests {
             }],
             models: vec![ProviderModelConfig {
                 name: model.into(),
-                protocols: vec![Protocol::OpenAiChat],
+                endpoint_protocol: (kind == ProviderKind::OpenCodeGo)
+                    .then_some(Protocol::OpenAiChat),
+                protocols: if kind == ProviderKind::OpenCodeGo {
+                    Vec::new()
+                } else {
+                    vec![Protocol::OpenAiChat]
+                },
                 pricing: None,
             }],
         };

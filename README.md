@@ -6,6 +6,29 @@ Responses, and Anthropic Messages, distributes requests across equivalent
 credentials, and falls back to later capacity or price layers before a response
 is committed.
 
+## Design principles
+
+**Native first. Transparent always. The selected upstream owns semantic
+validity.**
+
+- If the selected provider model officially supports the ingress protocol,
+  QuotaMux uses that native protocol directly and does not translate the
+  request.
+- Translation is a best-effort compatibility path used only when the selected
+  target lacks the ingress protocol. It must preserve reasoning, tool calls,
+  tool-result ordering, streaming behavior, and usage as faithfully as the
+  destination permits.
+- QuotaMux does not apply one provider's semantic restrictions to another. It
+  forwards provider-specific combinations such as thinking, `tool_choice`, and
+  tool history to the selected upstream for validation.
+- Upstream request-semantic HTTP `400`/`422` responses are returned without
+  fallback, retry, or circuit impact. Fallback is for provider and transport
+  failures covered by the routing policy, not for changing the verdict on an
+  invalid request.
+- Provider protocol capabilities are checked at startup. Unsupported declared
+  protocols produce a warning and are ignored; the request/attempt audit trail
+  records ingress, egress, provider, model, and whether translation occurred.
+
 Key capabilities:
 
 - provider definitions with exact upstream model IDs and multiple API keys;
@@ -152,7 +175,7 @@ api_key = "replace-with-second-go-key"
 [[providers.models]]
 # Always use the exact upstream model ID.
 name = "deepseek-v4-flash"
-protocols = ["openai-chat"]
+endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
 [[providers]]
@@ -226,7 +249,7 @@ api_key = "replace-with-opencode-go-key"
 
 [[providers.models]]
 name = "kimi-k3"
-protocols = ["openai-chat"]
+endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 0.30, cache_miss_input_usd_per_million = 3.00, output_usd_per_million = 15.00 }
 
 [[providers]]
@@ -327,6 +350,58 @@ the explicit context-window setting preserves the intended 1M limit. QuotaMux
 continues to expose the standard OpenAI `GET /v1/models` shape rather than a
 Codex-private catalog shape.
 
+### Claude Code and Pi through QuotaMux
+
+Claude Code speaks Anthropic Messages. Point it at the QuotaMux origin (without
+an added `/v1`); a placeholder local token is sufficient because inbound
+authentication is not currently enforced:
+
+```sh
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
+unset ANTHROPIC_API_KEY
+export ANTHROPIC_AUTH_TOKEN="local-quotamux"
+export ANTHROPIC_MODEL="kimi-k3[1m]"
+export CLAUDE_CODE_EFFORT_LEVEL=high
+claude
+```
+
+Kimi Code and DeepSeek Official use their native Anthropic endpoints. If a
+route instead selects an OpenCode Go Kimi or DeepSeek model, QuotaMux converts
+the request through that model's single Chat Completions endpoint. In tool
+history the conversion preserves assistant reasoning as `reasoning_content`,
+maps each `tool_use` to a function `tool_call` with the same ID, and emits every
+matching `tool_result` as a `role = "tool"` message before later user text.
+
+Pi can use QuotaMux as a custom OpenAI Chat provider. Its model configuration
+should disable the OpenAI `developer` role because a route can select Kimi or
+DeepSeek Chat endpoints that expect `system` instead:
+
+```json
+{
+  "providers": {
+    "quotamux": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "local-quotamux",
+      "authHeader": true,
+      "compat": {
+        "supportsDeveloperRole": false,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        { "id": "kimi-k3", "reasoning": true, "contextWindow": 1048576, "maxTokens": 32000 },
+        { "id": "deepseek-v4-pro", "reasoning": true, "contextWindow": 1048576, "maxTokens": 32000 }
+      ]
+    }
+  }
+}
+```
+
+Save that object as `~/.pi/agent/models.json`, then select, for example,
+`quotamux/kimi-k3:high`. Without `supportsDeveloperRole = false`, the request is
+still transparently forwarded, but the selected upstream returns HTTP `400`
+for the unsupported role.
+
 Validate before every restart:
 
 ```sh
@@ -357,6 +432,22 @@ name = "exact-upstream-model-id"
 protocols = ["openai-chat"]
 pricing = { cache_hit_input_usd_per_million = 0.0, cache_miss_input_usd_per_million = 0.0, output_usd_per_million = 0.0 }
 ```
+
+Official providers that expose several API families use `protocols` to declare
+all native protocols supported by that exact model. OpenCode Go is different:
+its catalog assigns one endpoint family to each model, so each Go model must
+declare exactly one `endpoint_protocol` instead:
+
+```toml
+[[providers.models]]
+name = "deepseek-v4-pro"
+endpoint_protocol = "openai-chat"
+```
+
+QuotaMux rejects `protocols` on `opencode-go`, and rejects
+`endpoint_protocol` on provider kinds whose models may expose multiple native
+protocols. This keeps the configuration shape aligned with the upstream API
+rather than suggesting capabilities that a specific Go model does not have.
 
 `pricing` is optional and belongs to this exact provider/model pair. When it is
 present, QuotaMux estimates cost from provider-reported cache-hit input,
@@ -406,7 +497,7 @@ OpenCode Go publishes one native endpoint per model rather than one uniform
 protocol for the whole catalog. The current Kimi K3 and DeepSeek V4 entries use
 Chat Completions; Qwen and MiniMax entries use Anthropic Messages; GPT 5.6 Luna
 uses Responses. QuotaMux therefore follows each Go model's configured
-`protocols` list exactly.
+`endpoint_protocol` exactly.
 
 For these kinds, `endpoint` is a base URL and QuotaMux appends the protocol
 path. An endpoint override is allowed for local tests.
@@ -456,7 +547,7 @@ api_key = "..."
 
 [[providers.models]]
 name = "deepseek-v4-flash"
-protocols = ["openai-chat"]
+endpoint_protocol = "openai-chat"
 ```
 
 One provider kind may also be declared multiple times when endpoints,
@@ -467,11 +558,11 @@ accounts, regions, or cache domains need distinct provider identities.
 ```toml
 [[providers.models]]
 name = "deepseek-v4-flash"
-protocols = ["openai-chat"]
+endpoint_protocol = "openai-chat"
 
 [[providers.models]]
 name = "another-upstream-model"
-protocols = ["openai-chat"]
+endpoint_protocol = "openai-chat"
 ```
 
 Only explicitly listed models can be referenced by route targets. QuotaMux does
@@ -496,9 +587,10 @@ protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 The target provider does not need to expose the same protocol as the client.
 For example, a served model may expose all three public protocols while its Go
 target only accepts Chat Completions. QuotaMux translates the request, response,
-stream, reasoning/thinking, tools, and usage. If a requested feature cannot be
-represented without losing meaning, QuotaMux returns a client error before
-calling the provider.
+stream, reasoning/thinking, tools, and usage on a best-effort basis. It does not
+reject provider-specific semantic combinations locally: the selected upstream
+receives the closest destination-protocol representation and owns the validity
+decision.
 
 Supported public protocols and endpoints:
 

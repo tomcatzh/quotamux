@@ -189,7 +189,8 @@ impl Gateway {
                     }],
                     models: vec![ProviderModelConfig {
                         name: UPSTREAM_MODEL.into(),
-                        protocols: vec![Protocol::OpenAiChat],
+                        endpoint_protocol: Some(Protocol::OpenAiChat),
+                        protocols: Vec::new(),
                         pricing: None,
                     }],
                 },
@@ -203,6 +204,7 @@ impl Gateway {
                     }],
                     models: vec![ProviderModelConfig {
                         name: UPSTREAM_MODEL.into(),
+                        endpoint_protocol: None,
                         protocols: vec![
                             Protocol::OpenAiChat,
                             Protocol::OpenAiResponses,
@@ -364,7 +366,12 @@ fn test_provider_kind_model(
         }],
         models: vec![ProviderModelConfig {
             name: model.into(),
-            protocols: vec![protocol],
+            endpoint_protocol: (kind == ProviderKind::OpenCodeGo).then_some(protocol),
+            protocols: if kind == ProviderKind::OpenCodeGo {
+                Vec::new()
+            } else {
+                vec![protocol]
+            },
             pricing: None,
         }],
     }

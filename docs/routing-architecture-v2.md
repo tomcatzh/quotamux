@@ -73,11 +73,13 @@ scaffolding only. They are not supported provider adapters until they have
 provider-specific authentication, URL, stream, error, mock end-to-end, and
 (where applicable) real credential tests.
 
-Each enabled model records every provider protocol that actually serves it.
-This is model-specific: for example, OpenCode currently documents different
-endpoints for Responses, Anthropic Messages, and Chat Completions models. The
-configuration is explicit even when QuotaMux can infer a default. Validation
-becomes provider-specific as each reserved adapter is implemented.
+Each enabled model records the provider protocol contract that actually serves
+it. Official providers whose exact model exposes several API families use a
+`protocols` list. OpenCode Go documents exactly one endpoint family for each
+model, so its entries instead require one `endpoint_protocol`. This prevents a
+provider-wide capability list from implying that one Go model accepts every Go
+endpoint family. Validation becomes provider-specific as each reserved adapter
+is implemented.
 
 An enabled provider model may also declare three USD-per-million-token pricing
 rates: cache-hit input, cache-miss input, and output. Cost calculation is
@@ -209,7 +211,7 @@ api_key = "..."
 
 [[providers.models]]
 name = "deepseek-v4-flash"
-protocols = ["openai-chat"]
+endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
 [[providers]]

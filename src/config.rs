@@ -165,9 +165,21 @@ pub struct CredentialConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProviderModelConfig {
     pub name: String,
+    #[serde(default)]
+    pub endpoint_protocol: Option<Protocol>,
+    #[serde(default)]
     pub protocols: Vec<Protocol>,
     #[serde(default)]
     pub pricing: Option<ModelPricingConfig>,
+}
+
+impl ProviderModelConfig {
+    pub fn native_protocols(&self) -> &[Protocol] {
+        match &self.endpoint_protocol {
+            Some(protocol) => std::slice::from_ref(protocol),
+            None => &self.protocols,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -270,6 +282,20 @@ impl Config {
         let mut discarded = 0;
         for provider in &mut self.providers {
             for model in &mut provider.models {
+                if model
+                    .endpoint_protocol
+                    .is_some_and(|protocol| !provider.kind.supports_protocol(protocol))
+                {
+                    let protocol = model.endpoint_protocol.take().unwrap();
+                    discarded += 1;
+                    tracing::warn!(
+                        provider = %provider.id,
+                        provider_kind = provider.kind.as_str(),
+                        model = %model.name,
+                        protocol = protocol.as_str(),
+                        "ignoring endpoint protocol unsupported by official provider API"
+                    );
+                }
                 model.protocols.retain(|protocol| {
                     if provider.kind.supports_protocol(*protocol) {
                         true
@@ -427,11 +453,32 @@ fn validate_provider(path: &str, provider: &ProviderConfig) -> Result<(), Config
                 model.name
             )));
         }
-        if model.protocols.is_empty() {
-            return Err(invalid(format!("{model_path}.protocols must not be empty")));
-        }
+        let native_protocols = if provider.kind == ProviderKind::OpenCodeGo {
+            if !model.protocols.is_empty() {
+                return Err(invalid(format!(
+                    "{model_path}.protocols is not valid for opencode-go; declare its single official endpoint as {model_path}.endpoint_protocol"
+                )));
+            }
+            if model.endpoint_protocol.is_none() {
+                return Err(invalid(format!(
+                    "{model_path}.endpoint_protocol is required for opencode-go because each model has one official endpoint"
+                )));
+            }
+            model.native_protocols()
+        } else {
+            if model.endpoint_protocol.is_some() {
+                return Err(invalid(format!(
+                    "{model_path}.endpoint_protocol is only valid for opencode-go; use {model_path}.protocols for provider kind {}",
+                    provider.kind.as_str()
+                )));
+            }
+            if model.protocols.is_empty() {
+                return Err(invalid(format!("{model_path}.protocols must not be empty")));
+            }
+            model.native_protocols()
+        };
         let mut protocols = HashSet::new();
-        for protocol in &model.protocols {
+        for protocol in native_protocols {
             if !protocols.insert(*protocol) {
                 return Err(invalid(format!(
                     "{model_path}.protocols contains duplicate {}",
@@ -557,7 +604,8 @@ mod tests {
                     }],
                     models: vec![ProviderModelConfig {
                         name: UPSTREAM_MODEL.into(),
-                        protocols: vec![Protocol::OpenAiChat],
+                        endpoint_protocol: Some(Protocol::OpenAiChat),
+                        protocols: Vec::new(),
                         pricing: None,
                     }],
                 },
@@ -571,6 +619,7 @@ mod tests {
                     }],
                     models: vec![ProviderModelConfig {
                         name: UPSTREAM_MODEL.into(),
+                        endpoint_protocol: None,
                         protocols: vec![
                             Protocol::OpenAiChat,
                             Protocol::OpenAiResponses,
@@ -674,6 +723,7 @@ mod tests {
     fn ollama_cloud_models_may_enable_chat_and_responses() {
         let mut config = valid();
         config.providers[0].kind = ProviderKind::OllamaCloud;
+        config.providers[0].models[0].endpoint_protocol = None;
         config.providers[0].models[0].protocols =
             vec![Protocol::OpenAiChat, Protocol::OpenAiResponses];
         config.validate().unwrap();
@@ -690,6 +740,8 @@ mod tests {
         let mut config = valid();
         config.providers[0].kind = ProviderKind::KimiCode;
         config.providers[0].models[0].name = "k3".into();
+        config.providers[0].models[0].endpoint_protocol = None;
+        config.providers[0].models[0].protocols = vec![Protocol::OpenAiChat];
         config.models[0].layers[0].targets[0].model = "k3".into();
         config.validate().unwrap();
 
@@ -705,6 +757,7 @@ mod tests {
         let mut config = valid();
         config.providers[0].kind = ProviderKind::KimiCode;
         config.providers[0].models[0].name = "k3".into();
+        config.providers[0].models[0].endpoint_protocol = None;
         config.providers[0].models[0].protocols = vec![
             Protocol::OpenAiChat,
             Protocol::AnthropicMessages,
@@ -728,6 +781,8 @@ mod tests {
         let mut config = valid();
         config.providers[0].kind = ProviderKind::KimiCode;
         config.providers[0].models[0].name = "k3".into();
+        config.providers[0].models[0].endpoint_protocol = None;
+        config.providers[0].models[0].protocols = vec![Protocol::OpenAiChat];
         config.models[0].layers[0].targets[0].model = "k3".into();
         config.providers[0].models[0]
             .protocols
@@ -741,12 +796,34 @@ mod tests {
     fn deepseek_official_supports_all_three_ingress_protocols() {
         let mut config = valid();
         config.providers[0].kind = ProviderKind::DeepSeekOfficial;
+        config.providers[0].models[0].endpoint_protocol = None;
         config.providers[0].models[0].protocols = vec![
             Protocol::OpenAiChat,
             Protocol::OpenAiResponses,
             Protocol::AnthropicMessages,
         ];
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn opencode_go_requires_one_model_specific_endpoint_protocol() {
+        let mut config = valid();
+        config.providers[0].models[0].endpoint_protocol = None;
+        config.providers[0].models[0].protocols = vec![Protocol::OpenAiChat];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("protocols is not valid for opencode-go"));
+
+        config.providers[0].models[0].protocols.clear();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("endpoint_protocol is required for opencode-go"));
+    }
+
+    #[test]
+    fn multi_protocol_providers_reject_model_specific_endpoint_protocol() {
+        let mut config = valid();
+        config.providers[0].kind = ProviderKind::DeepSeekOfficial;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("endpoint_protocol is only valid for opencode-go"));
     }
 
     #[test]
@@ -781,7 +858,7 @@ id = "go-a"
 api_key = "secret"
 [[providers.models]]
 name = "deepseek-v4-flash"
-protocols = ["openai-chat"]
+endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 1.0, cache_miss_input_usd_per_million = 2.0, output_usd_per_million = 3.0 }
 [[models]]
 name = "deepseek-v4-flash-0731"
@@ -798,6 +875,10 @@ targets = [{ provider = "go", credential = "go-a", model = "deepseek-v4-flash" }
         assert_eq!(config.affinity.checkpoint_bytes, 256);
         assert_eq!(config.affinity.max_checkpoints_per_path, 1024);
         assert_eq!(config.affinity.max_leases, 2048);
+        assert_eq!(
+            config.providers[0].models[0].endpoint_protocol,
+            Some(Protocol::OpenAiChat)
+        );
         assert_eq!(
             config.providers[0].models[0].pricing,
             Some(ModelPricingConfig {
