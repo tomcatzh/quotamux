@@ -87,12 +87,33 @@ impl ProviderKind {
 
     pub const fn fixed_protocol(self) -> Option<Protocol> {
         match self {
-            Self::KimiOfficial | Self::KimiCode | Self::CustomChatCompletions => {
-                Some(Protocol::OpenAiChat)
-            }
+            Self::KimiOfficial | Self::CustomChatCompletions => Some(Protocol::OpenAiChat),
             Self::CustomResponses => Some(Protocol::OpenAiResponses),
             Self::CustomAnthropic => Some(Protocol::AnthropicMessages),
             _ => None,
+        }
+    }
+
+    pub fn supports_protocol(self, protocol: Protocol) -> bool {
+        match self {
+            Self::DeepSeekOfficial => matches!(
+                protocol,
+                Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::AnthropicMessages
+            ),
+            Self::KimiCode => {
+                matches!(protocol, Protocol::OpenAiChat | Protocol::AnthropicMessages)
+            }
+            // OpenCode Go's official endpoint is selected per model. The provider
+            // offers all three protocol families overall; each configured model's
+            // `protocols` list remains the source of truth for its native endpoint.
+            Self::OpenCodeGo => matches!(
+                protocol,
+                Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::AnthropicMessages
+            ),
+            _ => match self.fixed_protocol() {
+                Some(fixed) => fixed == protocol,
+                None => true,
+            },
         }
     }
 
@@ -240,8 +261,33 @@ impl Config {
         if let Some(data_dir) = env::var_os("QUOTAMUX_DATA_DIR") {
             config.server.data_dir = PathBuf::from(data_dir);
         }
+        config.discard_unsupported_provider_protocols();
         config.validate()?;
         Ok(config)
+    }
+
+    pub(crate) fn discard_unsupported_provider_protocols(&mut self) -> usize {
+        let mut discarded = 0;
+        for provider in &mut self.providers {
+            for model in &mut provider.models {
+                model.protocols.retain(|protocol| {
+                    if provider.kind.supports_protocol(*protocol) {
+                        true
+                    } else {
+                        discarded += 1;
+                        tracing::warn!(
+                            provider = %provider.id,
+                            provider_kind = provider.kind.as_str(),
+                            model = %model.name,
+                            protocol = protocol.as_str(),
+                            "ignoring protocol unsupported by official provider API"
+                        );
+                        false
+                    }
+                });
+            }
+        }
+        discarded
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -392,14 +438,10 @@ fn validate_provider(path: &str, provider: &ProviderConfig) -> Result<(), Config
                     protocol.as_str()
                 )));
             }
-            if provider
-                .kind
-                .fixed_protocol()
-                .is_some_and(|fixed| fixed != *protocol)
-            {
+            if !provider.kind.supports_protocol(*protocol) {
                 return Err(invalid(format!(
-                    "{model_path}.protocols must contain only {} for provider kind {}",
-                    provider.kind.fixed_protocol().unwrap().as_str(),
+                    "{model_path}.protocols contains unsupported protocol {} for provider kind {}",
+                    protocol.as_str(),
                     provider.kind.as_str()
                 )));
             }
@@ -638,15 +680,12 @@ mod tests {
     }
 
     #[test]
-    fn kimi_code_has_its_own_chat_endpoint_and_rejects_other_egress_protocols() {
+    fn kimi_code_declares_chat_and_anthropic_as_official_protocols() {
         assert_eq!(
             ProviderKind::KimiCode.default_endpoint(),
             Some("https://api.kimi.com/coding/v1")
         );
-        assert_eq!(
-            ProviderKind::KimiCode.fixed_protocol(),
-            Some(Protocol::OpenAiChat)
-        );
+        assert_eq!(ProviderKind::KimiCode.fixed_protocol(), None);
 
         let mut config = valid();
         config.providers[0].kind = ProviderKind::KimiCode;
@@ -654,10 +693,60 @@ mod tests {
         config.models[0].layers[0].targets[0].model = "k3".into();
         config.validate().unwrap();
 
-        config.providers[0].models[0].protocols = vec![Protocol::AnthropicMessages];
+        config.providers[0].models[0].protocols =
+            vec![Protocol::OpenAiChat, Protocol::AnthropicMessages];
+        config.validate().unwrap();
+
+        assert!(!ProviderKind::KimiCode.supports_protocol(Protocol::OpenAiResponses));
+    }
+
+    #[test]
+    fn startup_discards_unsupported_provider_protocols_before_validation() {
+        let mut config = valid();
+        config.providers[0].kind = ProviderKind::KimiCode;
+        config.providers[0].models[0].name = "k3".into();
+        config.providers[0].models[0].protocols = vec![
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+        ];
+        config.models[0].layers[0].targets[0].model = "k3".into();
+
+        assert_eq!(config.discard_unsupported_provider_protocols(), 1);
+        assert_eq!(
+            config.providers[0].models[0].protocols,
+            vec![Protocol::OpenAiChat, Protocol::AnthropicMessages]
+        );
+        config.validate().unwrap();
+
+        // Re-running startup normalization is idempotent and emits no duplicate warning.
+        assert_eq!(config.discard_unsupported_provider_protocols(), 0);
+    }
+
+    #[test]
+    fn validation_keeps_unsupported_protocols_out_of_runtime_state() {
+        let mut config = valid();
+        config.providers[0].kind = ProviderKind::KimiCode;
+        config.providers[0].models[0].name = "k3".into();
+        config.models[0].layers[0].targets[0].model = "k3".into();
+        config.providers[0].models[0]
+            .protocols
+            .push(Protocol::OpenAiResponses);
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("must contain only openai-chat"));
+        assert!(error.contains("unsupported protocol openai-responses"));
         assert!(error.contains("kimi-code"));
+    }
+
+    #[test]
+    fn deepseek_official_supports_all_three_ingress_protocols() {
+        let mut config = valid();
+        config.providers[0].kind = ProviderKind::DeepSeekOfficial;
+        config.providers[0].models[0].protocols = vec![
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ];
+        config.validate().unwrap();
     }
 
     #[test]

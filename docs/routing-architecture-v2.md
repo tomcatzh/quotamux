@@ -54,10 +54,17 @@ always the provider's standard API identifier.
 The production-accepted provider adapters are currently `deepseek-official`,
 `opencode-go`, `kimi-code`, and `kimi-official`. Both Kimi adapters have
 provider-specific URL, model identity, error, mock end-to-end, real streaming,
-and 300,095-input-token acceptance. Kimi Code additionally completed a live
-two-turn Codex Responses-to-Chat reasoning/tool loop. Official base endpoints
-may be omitted, and endpoint overrides remain possible for local and
-integration tests.
+and 300,095-input-token acceptance. Kimi Code supports both native OpenAI Chat
+and Anthropic Messages, so Claude Code traffic stays native whenever that
+target is selected; it also completed a live two-turn Codex
+Responses-to-Chat reasoning/tool loop. Official base endpoints may be omitted,
+and endpoint overrides remain possible for local and integration tests.
+
+DeepSeek Official supports native OpenAI Chat Completions, OpenAI Responses,
+and Anthropic Messages. Those three protocols are enabled explicitly so an
+ingress request stays byte-shape-compatible with the official upstream whenever
+DeepSeek is selected; translation is reserved for fallback targets that do not
+offer the ingress protocol.
 
 The configuration enum also reserves `aliyun-bailian`, `ollama-cloud`,
 `opencode-zen`, `custom-chat-completions`, `custom-responses`, and

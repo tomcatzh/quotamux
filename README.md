@@ -239,7 +239,7 @@ api_key = "replace-with-kimi-code-key"
 
 [[providers.models]]
 name = "k3"
-protocols = ["openai-chat"]
+protocols = ["openai-chat", "anthropic-messages"]
 
 [[providers]]
 id = "kimi-official"
@@ -389,13 +389,24 @@ the provider-kind enum in the configuration schema:
 | `kind` | Default endpoint | Current acceptance status |
 | --- | --- | --- |
 | `opencode-go` | `https://opencode.ai/zen/go/v1` | Real-worker accepted for `deepseek-v4-flash` and `deepseek-v4-pro`; real stream and 300,095-input-token acceptance also pass for `kimi-k3`. The Pro response omitted `system_fingerprint`. Protocol remains model-specific. |
-| `deepseek-official` | `https://api.deepseek.com` | Real V4 Pro acceptance returns `system_fingerprint`; the adapter also supports configured cost estimation and Anthropic path handling. |
-| `kimi-code` | `https://api.kimi.com/coding/v1` | Real Allegretto streaming and 300,095-input-token acceptance pass with exact model `k3`; a live Codex worker completed a two-turn Responses-to-Chat reasoning/tool loop through this adapter. |
+| `deepseek-official` | `https://api.deepseek.com` | Native OpenAI Chat, OpenAI Responses, and Anthropic Messages are enabled; real V4 Pro acceptance returns `system_fingerprint`, and configured cost estimation is supported. |
+| `kimi-code` | `https://api.kimi.com/coding/v1` | Native OpenAI Chat and Anthropic Messages are supported with exact model `k3`; real Allegretto streaming, 300,095-input-token acceptance, Claude Code tool loops, and a live Codex worker have passed. |
 | `kimi-official` | `https://api.moonshot.cn/v1` | Real paid-account streaming and 300,095-input-token acceptance pass with exact model `kimi-k3`; layered fallback and provider-specific model rewrites are covered end to end. |
 
-Both Kimi adapters deliberately expose only `openai-chat` upstream for now. A
-served model can still expose Chat Completions, Responses, and Anthropic
-Messages; QuotaMux translates the latter two to Chat.
+Kimi Code exposes both `openai-chat` and `anthropic-messages` upstream. QuotaMux
+uses native Anthropic Messages for Claude Code and only translates when a
+selected fallback target lacks that protocol. Kimi Open Platform remains
+`openai-chat` only.
+
+DeepSeek Official exposes `openai-chat`, `openai-responses`, and
+`anthropic-messages`. QuotaMux keeps each matching ingress protocol native and
+only translates when routing to a target that does not expose that protocol.
+
+OpenCode Go publishes one native endpoint per model rather than one uniform
+protocol for the whole catalog. The current Kimi K3 and DeepSeek V4 entries use
+Chat Completions; Qwen and MiniMax entries use Anthropic Messages; GPT 5.6 Luna
+uses Responses. QuotaMux therefore follows each Go model's configured
+`protocols` list exactly.
 
 For these kinds, `endpoint` is a base URL and QuotaMux appends the protocol
 path. An endpoint override is allowed for local tests.

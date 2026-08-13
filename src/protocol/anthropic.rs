@@ -267,10 +267,10 @@ fn translate_message(message: &Value, messages: &mut Vec<Value>) {
     if has_calls {
         current.insert("tool_calls".into(), Value::Array(calls));
     }
+    messages.extend(tool_results);
     if has_text || has_reasoning || has_calls {
         messages.push(Value::Object(current));
     }
-    messages.extend(tool_results);
 }
 
 fn blocks_text(value: &Value) -> String {
@@ -802,11 +802,20 @@ mod tests {
     fn translates_thinking_and_tool_history() {
         let body = json!({"model":LOGICAL_MODEL,"max_tokens":128,"messages":[
             {"role":"assistant","content":[{"type":"thinking","thinking":"reason","signature":"x"},{"type":"tool_use","id":"t1","name":"f","input":{"x":1}}]},
-            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"ok"},
+                {"type":"text","text":"continue after the tool result"}
+            ]}
         ]});
         let chat = prepare_for_chat(body, "deepseek-v4-flash").unwrap();
         assert_eq!(chat["messages"][0]["reasoning_content"], "reason");
         assert_eq!(chat["messages"][1]["role"], "tool");
+        assert_eq!(chat["messages"][1]["tool_call_id"], "t1");
+        assert_eq!(chat["messages"][2]["role"], "user");
+        assert_eq!(
+            chat["messages"][2]["content"],
+            "continue after the tool result"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::State,
-    http::{HeaderName, HeaderValue, StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
 use quotamux::{
@@ -81,14 +81,20 @@ struct MockProviderState {
     replies: Mutex<VecDeque<MockReply>>,
     calls: AtomicUsize,
     request_bodies: Mutex<Vec<Value>>,
+    request_headers: Mutex<Vec<HeaderMap>>,
+    request_paths: Mutex<Vec<String>>,
 }
 
 async fn mock_provider_handler(
     State(state): State<Arc<MockProviderState>>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(body): Json<Value>,
 ) -> Response {
     state.calls.fetch_add(1, Ordering::SeqCst);
     state.request_bodies.lock().await.push(body);
+    state.request_headers.lock().await.push(headers);
+    state.request_paths.lock().await.push(uri.path().into());
     let reply = state.replies.lock().await.pop_front().unwrap_or_else(|| {
         MockReply::json(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -110,6 +116,8 @@ impl MockProvider {
             replies: Mutex::new(replies.into_iter().collect()),
             calls: AtomicUsize::new(0),
             request_bodies: Mutex::new(Vec::new()),
+            request_headers: Mutex::new(Vec::new()),
+            request_paths: Mutex::new(Vec::new()),
         });
         let app = Router::new()
             .fallback(mock_provider_handler)
@@ -138,6 +146,14 @@ impl MockProvider {
 
     async fn request_bodies(&self) -> Vec<Value> {
         self.state.request_bodies.lock().await.clone()
+    }
+
+    async fn request_headers(&self) -> Vec<HeaderMap> {
+        self.state.request_headers.lock().await.clone()
+    }
+
+    async fn request_paths(&self) -> Vec<String> {
+        self.state.request_paths.lock().await.clone()
     }
 }
 
@@ -700,6 +716,8 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
             }]},
             {"role":"user","content":[{
                 "type":"tool_result","tool_use_id":"tool-1","content":"sunny"
+            },{
+                "type":"text","text":"continue after all tool results"
             }]}
         ],
         "tools":[{
@@ -731,6 +749,95 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
     assert_eq!(upstream["messages"][1]["tool_calls"][0]["id"], "tool-1");
     assert!(upstream["messages"][1].get("reasoning_content").is_none());
     assert_eq!(upstream["messages"][2]["tool_call_id"], "tool-1");
+    assert_eq!(upstream["messages"][3]["role"], "user");
+    assert_eq!(
+        upstream["messages"][3]["content"],
+        "continue after all tool results"
+    );
+}
+
+#[tokio::test]
+async fn kimi_code_anthropic_ingress_uses_native_messages_protocol() {
+    let upstream = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        json!({
+            "id":"msg-native",
+            "type":"message",
+            "role":"assistant",
+            "model":"k3",
+            "content":[{"type":"text","text":"native ok"}],
+            "stop_reason":"end_turn",
+            "usage":{"input_tokens":20,"output_tokens":3}
+        }),
+    )])
+    .await;
+    let mut config = test_config(
+        vec![test_provider_kind_model(
+            "kimi-code",
+            "allegretto",
+            &upstream,
+            ProviderKind::KimiCode,
+            Protocol::AnthropicMessages,
+            "k3",
+        )],
+        vec![(
+            "native",
+            vec![target_model("kimi-code", "allegretto", "k3")],
+        )],
+    );
+    config.models[0].name = "kimi-k3".into();
+    config.models[0].aliases = vec!["kimi-k3[1m]".into()];
+    config.models[0].protocols = vec![Protocol::AnthropicMessages];
+    let gateway = Gateway::start_config(config, 0xa117_0001).await;
+    let client = reqwest::Client::new();
+    let request = json!({
+        "model":"kimi-k3[1m]",
+        "max_tokens":16_000,
+        "thinking":{"type":"adaptive"},
+        "output_config":{"effort":"high"},
+        "messages":[
+            {"role":"assistant","content":[{
+                "type":"tool_use","id":"Skill:3","name":"Skill","input":{"skill":"verify"}
+            }]},
+            {"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"Skill:3","content":"loaded"
+            },{
+                "type":"text","text":"continue after the skill result"
+            }]}
+        ]
+    });
+
+    let response = client
+        .post(gateway.url("/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .header("x-relay-include-metadata", "1")
+        .json(&request)
+        .send()
+        .await
+        .expect("native Kimi Messages response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-provider"), "kimi-code");
+    assert_eq!(
+        header_value(&response, "x-relay-egress-protocol"),
+        "anthropic-messages"
+    );
+    assert_eq!(header_value(&response, "x-relay-translated"), "0");
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["content"][0]["text"],
+        "native ok"
+    );
+
+    let bodies = upstream.request_bodies().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["model"], "k3");
+    assert_eq!(bodies[0]["thinking"], request["thinking"]);
+    assert_eq!(bodies[0]["output_config"], request["output_config"]);
+    assert_eq!(bodies[0]["messages"], request["messages"]);
+    assert_eq!(upstream.request_paths().await, vec!["/messages"]);
+    let headers = upstream.request_headers().await;
+    assert_eq!(headers[0]["x-api-key"], "test-key-allegretto");
+    assert_eq!(headers[0]["anthropic-version"], "2023-06-01");
+    assert!(headers[0].get("authorization").is_none());
 }
 
 #[tokio::test]

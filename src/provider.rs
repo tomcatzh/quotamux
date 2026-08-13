@@ -108,6 +108,7 @@ impl ProviderClient {
         let mut request = self.client.post(url).json(body);
         match (self.kind, protocol) {
             (ProviderKind::DeepSeekOfficial, Protocol::AnthropicMessages)
+            | (ProviderKind::KimiCode, Protocol::AnthropicMessages)
             | (ProviderKind::CustomAnthropic, Protocol::AnthropicMessages) => {
                 request = request.header("x-api-key", &self.api_key).header(
                     "anthropic-version",
@@ -293,11 +294,20 @@ mod tests {
     }
 
     #[test]
-    fn kimi_k3_provider_kinds_use_their_distinct_official_chat_urls() {
-        let code = client_for(ProviderKind::KimiCode, "k3");
+    fn kimi_k3_provider_kinds_use_their_distinct_official_urls() {
+        let mut code = client_for(ProviderKind::KimiCode, "k3");
+        code.protocols.push(Protocol::AnthropicMessages);
         assert_eq!(
             code.url(Protocol::OpenAiChat),
             "https://api.kimi.com/coding/v1/chat/completions"
+        );
+        assert_eq!(
+            code.url(Protocol::AnthropicMessages),
+            "https://api.kimi.com/coding/v1/messages"
+        );
+        assert_eq!(
+            code.protocol_for(Protocol::AnthropicMessages),
+            Protocol::AnthropicMessages
         );
 
         let official = client_for(ProviderKind::KimiOfficial, "kimi-k3");
@@ -310,6 +320,55 @@ mod tests {
         assert_eq!(
             go.url(Protocol::OpenAiChat),
             "https://opencode.ai/zen/go/v1/chat/completions"
+        );
+
+        let mut deepseek = client_for(ProviderKind::DeepSeekOfficial, "deepseek-v4-pro");
+        deepseek.protocols = vec![
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ];
+        assert_eq!(
+            deepseek.url(Protocol::OpenAiChat),
+            "https://api.deepseek.com/chat/completions"
+        );
+        assert_eq!(
+            deepseek.url(Protocol::OpenAiResponses),
+            "https://api.deepseek.com/responses"
+        );
+        assert_eq!(
+            deepseek.url(Protocol::AnthropicMessages),
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            assert_eq!(deepseek.protocol_for(protocol), protocol);
+        }
+    }
+
+    #[test]
+    fn opencode_go_uses_each_models_explicit_official_protocol() {
+        let chat = client_for(ProviderKind::OpenCodeGo, "kimi-k3");
+        assert_eq!(
+            chat.protocol_for(Protocol::AnthropicMessages),
+            Protocol::OpenAiChat
+        );
+
+        let mut anthropic = client_for(ProviderKind::OpenCodeGo, "qwen3.8-max");
+        anthropic.protocols = vec![Protocol::AnthropicMessages];
+        assert_eq!(
+            anthropic.protocol_for(Protocol::AnthropicMessages),
+            Protocol::AnthropicMessages
+        );
+
+        let mut responses = client_for(ProviderKind::OpenCodeGo, "gpt-5.6-luna");
+        responses.protocols = vec![Protocol::OpenAiResponses];
+        assert_eq!(
+            responses.protocol_for(Protocol::OpenAiResponses),
+            Protocol::OpenAiResponses
         );
     }
 

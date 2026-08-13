@@ -68,9 +68,10 @@ impl AppState {
     }
 
     async fn new_with_selector(
-        config: Config,
+        mut config: Config,
         selector: RandomSelector,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        config.discard_unsupported_provider_protocols();
         config.validate()?;
         let store = Store::open(&config.server.data_dir)?;
         if config.provider("opencode-go").is_some() && config.provider("open-code-go").is_none() {

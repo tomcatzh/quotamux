@@ -10,13 +10,16 @@ prompt bodies, and model response bodies are excluded.
 
 | Suite | Result | Concrete coverage |
 | --- | ---: | --- |
-| Library/unit tests | 71 passed, 0 failed | configuration (including optional model pricing validation), provider URL/error adapters, model-aware dashboard output, legacy provider-data migration, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
-| Local gateway end-to-end | 28 passed, 0 failed | all three ingress protocols, streaming and non-streaming translation, configured provider/model pricing, `system_fingerprint` passthrough, attempts, fallback, random layers, affinity, expiry, single-target bypass, and Kimi's three-provider/two-layer route |
+| Library/unit tests | 79 passed, 0 failed | configuration (including official protocol matrices and warning-and-ignore startup normalization), provider URL/error adapters, model-aware dashboard output, legacy provider-data migration, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
+| Local gateway end-to-end | 31 passed, 0 failed | all three ingress protocols, native Kimi Anthropic passthrough, mixed tool-result/text ordering, streaming and non-streaming translation, configured provider/model pricing, `system_fingerprint` passthrough, attempts, fallback, random layers, affinity, expiry, single-target bypass, and Kimi's three-provider/two-layer route |
 | Real worker probe | 1 passed, 0 failed | OpenCode Go and DeepSeek configured as equivalent targets in one affinity layer |
 | Real DeepSeek V4 Pro probe | 1 passed, 0 failed | exact `deepseek-v4-pro` calls to OpenCode Go and DeepSeek Official; fingerprint presence recorded per provider |
 | Real Kimi K3 acceptance | 3 passed, 0 failed | three direct streams, mixed subscription affinity, and explicitly gated 300,095-input-token requests to all three targets |
 | Codex CLI worker | passed, 2 gateway turns | Codex 0.145 through `http://127.0.0.1:8080/v1`, Responses-to-Chat streaming, shell tool execution, reasoning history, provider cache usage, and same-target prefix affinity |
-| Static checks | passed | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `git diff --check` |
+| Claude Code native worker | passed, 4 agent turns | Claude Code 2.1.231 passed through isolated `8081` and again after promotion to `8080`, using native Kimi Anthropic Messages, one Skill result, two Bash results, thinking history, and exact final output |
+| pi native worker | passed, 3 gateway turns | pi 0.84.1 passed through isolated `8081` and again after promotion to `8080`, using native Kimi Chat Completions, two sequential Bash tool results, reasoning history, and exact final output |
+| DeepSeek native protocol matrix | passed, 3 real requests | Chat Completions, Responses, and Anthropic Messages all reached DeepSeek Official without translation and returned HTTP 200 |
+| Static checks | passed | `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check` |
 
 The real-provider test is ignored during ordinary `cargo test` because it needs
 the local ignored configuration and consumes live provider quota. It is run
@@ -39,6 +42,9 @@ cargo test --test real_worker_affinity -- --ignored --nocapture
 | Kimi mixed-model affinity | Two divergent-prefix requests returned to `opencode-go-kimi`; the candidates used isolated `opencode-go/kimi-k3` and `kimi-code/k3` namespaces |
 | Responses model identity | A real non-streaming `/v1/responses` call returned public model `kimi-k3`, a 17-token reasoning item, exact text `MODEL_FIX_OK`, and internally used the OpenCode Go Chat route |
 | Codex multi-turn affinity | The first worker turn selected Kimi Code randomly; the tool-result turn returned to it through `prompt-prefix-affinity` with a 47,616-byte match |
+| Claude Code native Kimi loop | Five recorded requests in one Claude session used Kimi Code `k3`, Anthropic ingress and egress, HTTP 200, and `translated = false`; the agent completed Skill plus two sequential Bash calls |
+| pi native Kimi loop | Three recorded requests used Kimi Code `k3`, Chat ingress and egress, HTTP 200, and `translated = false`; both Bash marker directories were created |
+| DeepSeek official native matrix | V4 Pro returned exact markers over Chat, Responses, and Anthropic; all three attempt records used the matching egress protocol with `translated = false` |
 
 ## Real OpenCode Go + DeepSeek evidence
 
