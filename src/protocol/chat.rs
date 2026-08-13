@@ -2,12 +2,11 @@ use serde_json::Value;
 
 use super::{
     ValidationError, require_reasoning_for_tool_history, set_model, thinking_enabled,
-    validate_model, validate_named_tool_choice,
+    validate_model,
 };
 
 pub fn prepare(mut body: Value, upstream_model: &str) -> Result<Value, ValidationError> {
     validate_model(&body)?;
-    validate_named_tool_choice(&body)?;
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -57,17 +56,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_named_tool_choice_while_thinking() {
+    fn preserves_named_tool_choice_for_upstream_validation() {
         let body = json!({
-            "model":"deepseek-v4-flash-0731",
+            "model":"kimi-k3",
             "messages":[{"role":"user","content":"hi"}],
+            "reasoning_effort":"high",
             "tool_choice":{"type":"function","function":{"name":"f"}}
         });
-        assert!(
-            prepare(body, "deepseek-v4-flash")
-                .unwrap_err()
-                .message
-                .contains("named tool_choice")
-        );
+        let prepared = prepare(body, "kimi-k3").unwrap();
+        assert_eq!(prepared["reasoning_effort"], "high");
+        assert_eq!(prepared["tool_choice"]["function"]["name"], "f");
     }
 }

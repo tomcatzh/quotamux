@@ -482,6 +482,108 @@ async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
 }
 
 #[tokio::test]
+async fn named_tool_choice_reaches_upstream_and_400_does_not_fallback_or_open_circuit() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::BAD_REQUEST,
+            json!({"error":{"message":"named tool choice is unsupported"}}),
+        ),
+        MockReply::json(
+            StatusCode::BAD_REQUEST,
+            json!({"error":{"message":"named tool choice is unsupported"}}),
+        ),
+    ])
+    .await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let config = Config {
+        config_version: 2,
+        server: ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            data_dir: "unused-test-data".into(),
+        },
+        affinity: Default::default(),
+        providers: vec![
+            test_provider_kind_model(
+                "kimi-primary",
+                "primary-key",
+                &primary,
+                ProviderKind::KimiOfficial,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+            test_provider_kind_model(
+                "kimi-fallback",
+                "fallback-key",
+                &fallback,
+                ProviderKind::KimiOfficial,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+        ],
+        models: vec![ServedModelConfig {
+            name: "kimi-k3".into(),
+            aliases: Vec::new(),
+            protocols: vec![Protocol::OpenAiChat],
+            layers: vec![
+                RouteLayerConfig {
+                    name: "primary".into(),
+                    strategy: RouteStrategy::Random,
+                    targets: vec![target_model("kimi-primary", "primary-key", "kimi-k3")],
+                },
+                RouteLayerConfig {
+                    name: "fallback".into(),
+                    strategy: RouteStrategy::Random,
+                    targets: vec![target_model("kimi-fallback", "fallback-key", "kimi-k3")],
+                },
+            ],
+        }],
+    };
+    let gateway = Gateway::start_config(config, 0x400).await;
+    let client = reqwest::Client::new();
+    let request = json!({
+        "model":"kimi-k3",
+        "reasoning_effort":"high",
+        "messages":[{"role":"user","content":"check the weather"}],
+        "tools":[{"type":"function","function":{
+            "name":"weather","parameters":{"type":"object"}
+        }}],
+        "tool_choice":{"type":"function","function":{"name":"weather"}}
+    });
+
+    for streaming in [false, true] {
+        let mut request = request.clone();
+        if streaming {
+            request["stream"] = json!(true);
+        }
+        let response = client
+            .post(gateway.url("/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .expect("named tool choice response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.json::<Value>().await.expect("client error JSON");
+        assert_eq!(body["error"]["type"], "client_request");
+        assert_eq!(body["error"]["message"], "named tool choice is unsupported");
+    }
+
+    assert_eq!(primary.calls().await, 2);
+    assert_eq!(fallback.calls().await, 0);
+    let upstream_requests = primary.request_bodies().await;
+    assert_eq!(upstream_requests.len(), 2);
+    assert_eq!(upstream_requests[0]["reasoning_effort"], "high");
+    assert_eq!(
+        upstream_requests[0]["tool_choice"]["function"]["name"],
+        "weather"
+    );
+    assert_eq!(upstream_requests[1]["stream"], true);
+    assert_eq!(
+        upstream_requests[1]["stream_options"]["include_usage"],
+        true
+    );
+}
+
+#[tokio::test]
 async fn requests_api_paginates_with_exclusive_cursors() {
     let primary = MockProvider::start(
         (0..5)

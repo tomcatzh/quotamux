@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{config::LOGICAL_MODEL, sse::SseEvent, types::Usage};
 
-use super::{ValidationError, chat, set_model, thinking_enabled, validate_model};
+use super::{ValidationError, chat, set_model, validate_model};
 
 pub fn prepare_direct(mut body: Value, upstream_model: &str) -> Result<Value, ValidationError> {
     validate_model(&body)?;
@@ -470,12 +470,6 @@ fn translate_tools(body: &Value, chat: &mut Map<String, Value>) -> Result<(), Va
         let translated = if let Some(value) = choice.as_str() {
             Value::String(value.into())
         } else if choice.get("type").and_then(Value::as_str) == Some("function") {
-            if thinking_enabled(body) {
-                return Err(ValidationError::invalid(
-                    "DeepSeek V4 thinking mode does not support named tool_choice",
-                    Some("tool_choice"),
-                ));
-            }
             json!({"type":"function","function":{"name":choice.get("name").cloned().unwrap_or(Value::String(String::new()))}})
         } else {
             choice.clone()
@@ -1089,6 +1083,21 @@ mod tests {
         assert_eq!(response["model"], "public-kimi-k3");
         assert_eq!(response["output"][0]["type"], "reasoning");
         assert_eq!(response["output"][1]["type"], "message");
+    }
+
+    #[test]
+    fn responses_request_preserves_named_tool_choice_while_reasoning() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "input":"weather",
+            "reasoning":{"effort":"high"},
+            "tools":[{"type":"function","name":"weather","parameters":{"type":"object"}}],
+            "tool_choice":{"type":"function","name":"weather"}
+        });
+        let chat = prepare_for_chat(body, "provider-model").unwrap();
+        assert_eq!(chat["reasoning_effort"], "high");
+        assert_eq!(chat["tool_choice"]["type"], "function");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "weather");
     }
 
     #[test]

@@ -439,12 +439,6 @@ fn translate_tools(body: &Value, chat: &mut Map<String, Value>) -> Result<(), Va
             "none" | "auto" => Value::String(kind.into()),
             "any" => Value::String("required".into()),
             "tool" => {
-                if body.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled") {
-                    return Err(ValidationError::invalid(
-                        "DeepSeek V4 thinking mode does not support named tool_choice",
-                        Some("tool_choice"),
-                    ));
-                }
                 json!({"type":"function","function":{"name":choice.get("name").cloned().unwrap_or(Value::String(String::new()))}})
             }
             _ => {
@@ -945,6 +939,22 @@ mod tests {
             chat["response_format"]["json_schema"]["schema"]["type"],
             "object"
         );
+    }
+
+    #[test]
+    fn messages_request_preserves_named_tool_choice_while_thinking() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "max_tokens":128,
+            "thinking":{"type":"enabled","budget_tokens":64},
+            "messages":[{"role":"user","content":"weather"}],
+            "tools":[{"name":"weather","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"tool","name":"weather"}
+        });
+        let chat = prepare_for_chat(body, "provider-model").unwrap();
+        assert_eq!(chat["thinking"]["type"], "enabled");
+        assert_eq!(chat["tool_choice"]["type"], "function");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "weather");
     }
 
     #[test]

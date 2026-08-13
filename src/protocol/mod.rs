@@ -58,25 +58,6 @@ pub fn thinking_enabled(body: &Value) -> bool {
     true
 }
 
-pub fn validate_named_tool_choice(body: &Value) -> Result<(), ValidationError> {
-    if !thinking_enabled(body) {
-        return Ok(());
-    }
-    let named = body.get("tool_choice").is_some_and(|choice| {
-        choice.is_object()
-            && (choice.pointer("/function/name").is_some()
-                || choice.get("name").is_some()
-                || choice.get("type").and_then(Value::as_str) == Some("tool"))
-    });
-    if named {
-        return Err(ValidationError::invalid(
-            "DeepSeek V4 thinking mode does not support named tool_choice; use auto/required or disable thinking",
-            Some("tool_choice"),
-        ));
-    }
-    Ok(())
-}
-
 pub fn require_reasoning_for_tool_history(
     messages: &[Value],
     thinking: bool,
