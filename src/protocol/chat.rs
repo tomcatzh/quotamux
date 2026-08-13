@@ -1,23 +1,9 @@
 use serde_json::Value;
 
-use super::{
-    ValidationError, require_reasoning_for_tool_history, set_model, thinking_enabled,
-    validate_model,
-};
+use super::{ValidationError, set_model, validate_model};
 
 pub fn prepare(mut body: Value, upstream_model: &str) -> Result<Value, ValidationError> {
     validate_model(&body)?;
-    let messages = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ValidationError::invalid("messages must be an array", Some("messages")))?;
-    if messages.is_empty() {
-        return Err(ValidationError::invalid(
-            "messages must not be empty",
-            Some("messages"),
-        ));
-    }
-    require_reasoning_for_tool_history(messages, thinking_enabled(&body))?;
     if body.get("stream").and_then(Value::as_bool) == Some(true) {
         body.as_object_mut().expect("validated object").insert(
             "stream_options".into(),
@@ -47,12 +33,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_reasoning_history() {
+    fn preserves_missing_reasoning_history_for_upstream_validation() {
         let body = json!({
-            "model":"deepseek-v4-flash-0731",
-            "messages":[{"role":"assistant","tool_calls":[{"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]}]
+            "model":"kimi-k3",
+            "reasoning_effort":"high",
+            "messages":[
+                {"role":"assistant","tool_calls":[{"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"x","content":"ok"}
+            ]
         });
-        assert!(prepare(body, "deepseek-v4-flash").is_err());
+        let prepared = prepare(body, "kimi-k3").unwrap();
+        assert_eq!(prepared["reasoning_effort"], "high");
+        assert_eq!(
+            prepared["messages"][0]["tool_calls"][0]["function"]["name"],
+            "f"
+        );
+        assert!(prepared["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(prepared["messages"][1]["tool_call_id"], "x");
     }
 
     #[test]
@@ -66,5 +63,17 @@ mod tests {
         let prepared = prepare(body, "kimi-k3").unwrap();
         assert_eq!(prepared["reasoning_effort"], "high");
         assert_eq!(prepared["tool_choice"]["function"]["name"], "f");
+    }
+
+    #[test]
+    fn leaves_semantically_invalid_chat_body_for_upstream_validation() {
+        let body = json!({
+            "model":"kimi-k3",
+            "messages":"not-an-array",
+            "temperature":"not-a-number"
+        });
+        let prepared = prepare(body, "kimi-k3").unwrap();
+        assert_eq!(prepared["messages"], "not-an-array");
+        assert_eq!(prepared["temperature"], "not-a-number");
     }
 }

@@ -637,6 +637,190 @@ async fn named_tool_choice_reaches_upstream_and_400_does_not_fallback_or_open_ci
 }
 
 #[tokio::test]
+async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback() {
+    let primary = MockProvider::start(vec![MockReply::json(
+        StatusCode::BAD_REQUEST,
+        json!({"error":{"message":"reasoning_content is required"}}),
+    )])
+    .await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let config = Config {
+        config_version: 2,
+        server: ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            data_dir: "unused-test-data".into(),
+        },
+        affinity: Default::default(),
+        providers: vec![
+            test_provider_kind_model(
+                "kimi-primary",
+                "primary-key",
+                &primary,
+                ProviderKind::KimiOfficial,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+            test_provider_kind_model(
+                "kimi-fallback",
+                "fallback-key",
+                &fallback,
+                ProviderKind::KimiOfficial,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+        ],
+        models: vec![ServedModelConfig {
+            name: "kimi-k3".into(),
+            aliases: vec!["kimi-k3[1m]".into()],
+            protocols: vec![Protocol::AnthropicMessages],
+            layers: vec![
+                RouteLayerConfig {
+                    name: "primary".into(),
+                    strategy: RouteStrategy::Random,
+                    targets: vec![target_model("kimi-primary", "primary-key", "kimi-k3")],
+                },
+                RouteLayerConfig {
+                    name: "fallback".into(),
+                    strategy: RouteStrategy::Random,
+                    targets: vec![target_model("kimi-fallback", "fallback-key", "kimi-k3")],
+                },
+            ],
+        }],
+    };
+    let gateway = Gateway::start_config(config, 0xc1a0de).await;
+    let client = reqwest::Client::new();
+    let request = json!({
+        "model":"kimi-k3[1m]",
+        "max_tokens":16_000,
+        "thinking":{"type":"enabled","budget_tokens":8_000},
+        "messages":[
+            {"role":"user","content":"check the weather"},
+            {"role":"assistant","content":[{
+                "type":"tool_use","id":"tool-1","name":"weather","input":{"city":"Shanghai"}
+            }]},
+            {"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"tool-1","content":"sunny"
+            }]}
+        ],
+        "tools":[{
+            "name":"weather",
+            "input_schema":{"type":"object","properties":{"city":{"type":"string"}}}
+        }],
+        "tool_choice":{"type":"tool","name":"weather"}
+    });
+
+    let response = client
+        .post(gateway.url("/v1/messages"))
+        .json(&request)
+        .send()
+        .await
+        .expect("Claude tool history response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.json::<Value>().await.expect("client error JSON");
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(body["error"]["message"], "reasoning_content is required");
+
+    assert_eq!(primary.calls().await, 1);
+    assert_eq!(fallback.calls().await, 0);
+    let upstream_requests = primary.request_bodies().await;
+    assert_eq!(upstream_requests.len(), 1);
+    let upstream = &upstream_requests[0];
+    assert_eq!(upstream["model"], "kimi-k3");
+    assert_eq!(upstream["reasoning_effort"], "high");
+    assert_eq!(upstream["tool_choice"]["function"]["name"], "weather");
+    assert_eq!(upstream["messages"][1]["tool_calls"][0]["id"], "tool-1");
+    assert!(upstream["messages"][1].get("reasoning_content").is_none());
+    assert_eq!(upstream["messages"][2]["tool_call_id"], "tool-1");
+}
+
+#[tokio::test]
+async fn semantic_validation_is_deferred_upstream_for_every_ingress_protocol() {
+    let primary = MockProvider::start(
+        (0..3)
+            .map(|_| {
+                MockReply::json(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":{"message":"upstream semantic rejection"}}),
+                )
+            })
+            .collect(),
+    )
+    .await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    let cases = [
+        (
+            "/v1/chat/completions",
+            json!({
+                "model":LOGICAL_MODEL,
+                "messages":"not-an-array",
+                "temperature":"not-a-number"
+            }),
+        ),
+        (
+            "/v1/responses",
+            json!({
+                "model":LOGICAL_MODEL,
+                "input":[{"type":"future_item","payload":{"x":1}}],
+                "reasoning":{"effort":"future_effort"},
+                "tools":[{"type":"future_tool","name":"future"}],
+                "tool_choice":{"type":"future_choice","name":"future"}
+            }),
+        ),
+        (
+            "/v1/messages",
+            json!({
+                "model":LOGICAL_MODEL,
+                "max_tokens":128,
+                "messages":[{"role":"user","content":[{
+                    "type":"future_block","payload":{"x":1}
+                }]}],
+                "thinking":{"type":"future_thinking"},
+                "output_config":{
+                    "effort":"future_effort",
+                    "format":{"type":"future_format"}
+                },
+                "tool_choice":{"type":"future_choice","name":"future"}
+            }),
+        ),
+    ];
+
+    for (path, body) in cases {
+        let response = client
+            .post(gateway.url(path))
+            .json(&body)
+            .send()
+            .await
+            .expect("semantic pass-through response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    assert_eq!(primary.calls().await, 3);
+    assert_eq!(fallback.calls().await, 0);
+    let upstream = primary.request_bodies().await;
+    assert_eq!(upstream[0]["messages"], "not-an-array");
+    assert!(
+        upstream[1]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("future_item")
+    );
+    assert_eq!(upstream[1]["reasoning_effort"], "future_effort");
+    assert_eq!(upstream[1]["tools"][0]["type"], "future_tool");
+    assert!(
+        upstream[2]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("future_block")
+    );
+    assert_eq!(upstream[2]["thinking"]["type"], "future_thinking");
+    assert_eq!(upstream[2]["reasoning_effort"], "future_effort");
+    assert_eq!(upstream[2]["response_format"]["type"], "future_format");
+}
+
+#[tokio::test]
 async fn requests_api_paginates_with_exclusive_cursors() {
     let primary = MockProvider::start(
         (0..5)
@@ -2016,11 +2200,17 @@ async fn anthropic_nonstream_contains_thinking_and_text() {
 }
 
 #[tokio::test]
-async fn tool_call_history_preserves_reasoning_and_missing_reasoning_is_rejected() {
-    let primary = MockProvider::start(vec![MockReply::json(
-        StatusCode::OK,
-        chat_completion("tool response reasoning", "tool response"),
-    )])
+async fn tool_call_history_is_preserved_and_upstream_validates_missing_reasoning() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("tool response reasoning", "tool response"),
+        ),
+        MockReply::json(
+            StatusCode::BAD_REQUEST,
+            json!({"error":{"message":"reasoning_content is required"}}),
+        ),
+    ])
     .await;
     let fallback = MockProvider::start(Vec::new()).await;
     let gateway = Gateway::start(&primary, &fallback).await;
@@ -2081,8 +2271,23 @@ async fn tool_call_history_preserves_reasoning_and_missing_reasoning_is_rejected
         .await
         .expect("missing reasoning JSON");
     assert_eq!(missing_error["error"]["type"], "client_request");
-    assert_eq!(primary.calls().await, 1);
+    assert_eq!(
+        missing_error["error"]["message"],
+        "reasoning_content is required"
+    );
+    assert_eq!(primary.calls().await, 2);
     assert_eq!(fallback.calls().await, 0);
+    let sent_bodies = primary.request_bodies().await;
+    assert_eq!(sent_bodies.len(), 2);
+    assert_eq!(
+        sent_bodies[1]["messages"][1]["tool_calls"][0]["id"],
+        "call-2"
+    );
+    assert!(
+        sent_bodies[1]["messages"][1]
+            .get("reasoning_content")
+            .is_none()
+    );
 }
 
 #[tokio::test]
