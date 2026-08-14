@@ -6,6 +6,10 @@ license = "MIT"
 description = "A quota-aware local gateway for DeepSeek V4"
 repository = "https://github.com/tomcatzh/quotamux"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 async-stream = "0.3.6"
 axum = { version = "0.8.9", features = ["http1", "http2", "json", "tokio"] }
@@ -32,6 +36,11 @@ uuid = { version = "1.24.0", features = ["serde", "v7"] }
 [dev-dependencies]
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+[[test]]
+name = "gateway_integration"
+path = "tests/gateway_integration.rs"
+required-features = ["test-support"]
 
 [profile.release]
 codegen-units = 1

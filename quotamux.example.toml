@@ -1,6 +1,6 @@
-# QuotaMux version-two layered routing configuration.
+# QuotaMux version-three layered routing configuration.
 # Copy this file to quotamux.toml and keep the populated file private.
-config_version = 2
+config_version = 3
 
 [server]
 # Docker publishes this port on 127.0.0.1; QuotaMux listens on all container
@@ -16,41 +16,39 @@ max_candidates_per_prefix = 8
 max_leases = 16384
 success_ttl_ms = 300000
 
-# Provider definitions use exact upstream model IDs. Official provider kinds
-# supply their standard endpoint unless endpoint is explicitly overridden.
-[[providers]]
+# Backend definitions use exact upstream model IDs. Official adapters own their
+# endpoint; choose a custom-* adapter when supplying a customer URL.
+[[backends]]
 id = "opencode-go"
-kind = "opencode-go"
+adapter = "opencode-go"
 
-[[providers.credentials]]
+[[backends.credentials]]
 id = "go-plan"
 api_key = ""
 
-[[providers.models]]
+[[backends.models]]
 name = "deepseek-v4-flash"
-# OpenCode Go documents one endpoint family for each individual model.
-endpoint_protocol = "openai-chat"
+# The OpenCode Go adapter owns this official model's endpoint family.
 pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
-[[providers.models]]
+[[backends.models]]
 name = "deepseek-v4-pro"
-endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 0.003625, cache_miss_input_usd_per_million = 0.435, output_usd_per_million = 0.87 }
 
-[[providers]]
+[[backends]]
 id = "deepseek"
-kind = "deepseek-official"
+adapter = "deepseek-official"
 
-[[providers.credentials]]
+[[backends.credentials]]
 id = "deepseek-payg"
 api_key = ""
 
-[[providers.models]]
+[[backends.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
-[[providers.models]]
+[[backends.models]]
 name = "deepseek-v4-pro"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 pricing = { cache_hit_input_usd_per_million = 0.003625, cache_miss_input_usd_per_million = 0.435, output_usd_per_million = 0.87 }
@@ -68,14 +66,14 @@ protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 name = "plan"
 strategy = "random"
 targets = [
-  { provider = "opencode-go", credential = "go-plan", model = "deepseek-v4-flash" },
+  { backend = "opencode-go", credential = "go-plan", model = "deepseek-v4-flash" },
 ]
 
 [[models.layers]]
 name = "payg"
 strategy = "random"
 targets = [
-  { provider = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
+  { backend = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
 ]
 
 [[models]]
@@ -86,12 +84,12 @@ protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 name = "plan"
 strategy = "random"
 targets = [
-  { provider = "opencode-go", credential = "go-plan", model = "deepseek-v4-pro" },
+  { backend = "opencode-go", credential = "go-plan", model = "deepseek-v4-pro" },
 ]
 
 [[models.layers]]
 name = "payg"
 strategy = "random"
 targets = [
-  { provider = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-pro" },
+  { backend = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-pro" },
 ]

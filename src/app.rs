@@ -27,11 +27,11 @@ use crate::{
     affinity::{
         AffinityDirectory, CacheDomain, CacheEvidence, EvidenceConfidence, FingerprintPath,
     },
-    circuit::{CircuitBreaker, RouteDecision},
-    config::{Config, ProviderKind, RouteStrategy, RouteTargetConfig, ServedModelConfig},
+    circuit::{CircuitBreaker, CircuitPermit, RouteDecision},
+    config::{AdapterKind, Config, RouteStrategy, RouteTargetConfig, ServedModelConfig},
     dashboard::serve_spa,
     protocol::{self, ValidationError, anthropic, chat, responses},
-    provider::{ProviderClient, ProviderError},
+    provider::{BackendClient, BackendError},
     routing::RandomSelector,
     sse::{SseDecoder, SseEvent},
     store::{AttemptRollup, RequestRollup, RouteRollupKey, Store},
@@ -50,13 +50,13 @@ pub struct AppState {
 }
 
 struct TargetRuntime {
-    client: ProviderClient,
+    client: BackendClient,
     circuit: Arc<CircuitBreaker>,
 }
 
 impl AppState {
     pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_selector(config, RandomSelector::default()).await
+        Self::new_with_selector(config, RandomSelector::default(), HashMap::new()).await
     }
 
     #[doc(hidden)]
@@ -64,23 +64,74 @@ impl AppState {
         config: Config,
         seed: u64,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_selector(config, RandomSelector::with_seed(seed)).await
+        Self::new_with_selector(config, RandomSelector::with_seed(seed), HashMap::new()).await
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn new_with_random_seed_and_test_endpoints(
+        config: Config,
+        seed: u64,
+        endpoint_overrides: HashMap<String, String>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_selector(config, RandomSelector::with_seed(seed), endpoint_overrides).await
     }
 
     async fn new_with_selector(
-        mut config: Config,
+        config: Config,
         selector: RandomSelector,
+        endpoint_overrides: HashMap<String, String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        config.discard_unsupported_provider_protocols();
         config.validate()?;
+        for (backend_id, endpoint) in &endpoint_overrides {
+            if config.backend(backend_id).is_none() {
+                return Err(std::io::Error::other(format!(
+                    "test endpoint override references missing backend {backend_id}"
+                ))
+                .into());
+            }
+            let url = reqwest::Url::parse(endpoint).map_err(std::io::Error::other)?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(std::io::Error::other(format!(
+                    "test endpoint override for backend {backend_id} must be an absolute HTTP(S) URL"
+                ))
+                .into());
+            }
+            let host = url.host_str().unwrap_or_default();
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+            if !loopback {
+                return Err(std::io::Error::other(format!(
+                    "test endpoint override for backend {backend_id} must use a loopback host"
+                ))
+                .into());
+            }
+        }
         let store = Store::open(&config.server.data_dir)?;
-        if config.provider("opencode-go").is_some() && config.provider("open-code-go").is_none() {
-            let migrated = store.rename_provider("open-code-go", "opencode-go")?;
+        if config.backend("opencode-go").is_some() && config.backend("open-code-go").is_none() {
+            let migrated = store.rename_backend("open-code-go", "opencode-go")?;
             if migrated > 0 {
-                tracing::info!(migrated, "merged legacy open-code-go provider data");
+                tracing::info!(migrated, "merged legacy open-code-go backend data");
             }
         }
         store.ensure_stats_schema()?;
+        let opencode_go_targets = config
+            .models
+            .iter()
+            .flat_map(|model| &model.layers)
+            .flat_map(|layer| &layer.targets)
+            .filter(|target| {
+                config
+                    .backend(&target.backend)
+                    .is_some_and(|backend| backend.adapter == AdapterKind::OpenCodeGo)
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        let legacy_singleton_go_target = (opencode_go_targets.len() == 1)
+            .then(|| opencode_go_targets.iter().next().cloned())
+            .flatten();
         let affinity =
             AffinityDirectory::new(config.affinity.clone()).map_err(std::io::Error::other)?;
         let mut targets = HashMap::new();
@@ -88,20 +139,35 @@ impl AppState {
             for layer in &served_model.layers {
                 for target in &layer.targets {
                     if let Entry::Vacant(entry) = targets.entry(target.clone()) {
-                        let provider = config
-                            .provider(&target.provider)
-                            .expect("validated route provider");
-                        let credential = provider
+                        let backend = config
+                            .backend(&target.backend)
+                            .expect("validated route backend");
+                        let credential = backend
                             .credential(&target.credential)
                             .expect("validated route credential");
-                        let model = provider
-                            .model(&target.model)
-                            .expect("validated route model");
-                        let client = ProviderClient::new(provider, credential, model)?;
-                        let circuit_key = format!(
+                        let model = backend.model(&target.model).expect("validated route model");
+                        #[cfg(feature = "test-support")]
+                        let client = BackendClient::new_with_endpoint_override(
+                            backend,
+                            credential,
+                            model,
+                            endpoint_overrides.get(&backend.id).map(String::as_str),
+                        )?;
+                        #[cfg(not(feature = "test-support"))]
+                        let client = {
+                            debug_assert!(endpoint_overrides.is_empty());
+                            BackendClient::new(backend, credential, model)?
+                        };
+                        let legacy_circuit_key = format!(
                             "circuit:{}:{}:{}",
-                            target.provider, target.credential, target.model
+                            target.backend, target.credential, target.model
                         );
+                        let circuit_key = circuit_store_key(target);
+                        store.migrate_state_key(&legacy_circuit_key, &circuit_key)?;
+                        if legacy_singleton_go_target.as_ref() == Some(target) {
+                            store.migrate_state_key("opencode-go-circuit", &circuit_key)?;
+                            store.migrate_state_key("open-code-go-circuit", &circuit_key)?;
+                        }
                         let circuit = Arc::new(CircuitBreaker::load(store.clone(), circuit_key)?);
                         entry.insert(Arc::new(TargetRuntime { client, circuit }));
                     }
@@ -144,6 +210,18 @@ impl AppState {
             }
         });
     }
+}
+
+fn circuit_store_key(target: &RouteTargetConfig) -> String {
+    format!(
+        "circuit:v2:{}:{}:{}:{}:{}:{}",
+        target.backend.len(),
+        target.backend,
+        target.credential.len(),
+        target.credential,
+        target.model.len(),
+        target.model
+    )
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
@@ -217,18 +295,7 @@ async fn anthropic_messages(
     handle_inference(state, Protocol::AnthropicMessages, headers, body).await
 }
 
-async fn count_tokens(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    if has_provider_selector(&headers, &body) {
-        return client_error(
-            Protocol::AnthropicMessages,
-            "clients cannot select a provider",
-            Some("provider"),
-        );
-    }
+async fn count_tokens(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     if let Err(error) = resolve_served_model(&state, Protocol::AnthropicMessages, &body) {
         return validation_error(Protocol::AnthropicMessages, error);
     }
@@ -242,13 +309,6 @@ async fn handle_inference(
     headers: HeaderMap,
     body: Value,
 ) -> Response {
-    if has_provider_selector(&headers, &body) {
-        return client_error(
-            protocol,
-            "clients cannot select a provider",
-            Some("provider"),
-        );
-    }
     if let Err(error) = resolve_served_model(&state, protocol, &body) {
         return validation_error(protocol, error);
     }
@@ -361,15 +421,19 @@ fn affinity_context(
     let egress = runtime.client.protocol_for(ingress);
     let (_, _, prepared) =
         prepare_for_provider(egress, ingress, original, runtime.client.model()).ok()?;
-    let bytes = canonical_prompt_bytes(prepared)?;
-    let namespace = affinity_namespace(runtime.client.kind(), egress, runtime.client.model());
+    let bytes = canonical_prompt_bytes(egress, prepared)?;
+    let namespace = affinity_namespace(
+        runtime.client.adapter_kind(),
+        egress,
+        runtime.client.model(),
+    );
     let path = state
         .affinity
         .fingerprint(namespace.as_bytes(), [bytes.as_slice()]);
     let domain = CacheDomain {
         id: format!(
             "{}\0{}\0{}\0{}",
-            target.provider,
+            target.backend,
             target.credential,
             target.model,
             egress.as_str()
@@ -379,21 +443,59 @@ fn affinity_context(
     Some((path, domain))
 }
 
-fn affinity_namespace(kind: ProviderKind, egress: Protocol, model: &str) -> String {
+fn affinity_namespace(adapter: AdapterKind, egress: Protocol, model: &str) -> String {
     format!(
         "{}\0{}\0{}\0canonical-json-v1",
-        kind.as_str(),
+        adapter.as_str(),
         egress.as_str(),
         model
     )
 }
 
-fn canonical_prompt_bytes(mut prepared: Value) -> Option<Vec<u8>> {
-    let object = prepared.as_object_mut()?;
-    object.remove("model");
-    object.remove("stream");
-    object.remove("stream_options");
-    serde_json::to_vec(&prepared).ok()
+fn canonical_prompt_bytes(protocol: Protocol, prepared: Value) -> Option<Vec<u8>> {
+    let source = prepared.as_object()?;
+    let fields: &[&str] = match protocol {
+        Protocol::OpenAiChat => &[
+            "messages",
+            "tools",
+            "tool_choice",
+            "functions",
+            "function_call",
+            "response_format",
+            "reasoning_effort",
+            "thinking",
+            "verbosity",
+            "web_search_options",
+        ],
+        Protocol::OpenAiResponses => &[
+            "instructions",
+            "input",
+            "tools",
+            "tool_choice",
+            "reasoning",
+            "text",
+            "prompt",
+            "previous_response_id",
+            "conversation",
+        ],
+        Protocol::AnthropicMessages => &[
+            "system",
+            "messages",
+            "tools",
+            "tool_choice",
+            "thinking",
+            "output_config",
+        ],
+    };
+    let projection = fields
+        .iter()
+        .filter_map(|field| {
+            source
+                .get(*field)
+                .map(|value| ((*field).to_string(), value.clone()))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::to_vec(&Value::Object(projection)).ok()
 }
 
 fn target_runtime<'a>(state: &'a AppState, target: &RouteTargetConfig) -> &'a TargetRuntime {
@@ -432,7 +534,7 @@ fn terminal_route_failure(
     candidate: Option<RouteCandidate>,
 ) -> (AttemptFailure, Option<RouteCandidate>) {
     let failure = failure.unwrap_or_else(|| AttemptFailure {
-        error: ProviderError {
+        error: BackendError {
             class: FailureClass::FallbackUnavailable,
             status: Some(StatusCode::SERVICE_UNAVAILABLE),
             retry_after: None,
@@ -464,13 +566,16 @@ async fn handle_nonstream(
     let mut sequence = 0_u32;
     for mut candidate in candidates {
         let runtime = target_runtime(&state, &candidate.target);
-        match runtime.circuit.decide().await {
-            RouteDecision::Primary { probe } => candidate.probe = probe,
+        let permit = match runtime.circuit.decide().await {
+            RouteDecision::Primary { permit } => {
+                candidate.probe = permit.is_probe();
+                permit
+            }
             RouteDecision::Fallback { reason } => {
                 fallback_reason = fallback_reason.or(reason);
                 continue;
             }
-        }
+        };
         sequence += 1;
         match execute_json_attempt(
             &state,
@@ -486,7 +591,7 @@ async fn handle_nonstream(
         .await
         {
             Ok(mut success) => {
-                runtime.circuit.success().await;
+                permit.success().await;
                 observe_affinity(
                     &state,
                     &success.candidate,
@@ -498,8 +603,7 @@ async fn handle_nonstream(
             }
             Err(failure) => {
                 let allows_fallback = failure.error.class.allows_fallback();
-                runtime
-                    .circuit
+                permit
                     .failure(failure.error.class, failure.error.retry_after)
                     .await;
                 record_alert_if_needed(&state, &request_id, &candidate, failure.error.class).await;
@@ -546,8 +650,8 @@ async fn handle_nonstream(
         streaming: false,
         status: 200,
         error_class: None,
-        provider: Some(outcome.candidate.target.provider.clone()),
-        provider_kind: Some(outcome.provider_kind),
+        backend: Some(outcome.candidate.target.backend.clone()),
+        adapter: Some(outcome.adapter_kind),
         credential: Some(outcome.candidate.target.credential.clone()),
         route_layer: Some(outcome.candidate.layer_name.clone()),
         route_layer_index: Some(outcome.candidate.layer_index),
@@ -582,7 +686,7 @@ async fn handle_nonstream(
 
 struct JsonSuccess {
     candidate: RouteCandidate,
-    provider_kind: ProviderKind,
+    adapter_kind: AdapterKind,
     egress: Protocol,
     translated: bool,
     body: Value,
@@ -592,7 +696,7 @@ struct JsonSuccess {
 }
 
 struct AttemptFailure {
-    error: ProviderError,
+    error: BackendError,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -616,7 +720,7 @@ async fn execute_json_attempt(
             Ok(value) => value,
             Err(error) => {
                 return Err(AttemptFailure {
-                    error: ProviderError {
+                    error: BackendError {
                         class: FailureClass::ClientRequest,
                         status: Some(error.status),
                         retry_after: None,
@@ -636,7 +740,7 @@ async fn execute_json_attempt(
                 Some(request_id),
                 sequence,
                 candidate,
-                runtime.client.kind(),
+                runtime.client.adapter_kind(),
                 runtime.client.model(),
                 egress,
                 translated,
@@ -655,7 +759,7 @@ async fn execute_json_attempt(
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(_) => {
-            let error = ProviderError {
+            let error = BackendError {
                 class: FailureClass::ProviderTransient,
                 status: Some(status),
                 retry_after: None,
@@ -666,7 +770,7 @@ async fn execute_json_attempt(
                 Some(request_id),
                 sequence,
                 candidate,
-                runtime.client.kind(),
+                runtime.client.adapter_kind(),
                 runtime.client.model(),
                 egress,
                 translated,
@@ -683,7 +787,7 @@ async fn execute_json_attempt(
     let raw: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(_) => {
-            let error = ProviderError {
+            let error = BackendError {
                 class: FailureClass::ProviderUnknown5xxOrTransport,
                 status: Some(status),
                 retry_after: None,
@@ -694,7 +798,7 @@ async fn execute_json_attempt(
                 Some(request_id),
                 sequence,
                 candidate,
-                runtime.client.kind(),
+                runtime.client.adapter_kind(),
                 runtime.client.model(),
                 egress,
                 translated,
@@ -708,12 +812,32 @@ async fn execute_json_attempt(
             return Err(AttemptFailure { error });
         }
     };
+    if let Some(error) = runtime.client.classify_semantic_error(status, &raw) {
+        let record = failed_attempt(
+            &attempt_id,
+            Some(request_id),
+            sequence,
+            candidate,
+            runtime.client.adapter_kind(),
+            runtime.client.model(),
+            egress,
+            translated,
+            candidate.probe,
+            started_at_ms,
+            started,
+            request_bytes,
+            &error,
+        );
+        persist_attempt(state, &record);
+        return Err(AttemptFailure { error });
+    }
     let body = if translated {
         translate_nonstream(
             ingress,
             egress,
             &raw,
             protocol::model_name(original).unwrap_or(runtime.client.model()),
+            original,
         )
     } else {
         raw.clone()
@@ -724,8 +848,8 @@ async fn execute_json_attempt(
         id: attempt_id,
         request_id: Some(request_id.into()),
         sequence,
-        provider: candidate.target.provider.clone(),
-        provider_kind: Some(runtime.client.kind()),
+        backend: candidate.target.backend.clone(),
+        adapter: Some(runtime.client.adapter_kind()),
         credential: Some(candidate.target.credential.clone()),
         route_layer: Some(candidate.layer_name.clone()),
         route_layer_index: Some(candidate.layer_index),
@@ -752,7 +876,7 @@ async fn execute_json_attempt(
     persist_attempt(state, &record);
     Ok(JsonSuccess {
         candidate: candidate.clone(),
-        provider_kind: runtime.client.kind(),
+        adapter_kind: runtime.client.adapter_kind(),
         egress,
         translated,
         body,
@@ -788,13 +912,16 @@ async fn handle_stream(
             .get(&candidate.target)
             .expect("validated runtime target")
             .clone();
-        match runtime.circuit.decide().await {
-            RouteDecision::Primary { probe } => candidate.probe = probe,
+        let permit = match runtime.circuit.decide().await {
+            RouteDecision::Primary { permit } => {
+                candidate.probe = permit.is_probe();
+                permit
+            }
             RouteDecision::Fallback { reason } => {
                 fallback_reason = fallback_reason.or(reason);
                 continue;
             }
-        }
+        };
         sequence += 1;
         match prepare_stream_attempt(
             state.clone(),
@@ -811,13 +938,13 @@ async fn handle_stream(
         {
             Ok(mut success) => {
                 success.fallback_reason = fallback_reason;
+                success.permit = Some(permit);
                 prepared = Some(success);
                 break;
             }
             Err(failure) => {
                 let allows_fallback = failure.error.class.allows_fallback();
-                runtime
-                    .circuit
+                permit
                     .failure(failure.error.class, failure.error.retry_after)
                     .await;
                 record_alert_if_needed(&state, &request_id, &candidate, failure.error.class).await;
@@ -850,7 +977,7 @@ async fn handle_stream(
     };
 
     let candidate = prepared.candidate.clone();
-    let provider_kind = prepared.runtime.client.kind();
+    let adapter_kind = prepared.runtime.client.adapter_kind();
     let egress = prepared.egress;
     let translated = prepared.translated;
     let fallback_reason = prepared.fallback_reason;
@@ -873,19 +1000,25 @@ async fn handle_stream(
     let probe = prepared.probe;
     let attempt_started_at_ms = prepared.attempt_started_at_ms;
     let upstream_request_bytes = prepared.request_bytes;
+    let upstream_status = prepared.status;
     let upstream_model = prepared.runtime.client.model().to_string();
     let upstream_pricing = prepared.runtime.client.pricing().copied();
-    let runtime_for_stream = prepared.runtime.clone();
+    let provider_client = prepared.runtime.client.clone();
+    let permit = prepared
+        .permit
+        .expect("route permit attached after prepare");
     let candidate_for_stream = candidate.clone();
     let stream = stream! {
         let mut response_bytes = 0_u64;
         let mut usage = Usage::default();
         let mut stream_error = None;
         let mut response_translator =
-            responses::ChatToResponsesStream::new(requested_model.clone());
-        let mut anthropic_translator = anthropic::ChatToAnthropicStream::new();
-        let mut responses_source = responses::ResponsesToChatStream::new();
-        let mut anthropic_source = anthropic::AnthropicToChatStream::new();
+            responses::ChatToResponsesStream::new(requested_model.clone(), body.clone());
+        let mut anthropic_translator =
+            anthropic::ChatToAnthropicStream::new(requested_model.clone());
+        let mut responses_source = responses::ResponsesToChatStream::new(requested_model.clone());
+        let mut anthropic_source =
+            anthropic::AnthropicToChatStream::new(requested_model.clone());
         let mut pending_event = Some(first_event);
         loop {
             let next = if let Some(event) = pending_event.take() {
@@ -912,8 +1045,8 @@ async fn handle_stream(
                         match serde_json::from_str::<Value>(&event.data) {
                             Ok(upstream_chunk) => {
                                 let upstream_type=upstream_chunk.get("type").and_then(Value::as_str);
-                                if matches!(upstream_type,Some("response.failed"|"error")) {
-                                    stream_error=Some(FailureClass::StreamFailure);
+                                if let Some(class) = stream_error_class(&provider_client, upstream_status, &event, Some(&upstream_chunk)) {
+                                    stream_error=Some(class);
                                     break;
                                 }
                                 let upstream_terminal = match egress {
@@ -948,10 +1081,15 @@ async fn handle_stream(
                             Err(_) => { stream_error=Some(FailureClass::StreamFailure); break; }
                         }
                     } else {
-                        let parsed=serde_json::from_str::<Value>(&event.data).ok();
-                        if let Some(value)=parsed.as_ref() { observe_stream_usage(protocol, &mut usage, value); }
-                        let event_type=event.event.as_deref().or_else(||parsed.as_ref()?.get("type")?.as_str());
+                        let parsed=match serde_json::from_str::<Value>(&event.data) {
+                            Ok(value)=>value,
+                            Err(_)=>{stream_error=Some(FailureClass::StreamFailure);break;}
+                        };
+                        let semantic_error=stream_error_class(&provider_client, upstream_status, &event, Some(&parsed));
+                        observe_stream_usage(protocol, &mut usage, &parsed);
+                        let event_type=event.event.as_deref().or_else(||parsed.get("type")?.as_str());
                         let bytes=event.encode(); response_bytes+=bytes.len() as u64; yield Ok::<Bytes, Infallible>(bytes);
+                        if let Some(class)=semantic_error { stream_error=Some(class); break; }
                         if protocol == Protocol::OpenAiResponses && matches!(event_type, Some("response.completed"|"response.incomplete"|"response.failed")) { break; }
                         if protocol == Protocol::AnthropicMessages && event_type==Some("message_stop") { break; }
                     }
@@ -968,8 +1106,8 @@ async fn handle_stream(
             id:attempt_id,
             request_id:Some(request_id_for_stream.clone()),
             sequence,
-            provider:candidate_for_stream.target.provider.clone(),
-            provider_kind:Some(provider_kind),
+            backend:candidate_for_stream.target.backend.clone(),
+            adapter:Some(adapter_kind),
             credential:Some(candidate_for_stream.target.credential.clone()),
             route_layer:Some(candidate_for_stream.layer_name.clone()),
             route_layer_index:Some(candidate_for_stream.layer_index),
@@ -1005,8 +1143,8 @@ async fn handle_stream(
             streaming:true,
             status:if stream_error.is_some(){502}else{200},
             error_class:stream_error,
-            provider:Some(candidate_for_stream.target.provider.clone()),
-            provider_kind:Some(provider_kind),
+            backend:Some(candidate_for_stream.target.backend.clone()),
+            adapter:Some(adapter_kind),
             credential:Some(candidate_for_stream.target.credential.clone()),
             route_layer:Some(candidate_for_stream.layer_name.clone()),
             route_layer_index:Some(candidate_for_stream.layer_index),
@@ -1025,11 +1163,11 @@ async fn handle_stream(
         };
         persist_request(&state_for_stream,&request);
         if let Some(class)=stream_error {
-            runtime_for_stream.circuit.failure(class,None).await;
+            permit.failure(class,None).await;
             record_alert_if_needed(&state_for_stream,&request_id_for_stream,&candidate_for_stream,class).await;
         } else {
             observe_affinity(&state_for_stream,&candidate_for_stream,&usage);
-            runtime_for_stream.circuit.success().await;
+            permit.success().await;
         }
     };
     let mut response = Response::new(Body::from_stream(stream));
@@ -1066,7 +1204,9 @@ struct PreparedStream {
     probe: bool,
     attempt_started_at_ms: i64,
     request_bytes: u64,
+    status: StatusCode,
     fallback_reason: Option<FailureClass>,
+    permit: Option<CircuitPermit>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1090,7 +1230,7 @@ async fn prepare_stream_attempt(
             Ok(value) => value,
             Err(error) => {
                 return Err(AttemptFailure {
-                    error: ProviderError {
+                    error: BackendError {
                         class: FailureClass::ClientRequest,
                         status: Some(error.status),
                         retry_after: None,
@@ -1110,7 +1250,7 @@ async fn prepare_stream_attempt(
                 Some(request_id),
                 sequence,
                 candidate,
-                runtime.client.kind(),
+                runtime.client.adapter_kind(),
                 runtime.client.model(),
                 egress,
                 translated,
@@ -1129,7 +1269,7 @@ async fn prepare_stream_attempt(
     let event = match decoder.next_event().await {
         Ok(Some(event)) => event,
         Ok(None) | Err(_) => {
-            let error = ProviderError {
+            let error = BackendError {
                 class: FailureClass::StreamFailure,
                 status: Some(status),
                 retry_after: None,
@@ -1140,7 +1280,7 @@ async fn prepare_stream_attempt(
                 Some(request_id),
                 sequence,
                 candidate,
-                runtime.client.kind(),
+                runtime.client.adapter_kind(),
                 runtime.client.model(),
                 egress,
                 translated,
@@ -1154,29 +1294,25 @@ async fn prepare_stream_attempt(
             return Err(AttemptFailure { error });
         }
     };
-    if event.event.as_deref() == Some("error")
-        || serde_json::from_str::<Value>(&event.data)
-            .ok()
-            .is_some_and(|value| {
-                value.get("error").is_some()
-                    || matches!(
-                        value.get("type").and_then(Value::as_str),
-                        Some("response.failed" | "error")
-                    )
-            })
+    let parsed_first_event = serde_json::from_str::<Value>(&event.data).ok();
+    if let Some(class) =
+        stream_error_class(&runtime.client, status, &event, parsed_first_event.as_ref())
     {
-        let error = ProviderError {
-            class: FailureClass::StreamFailure,
-            status: Some(status),
-            retry_after: None,
-            safe_message: "upstream returned an SSE error before commit".into(),
-        };
+        let error = parsed_first_event
+            .as_ref()
+            .and_then(|value| runtime.client.classify_semantic_error(status, value))
+            .unwrap_or(BackendError {
+                class,
+                status: Some(status),
+                retry_after: None,
+                safe_message: "upstream returned an SSE error before commit".into(),
+            });
         let record = failed_attempt(
             &attempt_id,
             Some(request_id),
             sequence,
             candidate,
-            runtime.client.kind(),
+            runtime.client.adapter_kind(),
             runtime.client.model(),
             egress,
             translated,
@@ -1189,15 +1325,30 @@ async fn prepare_stream_attempt(
         persist_attempt(&state, &record);
         return Err(AttemptFailure { error });
     }
-    if translated && event.data != "[DONE]" {
-        serde_json::from_str::<Value>(&event.data).map_err(|_| AttemptFailure {
-            error: ProviderError {
-                class: FailureClass::StreamFailure,
-                status: Some(status),
-                retry_after: None,
-                safe_message: "upstream sent malformed SSE before commit".into(),
-            },
-        })?;
+    if event.data != "[DONE]" && parsed_first_event.is_none() {
+        let error = BackendError {
+            class: FailureClass::StreamFailure,
+            status: Some(status),
+            retry_after: None,
+            safe_message: "upstream sent malformed SSE before commit".into(),
+        };
+        let record = failed_attempt(
+            &attempt_id,
+            Some(request_id),
+            sequence,
+            candidate,
+            runtime.client.adapter_kind(),
+            runtime.client.model(),
+            egress,
+            translated,
+            candidate.probe,
+            attempt_started_at_ms,
+            attempt_started,
+            request_bytes,
+            &error,
+        );
+        persist_attempt(&state, &record);
+        return Err(AttemptFailure { error });
     }
     let _ = request_started;
     Ok(PreparedStream {
@@ -1212,8 +1363,41 @@ async fn prepare_stream_attempt(
         probe: candidate.probe,
         attempt_started_at_ms,
         request_bytes,
+        status,
         fallback_reason: None,
+        permit: None,
     })
+}
+
+fn is_stream_error(event: &SseEvent, parsed: Option<&Value>) -> bool {
+    event.event.as_deref() == Some("error")
+        || parsed.is_some_and(|value| {
+            value.get("error").is_some_and(|error| !error.is_null())
+                || matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("response.failed" | "error")
+                )
+        })
+}
+
+fn stream_error_class(
+    client: &BackendClient,
+    status: StatusCode,
+    event: &SseEvent,
+    parsed: Option<&Value>,
+) -> Option<FailureClass> {
+    if !is_stream_error(event, parsed) {
+        return None;
+    }
+    Some(
+        parsed
+            .and_then(|value| client.classify_semantic_error(status, value))
+            .map(|error| match error.class {
+                FailureClass::ProviderUnknown5xxOrTransport => FailureClass::StreamFailure,
+                class => class,
+            })
+            .unwrap_or(FailureClass::StreamFailure),
+    )
 }
 
 fn prepare_for_provider(
@@ -1248,19 +1432,22 @@ fn translate_nonstream(
     egress: Protocol,
     raw: &Value,
     response_model: &str,
+    original_request: &Value,
 ) -> Value {
     if ingress == egress {
         return raw.clone();
     }
     let chat = match egress {
         Protocol::OpenAiChat => raw.clone(),
-        Protocol::OpenAiResponses => responses::response_to_chat(raw),
-        Protocol::AnthropicMessages => anthropic::message_to_chat(raw),
+        Protocol::OpenAiResponses => responses::response_to_chat(raw, response_model),
+        Protocol::AnthropicMessages => anthropic::message_to_chat(raw, response_model),
     };
     match ingress {
         Protocol::OpenAiChat => chat,
-        Protocol::OpenAiResponses => responses::chat_to_response(&chat, response_model),
-        Protocol::AnthropicMessages => anthropic::chat_to_message(&chat),
+        Protocol::OpenAiResponses => {
+            responses::chat_to_response(&chat, response_model, original_request)
+        }
+        Protocol::AnthropicMessages => anthropic::chat_to_message(&chat, response_model),
     }
 }
 
@@ -1296,9 +1483,12 @@ async fn terminal_failure(
         streaming: false,
         status: status.as_u16(),
         error_class: Some(class),
-        provider: candidate.map(|candidate| candidate.target.provider.clone()),
-        provider_kind: candidate
-            .map(|candidate| target_runtime(state, &candidate.target).client.kind()),
+        backend: candidate.map(|candidate| candidate.target.backend.clone()),
+        adapter: candidate.map(|candidate| {
+            target_runtime(state, &candidate.target)
+                .client
+                .adapter_kind()
+        }),
         credential: candidate.map(|candidate| candidate.target.credential.clone()),
         route_layer: candidate.map(|candidate| candidate.layer_name.clone()),
         route_layer_index: candidate.map(|candidate| candidate.layer_index),
@@ -1376,7 +1566,7 @@ fn failed_attempt(
     request_id: Option<&str>,
     sequence: u32,
     candidate: &RouteCandidate,
-    provider_kind: ProviderKind,
+    adapter_kind: AdapterKind,
     model: &str,
     egress: Protocol,
     translated: bool,
@@ -1384,14 +1574,14 @@ fn failed_attempt(
     started_at_ms: i64,
     started: Instant,
     request_bytes: u64,
-    error: &ProviderError,
+    error: &BackendError,
 ) -> AttemptRecord {
     AttemptRecord {
         id: id.into(),
         request_id: request_id.map(str::to_string),
         sequence,
-        provider: candidate.target.provider.clone(),
-        provider_kind: Some(provider_kind),
+        backend: candidate.target.backend.clone(),
+        adapter: Some(adapter_kind),
         credential: Some(candidate.target.credential.clone()),
         route_layer: Some(candidate.layer_name.clone()),
         route_layer_index: Some(candidate.layer_index),
@@ -1475,6 +1665,7 @@ async fn record_alert_if_needed(
         FailureClass::ProviderAuth
             | FailureClass::ProviderBilling
             | FailureClass::ProviderConfiguration
+            | FailureClass::ProviderQuota
             | FailureClass::ProviderUnknown4xx
             | FailureClass::FallbackUnavailable
     ) {
@@ -1486,13 +1677,13 @@ async fn record_alert_if_needed(
     let record = AlertRecord {
         id: format!(
             "{}:{}:{}:{}",
-            candidate.target.provider,
+            candidate.target.backend,
             candidate.target.credential,
             candidate.target.model,
             class.as_str()
         ),
-        provider: candidate.target.provider.clone(),
-        provider_kind: Some(runtime.client.kind()),
+        backend: candidate.target.backend.clone(),
+        adapter: Some(runtime.client.adapter_kind()),
         credential: Some(candidate.target.credential.clone()),
         class,
         active: true,
@@ -1508,11 +1699,6 @@ async fn record_alert_if_needed(
 
 fn metadata_requested(headers: &HeaderMap) -> bool {
     headers.get(METADATA_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
-}
-fn has_provider_selector(headers: &HeaderMap, body: &Value) -> bool {
-    body.get("provider").is_some()
-        || headers.contains_key("x-relay-provider")
-        || headers.contains_key("x-provider")
 }
 fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -1539,7 +1725,7 @@ fn apply_metadata(
     let headers = response.headers_mut();
     for (name, value) in [
         ("x-relay-request-id", request_id.to_string()),
-        ("x-relay-provider", candidate.target.provider.clone()),
+        ("x-relay-backend", candidate.target.backend.clone()),
         ("x-relay-credential", candidate.target.credential.clone()),
         ("x-relay-route-layer", candidate.layer_name.clone()),
         (
@@ -1629,7 +1815,7 @@ async fn routing(State(state): State<Arc<AppState>>) -> Json<Value> {
             let mut targets = Vec::with_capacity(layer.targets.len());
             for target in &layer.targets {
                 targets.push(json!({
-                    "provider": target.provider,
+                    "backend": target.backend,
                     "credential": target.credential,
                     "upstream_model": target.model,
                     "circuit": target_runtime(&state, target).circuit.snapshot().await,
@@ -1698,7 +1884,7 @@ async fn routing_stats(
             let key = RouteRollupKey {
                 layer_index: layer_index as u32,
                 layer_name: layer.name.clone(),
-                provider: target.provider.clone(),
+                backend: target.backend.clone(),
                 credential: target.credential.clone(),
                 upstream_model: target.model.clone(),
             };
@@ -1711,7 +1897,7 @@ async fn routing_stats(
                     .into_response();
             }
             targets.push(json!({
-                "provider": target.provider,
+                "backend": target.backend,
                 "credential": target.credential,
                 "upstream_model": target.model,
                 "configured": true,
@@ -1733,7 +1919,7 @@ async fn routing_stats(
             json!({
                 "layer_index": key.layer_index,
                 "layer_name": key.layer_name,
-                "provider": key.provider,
+                "backend": key.backend,
                 "credential": key.credential,
                 "upstream_model": key.upstream_model,
                 "configured": false,
@@ -1792,8 +1978,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
                 if seen.insert(target) {
                     let runtime = target_runtime(&state, target);
                     target_rows.push(json!({
-                        "provider":target.provider,
-                        "provider_kind":runtime.client.kind().as_str(),
+                        "backend":target.backend,
+                        "adapter":runtime.client.adapter_kind().as_str(),
                         "credential":target.credential,
                         "model":target.model,
                         "protocols":runtime.client.protocols().iter().map(|protocol|protocol.as_str()).collect::<Vec<_>>(),
@@ -1842,25 +2028,25 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
                 .into_response();
         }
     };
-    let mut providers: BTreeMap<String, Value> = BTreeMap::new();
-    let provider_names = state
+    let mut backends: BTreeMap<String, Value> = BTreeMap::new();
+    let backend_names = state
         .config
-        .providers
+        .backends
         .iter()
-        .map(|provider| provider.id.clone())
-        .chain(rollup.attempts.keys().map(|(provider, _)| provider.clone()))
+        .map(|backend| backend.id.clone())
+        .chain(rollup.attempts.keys().map(|(backend, _)| backend.clone()))
         .collect::<std::collections::BTreeSet<_>>();
-    for provider in provider_names {
+    for backend in backend_names {
         let rows = rollup
             .attempts
             .iter()
-            .filter(|((row_provider, _), _)| row_provider == &provider)
+            .filter(|((row_backend, _), _)| row_backend == &backend)
             .collect::<Vec<_>>();
         let models = state
             .config
-            .providers
+            .backends
             .iter()
-            .filter(|configured| configured.id == provider)
+            .filter(|configured| configured.id == backend)
             .flat_map(|configured| configured.models.iter().map(|model| model.name.as_str()))
             .chain(
                 rows.iter()
@@ -1872,12 +2058,10 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
             .models
             .iter()
             .filter(|model| {
-                model.layers.iter().any(|layer| {
-                    layer
-                        .targets
-                        .iter()
-                        .any(|target| target.provider == provider)
-                })
+                model
+                    .layers
+                    .iter()
+                    .any(|layer| layer.targets.iter().any(|target| target.backend == backend))
             })
             .map(|model| model.name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
@@ -1895,12 +2079,12 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
         let summary = summary.as_object_mut().expect("attempt rollup object");
         summary.insert("models".into(), json!(models));
         summary.insert("served_models".into(), json!(served_models));
-        providers.insert(provider, Value::Object(summary.clone()));
+        backends.insert(backend, Value::Object(summary.clone()));
     }
     let routes = rollup
         .attempts
         .iter()
-        .map(|((provider, upstream_model), value)| {
+        .map(|((backend, upstream_model), value)| {
             let served_models = state
                 .config
                 .models
@@ -1908,7 +2092,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
                 .filter(|model| {
                     model.layers.iter().any(|layer| {
                         layer.targets.iter().any(|target| {
-                            target.provider.as_str() == provider.as_str()
+                            target.backend.as_str() == backend.as_str()
                                 && target.model.as_str() == upstream_model.as_str()
                         })
                     })
@@ -1918,7 +2102,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
             let mut summary = attempt_rollup_json(*value);
             let summary = summary.as_object_mut().expect("attempt rollup object");
             summary.insert("served_models".into(), json!(served_models));
-            summary.insert("provider".into(), Value::String(provider.clone()));
+            summary.insert("backend".into(), Value::String(backend.clone()));
             summary.insert(
                 "upstream_model".into(),
                 Value::String(upstream_model.clone()),
@@ -1935,7 +2119,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
             "output_tokens":requests.output_tokens,
             "bytes":requests.bytes,
         },
-        "providers":providers,
+        "backends":backends,
         "routes":routes
     }))
     .into_response()
@@ -1959,25 +2143,46 @@ mod tests {
 
     #[test]
     fn affinity_canonicalization_ignores_transport_and_model_fields() {
-        let baseline = canonical_prompt_bytes(json!({
-            "model":"provider-model-a",
-            "messages":[{"role":"user","content":"same prompt"}],
-            "stream":false
-        }))
+        let baseline = canonical_prompt_bytes(
+            Protocol::OpenAiChat,
+            json!({
+                "model":"provider-model-a",
+                "messages":[{"role":"user","content":"same prompt"}],
+                "stream":false
+            }),
+        )
         .unwrap();
-        let streaming = canonical_prompt_bytes(json!({
-            "model":"provider-model-b",
-            "messages":[{"role":"user","content":"same prompt"}],
-            "stream":true,
-            "stream_options":{"include_usage":true}
-        }))
+        let streaming = canonical_prompt_bytes(
+            Protocol::OpenAiChat,
+            json!({
+                "model":"provider-model-b",
+                "messages":[{"role":"user","content":"same prompt"}],
+                "stream":true,
+                "stream_options":{"include_usage":true}
+            }),
+        )
         .unwrap();
         assert_eq!(baseline, streaming);
     }
 
     #[test]
+    fn circuit_keys_are_unambiguous_even_when_ids_contain_colons() {
+        let left = RouteTargetConfig {
+            backend: "a:b".into(),
+            credential: "c".into(),
+            model: "d".into(),
+        };
+        let right = RouteTargetConfig {
+            backend: "a".into(),
+            credential: "b:c".into(),
+            model: "d".into(),
+        };
+        assert_ne!(circuit_store_key(&left), circuit_store_key(&right));
+    }
+
+    #[test]
     fn affinity_canonicalization_preserves_prompt_semantics() {
-        let baseline = canonical_prompt_bytes(json!({
+        let baseline = canonical_prompt_bytes(Protocol::OpenAiChat, json!({
             "model":"provider-model",
             "messages":[{"role":"user","content":"same prompt"}],
             "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
@@ -2000,21 +2205,49 @@ mod tests {
                 "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
             }),
         ] {
-            assert_ne!(baseline, canonical_prompt_bytes(changed).unwrap());
+            assert_ne!(
+                baseline,
+                canonical_prompt_bytes(Protocol::OpenAiChat, changed).unwrap()
+            );
         }
     }
 
     #[test]
-    fn affinity_namespaces_isolate_provider_kind_protocol_and_upstream_model() {
-        let go_k3 = affinity_namespace(ProviderKind::OpenCodeGo, Protocol::OpenAiChat, "kimi-k3");
+    fn affinity_canonicalization_ignores_non_prompt_selector_like_fields() {
+        let baseline = canonical_prompt_bytes(
+            Protocol::OpenAiChat,
+            json!({
+                "model":"provider-model",
+                "messages":[{"role":"user","content":"same prompt"}]
+            }),
+        )
+        .unwrap();
+        let decorated = canonical_prompt_bytes(
+            Protocol::OpenAiChat,
+            json!({
+                "model":"provider-model",
+                "messages":[{"role":"user","content":"same prompt"}],
+                "provider":"fake-provider",
+                "credential":"fake-credential",
+                "route_layer":"fake-layer",
+                "x_relay_provider":"fake-header-shaped-field"
+            }),
+        )
+        .unwrap();
+        assert_eq!(baseline, decorated);
+    }
+
+    #[test]
+    fn affinity_namespaces_isolate_adapter_protocol_and_upstream_model() {
+        let go_k3 = affinity_namespace(AdapterKind::OpenCodeGo, Protocol::OpenAiChat, "kimi-k3");
         assert_ne!(
             go_k3,
-            affinity_namespace(ProviderKind::KimiCode, Protocol::OpenAiChat, "k3")
+            affinity_namespace(AdapterKind::KimiCode, Protocol::OpenAiChat, "k3")
         );
         assert_ne!(
             go_k3,
             affinity_namespace(
-                ProviderKind::OpenCodeGo,
+                AdapterKind::OpenCodeGo,
                 Protocol::AnthropicMessages,
                 "kimi-k3"
             )
@@ -2022,20 +2255,13 @@ mod tests {
         assert_ne!(
             go_k3,
             affinity_namespace(
-                ProviderKind::OpenCodeGo,
+                AdapterKind::OpenCodeGo,
                 Protocol::OpenAiChat,
                 "kimi-k3-256k"
             )
         );
     }
 
-    #[test]
-    fn rejects_provider_selection() {
-        assert!(has_provider_selector(
-            &HeaderMap::new(),
-            &json!({"provider":"deepseek"})
-        ));
-    }
     #[test]
     fn calculates_cost_from_model_pricing_only() {
         let usage = Usage {

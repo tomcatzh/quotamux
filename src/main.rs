@@ -13,7 +13,7 @@ struct Args {
     #[arg(long, default_value = "quotamux.toml", env = "QUOTAMUX_CONFIG")]
     config: PathBuf,
 
-    /// Validate configuration and provider model identities, then exit.
+    /// Validate configuration, backend identities, and adapter model contracts, then exit.
     #[arg(long)]
     check: bool,
 }

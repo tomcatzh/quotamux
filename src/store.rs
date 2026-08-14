@@ -79,7 +79,7 @@ pub struct AttemptRollup {
 pub struct RouteRollupKey {
     pub layer_index: u32,
     pub layer_name: String,
-    pub provider: String,
+    pub backend: String,
     pub credential: String,
     pub upstream_model: String,
 }
@@ -217,6 +217,38 @@ impl Store {
             .map_err(|error| error.to_string())
     }
 
+    pub fn migrate_state_key(&self, old: &str, new: &str) -> Result<bool, String> {
+        if old == new {
+            return Ok(false);
+        }
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let changed = {
+            let mut table = transaction
+                .open_table(STATE)
+                .map_err(|error| error.to_string())?;
+            let old_value = table
+                .get(old)
+                .map_err(|error| error.to_string())?
+                .map(|value| value.value().to_vec());
+            if let Some(old_value) = old_value {
+                if table.get(new).map_err(|error| error.to_string())?.is_none() {
+                    table
+                        .insert(new, old_value.as_slice())
+                        .map_err(|error| error.to_string())?;
+                }
+                table.remove(old).map_err(|error| error.to_string())?;
+                true
+            } else {
+                false
+            }
+        };
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed)
+    }
+
     pub fn record_request(&self, record: &RequestRecord) -> Result<(), String> {
         let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
         let transaction = self
@@ -283,7 +315,7 @@ impl Store {
         self.put(ALERTS, &record.id, record)
     }
 
-    pub fn rename_provider(&self, old: &str, new: &str) -> Result<usize, String> {
+    pub fn rename_backend(&self, old: &str, new: &str) -> Result<usize, String> {
         if old == new {
             return Ok(0);
         }
@@ -292,9 +324,9 @@ impl Store {
             .begin_write()
             .map_err(|error| error.to_string())?;
         let mut changed = 0;
-        changed += rewrite_provider_field(&transaction, REQUESTS, old, new)?;
-        changed += rewrite_provider_field(&transaction, ATTEMPTS, old, new)?;
-        changed += rewrite_provider_field(&transaction, ALERTS, old, new)?;
+        changed += rewrite_backend_field(&transaction, REQUESTS, old, new)?;
+        changed += rewrite_backend_field(&transaction, ATTEMPTS, old, new)?;
+        changed += rewrite_backend_field(&transaction, ALERTS, old, new)?;
         changed += rename_circuit_state_keys(&transaction, old, new)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(changed)
@@ -408,9 +440,9 @@ impl Store {
                 .map_err(|error| error.to_string())?;
             for entry in table.iter().map_err(|error| error.to_string())? {
                 let (key, value) = entry.map_err(|error| error.to_string())?;
-                let (provider, upstream_model) = key.value();
+                let (backend, upstream_model) = key.value();
                 result.attempts.insert(
-                    (provider.to_string(), upstream_model.to_string()),
+                    (backend.to_string(), upstream_model.to_string()),
                     AttemptRollup::from(value.value()),
                 );
             }
@@ -813,7 +845,7 @@ fn apply_request_rollup(
                         SCOPE_TARGET,
                         target.layer_index,
                         target.layer_name.as_str(),
-                        target.provider.as_str(),
+                        target.backend.as_str(),
                         target.credential.as_str(),
                         target.upstream_model.as_str(),
                     ),
@@ -853,7 +885,7 @@ fn apply_request_rollup(
                 SCOPE_TARGET,
                 target.layer_index,
                 target.layer_name.as_str(),
-                target.provider.as_str(),
+                target.backend.as_str(),
                 target.credential.as_str(),
                 target.upstream_model.as_str(),
             ),
@@ -871,7 +903,7 @@ fn request_target(record: &RequestRecord) -> Option<RouteRollupKey> {
     Some(RouteRollupKey {
         layer_index: u32::try_from(record.route_layer_index?).ok()?,
         layer_name: record.route_layer.clone()?,
-        provider: record.provider.clone()?,
+        backend: record.backend.clone()?,
         credential: record.credential.clone()?,
         upstream_model: record.upstream_model.clone()?,
     })
@@ -927,7 +959,7 @@ fn apply_attempt_rollup(
     if !delta.cost_usd.is_finite() {
         return Err("provider cost is not finite".into());
     }
-    let key = (record.provider.as_str(), record.upstream_model.as_str());
+    let key = (record.backend.as_str(), record.upstream_model.as_str());
     let mut table = transaction
         .open_table(ATTEMPT_ROLLUP_ALL)
         .map_err(|error| error.to_string())?;
@@ -968,7 +1000,7 @@ fn accumulate_request_row(
     key: RequestAllKey<'_>,
     value: RequestRollupValue,
 ) -> Result<(), String> {
-    let (_, scope, layer_index, layer_name, provider, credential, upstream_model) = key;
+    let (_, scope, layer_index, layer_name, backend, credential, upstream_model) = key;
     let value = RequestRollup::from(value);
     match scope {
         SCOPE_MODEL => result.total.checked_add_assign(value),
@@ -977,7 +1009,7 @@ fn accumulate_request_row(
             .entry(RouteRollupKey {
                 layer_index,
                 layer_name: layer_name.to_string(),
-                provider: provider.to_string(),
+                backend: backend.to_string(),
                 credential: credential.to_string(),
                 upstream_model: upstream_model.to_string(),
             })
@@ -993,7 +1025,7 @@ fn accumulate_request_bucket_row(
     key: RequestBucketKey<'_>,
     value: RequestRollupValue,
 ) -> Result<(), String> {
-    let (model, _, _, scope, layer_index, layer_name, provider, credential, upstream_model) = key;
+    let (model, _, _, scope, layer_index, layer_name, backend, credential, upstream_model) = key;
     accumulate_request_row(
         result,
         (
@@ -1001,7 +1033,7 @@ fn accumulate_request_bucket_row(
             scope,
             layer_index,
             layer_name,
-            provider,
+            backend,
             credential,
             upstream_model,
         ),
@@ -1022,7 +1054,7 @@ fn ceil_to(value: i64, unit: i64) -> i64 {
     }
 }
 
-fn rewrite_provider_field(
+fn rewrite_backend_field(
     transaction: &WriteTransaction,
     definition: TableDefinition<&str, &[u8]>,
     old: &str,
@@ -1038,10 +1070,17 @@ fn rewrite_provider_field(
             let (key, value) = entry.map_err(|error| error.to_string())?;
             let mut record: Value =
                 serde_json::from_slice(value.value()).map_err(|error| error.to_string())?;
-            if record.get("provider").and_then(Value::as_str) != Some(old) {
+            let current = record
+                .get("backend")
+                .or_else(|| record.get("provider"))
+                .and_then(Value::as_str);
+            if current != Some(old) {
                 continue;
             }
-            record["provider"] = Value::String(new.to_string());
+            if let Some(object) = record.as_object_mut() {
+                object.remove("provider");
+                object.insert("backend".into(), Value::String(new.to_string()));
+            }
             updates.push((
                 key.value().to_string(),
                 serde_json::to_vec(&record).map_err(|error| error.to_string())?,
@@ -1105,7 +1144,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use crate::{
-        config::ProviderKind,
+        config::AdapterKind,
         types::{Protocol, Usage},
     };
 
@@ -1123,6 +1162,28 @@ mod tests {
             store.get_state::<Example>("example").unwrap(),
             Some(Example { value: 7 })
         );
+    }
+
+    #[test]
+    fn migrates_state_keys_without_overwriting_a_newer_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.put_state("old", &Example { value: 7 }).unwrap();
+        assert!(store.migrate_state_key("old", "new").unwrap());
+        assert_eq!(
+            store.get_state::<Example>("new").unwrap(),
+            Some(Example { value: 7 })
+        );
+        assert!(!store.migrate_state_key("old", "new").unwrap());
+
+        store.put_state("old", &Example { value: 8 }).unwrap();
+        store.put_state("new", &Example { value: 9 }).unwrap();
+        assert!(store.migrate_state_key("old", "new").unwrap());
+        assert_eq!(
+            store.get_state::<Example>("new").unwrap(),
+            Some(Example { value: 9 })
+        );
+        assert!(store.get_state::<Example>("old").unwrap().is_none());
     }
 
     #[test]
@@ -1158,15 +1219,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store
-                .rename_provider("open-code-go", "opencode-go")
-                .unwrap(),
+            store.rename_backend("open-code-go", "opencode-go").unwrap(),
             4
         );
         assert_eq!(
-            store
-                .rename_provider("open-code-go", "opencode-go")
-                .unwrap(),
+            store.rename_backend("open-code-go", "opencode-go").unwrap(),
             0
         );
 
@@ -1179,7 +1236,7 @@ mod tests {
             let table = transaction.open_table(definition).unwrap();
             let record: Value =
                 serde_json::from_slice(table.get(key).unwrap().unwrap().value()).unwrap();
-            assert_eq!(record["provider"], "opencode-go");
+            assert_eq!(record["backend"], "opencode-go");
         }
         assert!(
             store
@@ -1215,7 +1272,7 @@ mod tests {
         let (target, value) = all.targets.first_key_value().unwrap();
         assert_eq!(target.layer_index, 0);
         assert_eq!(target.layer_name, "plan");
-        assert_eq!(target.provider, "provider");
+        assert_eq!(target.backend, "provider");
         assert_eq!(target.credential, "key-a");
         assert_eq!(value.calls, 1);
 
@@ -1262,7 +1319,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         store.ensure_stats_schema().unwrap();
         let mut request = request_record("request-unattributed", Utc::now().timestamp_millis());
-        request.provider = None;
+        request.backend = None;
         request.credential = None;
         request.route_layer = None;
         request.route_layer_index = None;
@@ -1485,8 +1542,8 @@ mod tests {
             streaming: false,
             status: 200,
             error_class: None,
-            provider: Some("provider".into()),
-            provider_kind: Some(ProviderKind::DeepSeekOfficial),
+            backend: Some("provider".into()),
+            adapter: Some(AdapterKind::DeepSeekOfficial),
             credential: Some("key-a".into()),
             route_layer: Some("plan".into()),
             route_layer_index: Some(0),
@@ -1518,8 +1575,8 @@ mod tests {
             id: id.into(),
             request_id: Some("legacy-request".into()),
             sequence: 1,
-            provider: "provider".into(),
-            provider_kind: Some(ProviderKind::DeepSeekOfficial),
+            backend: "provider".into(),
+            adapter: Some(AdapterKind::DeepSeekOfficial),
             credential: Some("key-a".into()),
             route_layer: Some("plan".into()),
             route_layer_index: Some(0),

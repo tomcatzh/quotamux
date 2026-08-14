@@ -39,18 +39,11 @@ pub fn model_name(body: &Value) -> Result<&str, ValidationError> {
 
 pub fn validate_model(body: &Value) -> Result<(), ValidationError> {
     model_name(body)?;
-    if body.get("provider").is_some() {
-        return Err(ValidationError::invalid(
-            "clients cannot select a provider",
-            Some("provider"),
-        ));
-    }
     Ok(())
 }
 
 pub fn set_model(body: &mut Value, model: &str) {
     if let Some(object) = body.as_object_mut() {
         object.insert("model".into(), Value::String(model.into()));
-        object.remove("provider");
     }
 }

@@ -1,7 +1,7 @@
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 
-use quotamux::{Config, provider::ProviderClient, types::Protocol};
+use quotamux::{Config, provider::BackendClient, types::Protocol};
 
 const CONFIG_PATH: &str = "quotamux.toml";
 const MODEL: &str = "deepseek-v4-pro";
@@ -17,36 +17,35 @@ async fn configured_deepseek_v4_pro_targets_report_system_fingerprints() {
     let mut missing_required_fingerprints = Vec::new();
 
     for target in targets {
-        let provider = config.provider(&target.provider).unwrap_or_else(|| {
+        let provider = config.backend(&target.backend).unwrap_or_else(|| {
             panic!(
                 "private {CONFIG_PATH} is missing provider {}",
-                target.provider
+                target.backend
             )
         });
         let credential = provider.credential(&target.credential).unwrap_or_else(|| {
             panic!(
                 "private {CONFIG_PATH} target for provider {} is missing credential {}",
-                target.provider, target.credential
+                target.backend, target.credential
             )
         });
         let model = provider.model(MODEL).unwrap_or_else(|| {
             panic!(
                 "private {CONFIG_PATH} provider {} is missing model {MODEL}",
-                target.provider
+                target.backend
+            )
+        });
+        let client = BackendClient::new(provider, credential, model).unwrap_or_else(|_| {
+            panic!(
+                "failed to construct BackendClient for provider {} model {MODEL}",
+                target.backend
             )
         });
         assert!(
-            model.native_protocols().contains(&Protocol::OpenAiChat),
+            client.protocols().contains(&Protocol::OpenAiChat),
             "private {CONFIG_PATH} provider {} model {MODEL} must enable OpenAI Chat",
-            target.provider
+            target.backend
         );
-
-        let client = ProviderClient::new(provider, credential, model).unwrap_or_else(|_| {
-            panic!(
-                "failed to construct ProviderClient for provider {} model {MODEL}",
-                target.provider
-            )
-        });
         let response = match client
             .send(
                 Protocol::OpenAiChat,
@@ -63,13 +62,13 @@ async fn configured_deepseek_v4_pro_targets_report_system_fingerprints() {
             Ok(response) => response,
             Err(error) => panic!(
                 "DeepSeek V4 Pro request failed for provider {} with status {:?}",
-                target.provider, error.status
+                target.backend, error.status
             ),
         };
         let body = response.json::<Value>().await.unwrap_or_else(|_| {
             panic!(
                 "DeepSeek V4 Pro provider {} returned invalid JSON",
-                target.provider
+                target.backend
             )
         });
         let returned_model = body
@@ -79,7 +78,7 @@ async fn configured_deepseek_v4_pro_targets_report_system_fingerprints() {
             .unwrap_or_else(|| {
                 panic!(
                     "DeepSeek V4 Pro provider {} response is missing a model",
-                    target.provider
+                    target.backend
                 )
             });
         let fingerprint = body
@@ -87,16 +86,16 @@ async fn configured_deepseek_v4_pro_targets_report_system_fingerprints() {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|fingerprint| !fingerprint.is_empty());
-        if provider.kind == quotamux::config::ProviderKind::DeepSeekOfficial
+        if provider.adapter == quotamux::config::AdapterKind::DeepSeekOfficial
             && fingerprint.is_none()
         {
-            missing_required_fingerprints.push(target.provider.clone());
+            missing_required_fingerprints.push(target.backend.clone());
         }
 
         eprintln!(
             "REAL_DEEPSEEK_V4_PRO_EVIDENCE {}",
             json!({
-                "provider": target.provider,
+                "backend": target.backend,
                 "model": returned_model,
                 "system_fingerprint": fingerprint
             })
@@ -117,13 +116,13 @@ fn configured_targets(config: &Config) -> Vec<quotamux::config::RouteTargetConfi
         .layers
         .iter()
         .flat_map(|layer| layer.targets.iter())
-        .filter(|target| PROVIDER_IDS.contains(&target.provider.as_str()) && target.model == MODEL)
+        .filter(|target| PROVIDER_IDS.contains(&target.backend.as_str()) && target.model == MODEL)
         .cloned()
         .collect::<Vec<_>>();
 
     for provider_id in PROVIDER_IDS {
         assert!(
-            targets.iter().any(|target| target.provider == provider_id),
+            targets.iter().any(|target| target.backend == provider_id),
             "private {CONFIG_PATH} is missing a {MODEL} target for provider {provider_id}"
         );
     }

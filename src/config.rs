@@ -7,7 +7,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{affinity::PrefixAffinityConfig, types::Protocol};
+use crate::{
+    affinity::PrefixAffinityConfig,
+    provider::{EndpointPolicy, ModelProtocolPolicy, adapter_for},
+    types::Protocol,
+};
 
 pub const LOGICAL_MODEL: &str = "deepseek-v4-flash-0731";
 pub const UPSTREAM_MODEL: &str = "deepseek-v4-flash";
@@ -19,7 +23,7 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub affinity: PrefixAffinityConfig,
-    pub providers: Vec<ProviderConfig>,
+    pub backends: Vec<BackendConfig>,
     pub models: Vec<ServedModelConfig>,
 }
 
@@ -31,7 +35,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub enum ProviderKind {
+pub enum AdapterKind {
     #[serde(rename = "deepseek-official")]
     DeepSeekOfficial,
     #[serde(rename = "kimi-official")]
@@ -54,7 +58,7 @@ pub enum ProviderKind {
     CustomAnthropic,
 }
 
-impl ProviderKind {
+impl AdapterKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DeepSeekOfficial => "deepseek-official",
@@ -69,87 +73,27 @@ impl ProviderKind {
             Self::CustomAnthropic => "custom-anthropic",
         }
     }
-
-    pub const fn default_endpoint(self) -> Option<&'static str> {
-        match self {
-            Self::DeepSeekOfficial => Some("https://api.deepseek.com"),
-            Self::KimiOfficial => Some("https://api.moonshot.cn/v1"),
-            Self::KimiCode => Some("https://api.kimi.com/coding/v1"),
-            Self::OllamaCloud => Some("https://ollama.com/v1"),
-            Self::OpenCodeZen => Some("https://opencode.ai/zen/v1"),
-            Self::OpenCodeGo => Some("https://opencode.ai/zen/go/v1"),
-            Self::AliyunBailian
-            | Self::CustomChatCompletions
-            | Self::CustomResponses
-            | Self::CustomAnthropic => None,
-        }
-    }
-
-    pub const fn fixed_protocol(self) -> Option<Protocol> {
-        match self {
-            Self::KimiOfficial | Self::CustomChatCompletions => Some(Protocol::OpenAiChat),
-            Self::CustomResponses => Some(Protocol::OpenAiResponses),
-            Self::CustomAnthropic => Some(Protocol::AnthropicMessages),
-            _ => None,
-        }
-    }
-
-    pub fn supports_protocol(self, protocol: Protocol) -> bool {
-        match self {
-            Self::DeepSeekOfficial => matches!(
-                protocol,
-                Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::AnthropicMessages
-            ),
-            Self::KimiCode => {
-                matches!(protocol, Protocol::OpenAiChat | Protocol::AnthropicMessages)
-            }
-            // OpenCode Go's official endpoint is selected per model. The provider
-            // offers all three protocol families overall; each configured model's
-            // `protocols` list remains the source of truth for its native endpoint.
-            Self::OpenCodeGo => matches!(
-                protocol,
-                Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::AnthropicMessages
-            ),
-            _ => match self.fixed_protocol() {
-                Some(fixed) => fixed == protocol,
-                None => true,
-            },
-        }
-    }
-
-    pub const fn uses_exact_endpoint(self) -> bool {
-        matches!(
-            self,
-            Self::CustomChatCompletions | Self::CustomResponses | Self::CustomAnthropic
-        )
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderConfig {
+pub struct BackendConfig {
     pub id: String,
-    pub kind: ProviderKind,
+    pub adapter: AdapterKind,
     #[serde(default)]
     pub endpoint: Option<String>,
     pub credentials: Vec<CredentialConfig>,
-    pub models: Vec<ProviderModelConfig>,
+    pub models: Vec<BackendModelConfig>,
 }
 
-impl ProviderConfig {
-    pub fn endpoint(&self) -> Option<&str> {
-        self.endpoint
-            .as_deref()
-            .or_else(|| self.kind.default_endpoint())
-    }
-
+impl BackendConfig {
     pub fn credential(&self, id: &str) -> Option<&CredentialConfig> {
         self.credentials
             .iter()
             .find(|credential| credential.id == id)
     }
 
-    pub fn model(&self, name: &str) -> Option<&ProviderModelConfig> {
+    pub fn model(&self, name: &str) -> Option<&BackendModelConfig> {
         self.models.iter().find(|model| model.name == name)
     }
 }
@@ -163,23 +107,12 @@ pub struct CredentialConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderModelConfig {
+pub struct BackendModelConfig {
     pub name: String,
-    #[serde(default)]
-    pub endpoint_protocol: Option<Protocol>,
     #[serde(default)]
     pub protocols: Vec<Protocol>,
     #[serde(default)]
     pub pricing: Option<ModelPricingConfig>,
-}
-
-impl ProviderModelConfig {
-    pub fn native_protocols(&self) -> &[Protocol] {
-        match &self.endpoint_protocol {
-            Some(protocol) => std::slice::from_ref(protocol),
-            None => &self.protocols,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -233,7 +166,7 @@ pub struct RouteLayerConfig {
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteTargetConfig {
-    pub provider: String,
+    pub backend: String,
     pub credential: String,
     pub model: String,
 }
@@ -261,9 +194,15 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let mut config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
+        let mut config: Self = toml::from_str(&text).map_err(|mut source| {
+            // toml attaches the complete source document to its error so it can
+            // render snippets. Configuration files contain API keys, therefore
+            // neither Debug nor Display may retain that input.
+            source.set_input(None);
+            ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            }
         })?;
 
         if config.server.data_dir.is_relative() {
@@ -273,53 +212,14 @@ impl Config {
         if let Some(data_dir) = env::var_os("QUOTAMUX_DATA_DIR") {
             config.server.data_dir = PathBuf::from(data_dir);
         }
-        config.discard_unsupported_provider_protocols();
         config.validate()?;
         Ok(config)
     }
 
-    pub(crate) fn discard_unsupported_provider_protocols(&mut self) -> usize {
-        let mut discarded = 0;
-        for provider in &mut self.providers {
-            for model in &mut provider.models {
-                if model
-                    .endpoint_protocol
-                    .is_some_and(|protocol| !provider.kind.supports_protocol(protocol))
-                {
-                    let protocol = model.endpoint_protocol.take().unwrap();
-                    discarded += 1;
-                    tracing::warn!(
-                        provider = %provider.id,
-                        provider_kind = provider.kind.as_str(),
-                        model = %model.name,
-                        protocol = protocol.as_str(),
-                        "ignoring endpoint protocol unsupported by official provider API"
-                    );
-                }
-                model.protocols.retain(|protocol| {
-                    if provider.kind.supports_protocol(*protocol) {
-                        true
-                    } else {
-                        discarded += 1;
-                        tracing::warn!(
-                            provider = %provider.id,
-                            provider_kind = provider.kind.as_str(),
-                            model = %model.name,
-                            protocol = protocol.as_str(),
-                            "ignoring protocol unsupported by official provider API"
-                        );
-                        false
-                    }
-                });
-            }
-        }
-        discarded
-    }
-
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.config_version != 2 {
+        if self.config_version != 3 {
             return Err(invalid(format!(
-                "unsupported config_version {}; expected 2",
+                "unsupported config_version {}; expected 3",
                 self.config_version
             )));
         }
@@ -327,31 +227,31 @@ impl Config {
             .listen
             .parse::<std::net::SocketAddr>()
             .map_err(|_| invalid("server.listen must be an IP socket address"))?;
-        if self.providers.is_empty() {
-            return Err(invalid("providers must not be empty"));
+        if self.backends.is_empty() {
+            return Err(invalid("backends must not be empty"));
         }
         if self.models.is_empty() {
             return Err(invalid("models must not be empty"));
         }
         self.affinity.validate().map_err(invalid)?;
 
-        let mut provider_ids = HashSet::new();
-        for (provider_index, provider) in self.providers.iter().enumerate() {
-            let path = format!("providers[{provider_index}]");
-            validate_id(&format!("{path}.id"), &provider.id)?;
-            if !provider_ids.insert(provider.id.as_str()) {
+        let mut backend_ids = HashSet::new();
+        for (backend_index, backend) in self.backends.iter().enumerate() {
+            let path = format!("backends[{backend_index}]");
+            validate_id(&format!("{path}.id"), &backend.id)?;
+            if !backend_ids.insert(backend.id.as_str()) {
                 return Err(invalid(format!(
-                    "{path}.id duplicates provider {}",
-                    provider.id
+                    "{path}.id duplicates backend {}",
+                    backend.id
                 )));
             }
-            validate_provider(&path, provider)?;
+            validate_backend(&path, backend)?;
         }
 
-        let providers = self
-            .providers
+        let backends = self
+            .backends
             .iter()
-            .map(|provider| (provider.id.as_str(), provider))
+            .map(|backend| (backend.id.as_str(), backend))
             .collect::<HashMap<_, _>>();
         let mut public_names = HashMap::<&str, &str>::new();
         for (model_index, model) in self.models.iter().enumerate() {
@@ -399,15 +299,15 @@ impl Config {
                             layer.name
                         )));
                     }
-                    validate_target(&target_path, target, &providers)?;
+                    validate_target(&target_path, target, &backends)?;
                 }
             }
         }
         Ok(())
     }
 
-    pub fn provider(&self, id: &str) -> Option<&ProviderConfig> {
-        self.providers.iter().find(|provider| provider.id == id)
+    pub fn backend(&self, id: &str) -> Option<&BackendConfig> {
+        self.backends.iter().find(|backend| backend.id == id)
     }
 
     pub fn resolve_model(&self, name: &str) -> Option<&ServedModelConfig> {
@@ -415,19 +315,42 @@ impl Config {
     }
 }
 
-fn validate_provider(path: &str, provider: &ProviderConfig) -> Result<(), ConfigError> {
-    let endpoint = provider.endpoint().ok_or_else(|| {
+fn validate_backend(path: &str, backend: &BackendConfig) -> Result<(), ConfigError> {
+    let adapter = adapter_for(backend.adapter).ok_or_else(|| {
         invalid(format!(
-            "{path}.endpoint is required for provider kind {}",
-            provider.kind.as_str()
+            "{path}.adapter {} is recognized but not implemented by this QuotaMux build",
+            backend.adapter.as_str()
         ))
     })?;
-    validate_endpoint(&format!("{path}.endpoint"), endpoint)?;
-    if provider.credentials.is_empty() {
+    if adapter.kind() != backend.adapter {
+        return Err(invalid(format!(
+            "internal adapter registry mismatch for adapter {}",
+            backend.adapter.as_str()
+        )));
+    }
+    match adapter.endpoint_policy() {
+        EndpointPolicy::Official(_) if backend.endpoint.is_some() => {
+            return Err(invalid(format!(
+                "{path}.endpoint is not configurable for official adapter {}; use the matching custom-* adapter for a custom endpoint",
+                backend.adapter.as_str()
+            )));
+        }
+        EndpointPolicy::Official(_) => {}
+        EndpointPolicy::ConfiguredExact => {
+            let endpoint = backend.endpoint.as_deref().ok_or_else(|| {
+                invalid(format!(
+                    "{path}.endpoint is required for custom adapter {}",
+                    backend.adapter.as_str()
+                ))
+            })?;
+            validate_endpoint(&format!("{path}.endpoint"), endpoint)?;
+        }
+    }
+    if backend.credentials.is_empty() {
         return Err(invalid(format!("{path}.credentials must not be empty")));
     }
     let mut credential_ids = HashSet::new();
-    for (index, credential) in provider.credentials.iter().enumerate() {
+    for (index, credential) in backend.credentials.iter().enumerate() {
         let credential_path = format!("{path}.credentials[{index}]");
         validate_id(&format!("{credential_path}.id"), &credential.id)?;
         if !credential_ids.insert(credential.id.as_str()) {
@@ -440,11 +363,11 @@ fn validate_provider(path: &str, provider: &ProviderConfig) -> Result<(), Config
             return Err(invalid(format!("{credential_path}.api_key is empty")));
         }
     }
-    if provider.models.is_empty() {
+    if backend.models.is_empty() {
         return Err(invalid(format!("{path}.models must not be empty")));
     }
     let mut model_names = HashSet::new();
-    for (index, model) in provider.models.iter().enumerate() {
+    for (index, model) in backend.models.iter().enumerate() {
         let model_path = format!("{path}.models[{index}]");
         validate_id(&format!("{model_path}.name"), &model.name)?;
         if !model_names.insert(model.name.as_str()) {
@@ -453,43 +376,43 @@ fn validate_provider(path: &str, provider: &ProviderConfig) -> Result<(), Config
                 model.name
             )));
         }
-        let native_protocols = if provider.kind == ProviderKind::OpenCodeGo {
-            if !model.protocols.is_empty() {
-                return Err(invalid(format!(
-                    "{model_path}.protocols is not valid for opencode-go; declare its single official endpoint as {model_path}.endpoint_protocol"
-                )));
+        let native_protocols = match adapter.model_protocol_policy() {
+            ModelProtocolPolicy::OfficialCatalog => {
+                if !model.protocols.is_empty() {
+                    return Err(invalid(format!(
+                        "{model_path}.protocols is not configurable for adapter {}; the adapter owns each official model endpoint",
+                        backend.adapter.as_str()
+                    )));
+                }
+                let expected = adapter.protocol_for_model(&model.name).ok_or_else(|| {
+                    invalid(format!(
+                        "{model_path}.name {} is not in the current official catalog for adapter {}",
+                        model.name,
+                        backend.adapter.as_str()
+                    ))
+                })?;
+                vec![expected]
             }
-            if model.endpoint_protocol.is_none() {
-                return Err(invalid(format!(
-                    "{model_path}.endpoint_protocol is required for opencode-go because each model has one official endpoint"
-                )));
+            ModelProtocolPolicy::Listed => {
+                if model.protocols.is_empty() {
+                    return Err(invalid(format!("{model_path}.protocols must not be empty")));
+                }
+                model.protocols.clone()
             }
-            model.native_protocols()
-        } else {
-            if model.endpoint_protocol.is_some() {
-                return Err(invalid(format!(
-                    "{model_path}.endpoint_protocol is only valid for opencode-go; use {model_path}.protocols for provider kind {}",
-                    provider.kind.as_str()
-                )));
-            }
-            if model.protocols.is_empty() {
-                return Err(invalid(format!("{model_path}.protocols must not be empty")));
-            }
-            model.native_protocols()
         };
         let mut protocols = HashSet::new();
-        for protocol in native_protocols {
+        for protocol in &native_protocols {
             if !protocols.insert(*protocol) {
                 return Err(invalid(format!(
                     "{model_path}.protocols contains duplicate {}",
                     protocol.as_str()
                 )));
             }
-            if !provider.kind.supports_protocol(*protocol) {
+            if !adapter.supports_protocol(*protocol) {
                 return Err(invalid(format!(
-                    "{model_path}.protocols contains unsupported protocol {} for provider kind {}",
+                    "{model_path}.protocols contains unsupported protocol {} for adapter {}",
                     protocol.as_str(),
-                    provider.kind.as_str()
+                    backend.adapter.as_str()
                 )));
             }
         }
@@ -519,24 +442,24 @@ fn validate_provider(path: &str, provider: &ProviderConfig) -> Result<(), Config
 fn validate_target(
     path: &str,
     target: &RouteTargetConfig,
-    providers: &HashMap<&str, &ProviderConfig>,
+    backends: &HashMap<&str, &BackendConfig>,
 ) -> Result<(), ConfigError> {
-    let provider = providers.get(target.provider.as_str()).ok_or_else(|| {
+    let backend = backends.get(target.backend.as_str()).ok_or_else(|| {
         invalid(format!(
-            "{path}.provider references missing provider {}",
-            target.provider
+            "{path}.backend references missing backend {}",
+            target.backend
         ))
     })?;
-    if provider.credential(&target.credential).is_none() {
+    if backend.credential(&target.credential).is_none() {
         return Err(invalid(format!(
-            "{path}.credential references missing credential {} on provider {}",
-            target.credential, target.provider
+            "{path}.credential references missing credential {} on backend {}",
+            target.credential, target.backend
         )));
     }
-    if provider.model(&target.model).is_none() {
+    if backend.model(&target.model).is_none() {
         return Err(invalid(format!(
-            "{path}.model references model {} not enabled on provider {}",
-            target.model, target.provider
+            "{path}.model references model {} not enabled on backend {}",
+            target.model, target.backend
         )));
     }
     Ok(())
@@ -569,8 +492,8 @@ fn validate_id(path: &str, value: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_endpoint(path: &str, endpoint: &str) -> Result<(), ConfigError> {
-    let url =
-        reqwest::Url::parse(endpoint).map_err(|_| invalid(format!("{path} is not a valid URL")))?;
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|_| invalid(format!("{path} must be an absolute HTTP(S) URL")))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(invalid(format!("{path} must be an absolute HTTP(S) URL")));
     }
@@ -587,39 +510,37 @@ mod tests {
 
     pub fn valid() -> Config {
         Config {
-            config_version: 2,
+            config_version: 3,
             server: ServerConfig {
                 listen: "127.0.0.1:8080".into(),
                 data_dir: "data".into(),
             },
             affinity: PrefixAffinityConfig::default(),
-            providers: vec![
-                ProviderConfig {
+            backends: vec![
+                BackendConfig {
                     id: "go".into(),
-                    kind: ProviderKind::OpenCodeGo,
+                    adapter: AdapterKind::OpenCodeGo,
                     endpoint: None,
                     credentials: vec![CredentialConfig {
                         id: "go-plan".into(),
                         api_key: "x".into(),
                     }],
-                    models: vec![ProviderModelConfig {
+                    models: vec![BackendModelConfig {
                         name: UPSTREAM_MODEL.into(),
-                        endpoint_protocol: Some(Protocol::OpenAiChat),
                         protocols: Vec::new(),
                         pricing: None,
                     }],
                 },
-                ProviderConfig {
+                BackendConfig {
                     id: "deepseek".into(),
-                    kind: ProviderKind::DeepSeekOfficial,
+                    adapter: AdapterKind::DeepSeekOfficial,
                     endpoint: None,
                     credentials: vec![CredentialConfig {
                         id: "deepseek-payg".into(),
                         api_key: "y".into(),
                     }],
-                    models: vec![ProviderModelConfig {
+                    models: vec![BackendModelConfig {
                         name: UPSTREAM_MODEL.into(),
-                        endpoint_protocol: None,
                         protocols: vec![
                             Protocol::OpenAiChat,
                             Protocol::OpenAiResponses,
@@ -642,7 +563,7 @@ mod tests {
                         name: "plan".into(),
                         strategy: RouteStrategy::Random,
                         targets: vec![RouteTargetConfig {
-                            provider: "go".into(),
+                            backend: "go".into(),
                             credential: "go-plan".into(),
                             model: UPSTREAM_MODEL.into(),
                         }],
@@ -651,7 +572,7 @@ mod tests {
                         name: "payg".into(),
                         strategy: RouteStrategy::Random,
                         targets: vec![RouteTargetConfig {
-                            provider: "deepseek".into(),
+                            backend: "deepseek".into(),
                             credential: "deepseek-payg".into(),
                             model: UPSTREAM_MODEL.into(),
                         }],
@@ -674,7 +595,7 @@ mod tests {
     #[test]
     fn rejects_empty_keys_without_exposing_secret_values() {
         let mut config = valid();
-        config.providers[0].credentials[0].api_key.clear();
+        config.backends[0].credentials[0].api_key.clear();
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("api_key is empty"));
         assert!(!error.contains("deepseek-payg"));
@@ -702,14 +623,14 @@ mod tests {
     #[test]
     fn validates_optional_model_pricing_as_finite_non_negative_usd_rates() {
         let mut config = valid();
-        config.providers[0].models[0].pricing = Some(ModelPricingConfig {
+        config.backends[0].models[0].pricing = Some(ModelPricingConfig {
             cache_hit_input_usd_per_million: 1.0,
             cache_miss_input_usd_per_million: 2.0,
             output_usd_per_million: 3.0,
         });
         config.validate().unwrap();
 
-        config.providers[0].models[0]
+        config.backends[0].models[0]
             .pricing
             .as_mut()
             .unwrap()
@@ -720,71 +641,69 @@ mod tests {
     }
 
     #[test]
-    fn ollama_cloud_models_may_enable_chat_and_responses() {
-        let mut config = valid();
-        config.providers[0].kind = ProviderKind::OllamaCloud;
-        config.providers[0].models[0].endpoint_protocol = None;
-        config.providers[0].models[0].protocols =
-            vec![Protocol::OpenAiChat, Protocol::OpenAiResponses];
-        config.validate().unwrap();
+    fn recognized_but_unimplemented_adapters_are_rejected() {
+        for adapter in [
+            AdapterKind::AliyunBailian,
+            AdapterKind::OllamaCloud,
+            AdapterKind::OpenCodeZen,
+        ] {
+            let mut config = valid();
+            config.backends[0].adapter = adapter;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("recognized but not implemented"),
+                "{adapter:?}"
+            );
+        }
     }
 
     #[test]
     fn kimi_code_declares_chat_and_anthropic_as_official_protocols() {
+        let adapter = adapter_for(AdapterKind::KimiCode).unwrap();
         assert_eq!(
-            ProviderKind::KimiCode.default_endpoint(),
-            Some("https://api.kimi.com/coding/v1")
+            adapter.endpoint_policy(),
+            EndpointPolicy::Official("https://api.kimi.com/coding/v1")
         );
-        assert_eq!(ProviderKind::KimiCode.fixed_protocol(), None);
 
         let mut config = valid();
-        config.providers[0].kind = ProviderKind::KimiCode;
-        config.providers[0].models[0].name = "k3".into();
-        config.providers[0].models[0].endpoint_protocol = None;
-        config.providers[0].models[0].protocols = vec![Protocol::OpenAiChat];
+        config.backends[0].adapter = AdapterKind::KimiCode;
+        config.backends[0].models[0].name = "k3".into();
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
         config.models[0].layers[0].targets[0].model = "k3".into();
         config.validate().unwrap();
 
-        config.providers[0].models[0].protocols =
+        config.backends[0].models[0].protocols =
             vec![Protocol::OpenAiChat, Protocol::AnthropicMessages];
         config.validate().unwrap();
 
-        assert!(!ProviderKind::KimiCode.supports_protocol(Protocol::OpenAiResponses));
+        assert!(!adapter.supports_protocol(Protocol::OpenAiResponses));
     }
 
     #[test]
-    fn startup_discards_unsupported_provider_protocols_before_validation() {
+    fn startup_rejects_unsupported_backend_protocols_instead_of_discarding_them() {
         let mut config = valid();
-        config.providers[0].kind = ProviderKind::KimiCode;
-        config.providers[0].models[0].name = "k3".into();
-        config.providers[0].models[0].endpoint_protocol = None;
-        config.providers[0].models[0].protocols = vec![
+        config.backends[0].adapter = AdapterKind::KimiCode;
+        config.backends[0].models[0].name = "k3".into();
+        config.backends[0].models[0].protocols = vec![
             Protocol::OpenAiChat,
             Protocol::AnthropicMessages,
             Protocol::OpenAiResponses,
         ];
         config.models[0].layers[0].targets[0].model = "k3".into();
 
-        assert_eq!(config.discard_unsupported_provider_protocols(), 1);
-        assert_eq!(
-            config.providers[0].models[0].protocols,
-            vec![Protocol::OpenAiChat, Protocol::AnthropicMessages]
-        );
-        config.validate().unwrap();
-
-        // Re-running startup normalization is idempotent and emits no duplicate warning.
-        assert_eq!(config.discard_unsupported_provider_protocols(), 0);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("unsupported protocol openai-responses"));
+        assert_eq!(config.backends[0].models[0].protocols.len(), 3);
     }
 
     #[test]
     fn validation_keeps_unsupported_protocols_out_of_runtime_state() {
         let mut config = valid();
-        config.providers[0].kind = ProviderKind::KimiCode;
-        config.providers[0].models[0].name = "k3".into();
-        config.providers[0].models[0].endpoint_protocol = None;
-        config.providers[0].models[0].protocols = vec![Protocol::OpenAiChat];
+        config.backends[0].adapter = AdapterKind::KimiCode;
+        config.backends[0].models[0].name = "k3".into();
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
         config.models[0].layers[0].targets[0].model = "k3".into();
-        config.providers[0].models[0]
+        config.backends[0].models[0]
             .protocols
             .push(Protocol::OpenAiResponses);
         let error = config.validate().unwrap_err().to_string();
@@ -795,9 +714,8 @@ mod tests {
     #[test]
     fn deepseek_official_supports_all_three_ingress_protocols() {
         let mut config = valid();
-        config.providers[0].kind = ProviderKind::DeepSeekOfficial;
-        config.providers[0].models[0].endpoint_protocol = None;
-        config.providers[0].models[0].protocols = vec![
+        config.backends[0].adapter = AdapterKind::DeepSeekOfficial;
+        config.backends[0].models[0].protocols = vec![
             Protocol::OpenAiChat,
             Protocol::OpenAiResponses,
             Protocol::AnthropicMessages,
@@ -806,24 +724,145 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_requires_one_model_specific_endpoint_protocol() {
+    fn opencode_go_owns_its_model_to_protocol_catalog() {
         let mut config = valid();
-        config.providers[0].models[0].endpoint_protocol = None;
-        config.providers[0].models[0].protocols = vec![Protocol::OpenAiChat];
+        config.validate().unwrap();
+        config.backends[0].models[0].name = "unknown-go-model".into();
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("protocols is not valid for opencode-go"));
+        assert!(error.contains("not in the current official catalog"));
 
-        config.providers[0].models[0].protocols.clear();
+        config.backends[0].models[0].name = UPSTREAM_MODEL.into();
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("endpoint_protocol is required for opencode-go"));
+        assert!(error.contains("protocols is not configurable"));
     }
 
     #[test]
-    fn multi_protocol_providers_reject_model_specific_endpoint_protocol() {
+    fn removed_endpoint_protocol_field_is_rejected_during_deserialization() {
+        let error = toml::from_str::<BackendModelConfig>(
+            "name = \"model\"\nendpoint_protocol = \"openai-chat\"\nprotocols = [\"openai-chat\"]",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown field `endpoint_protocol`"));
+    }
+
+    #[test]
+    fn official_adapter_endpoint_overrides_are_rejected() {
         let mut config = valid();
-        config.providers[0].kind = ProviderKind::DeepSeekOfficial;
+        config.backends[0].endpoint = Some("https://customer.example/v1".into());
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("endpoint_protocol is only valid for opencode-go"));
+        assert!(error.contains("endpoint is not configurable"));
+        assert!(error.contains("custom-*"));
+    }
+
+    #[test]
+    fn official_endpoint_is_rejected_even_when_it_equals_the_default() {
+        let mut config = valid();
+        config.backends[0].endpoint = Some("https://opencode.ai/zen/go/v1/".into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("endpoint is not configurable"));
+
+        config.backends[0].endpoint = Some("https://customer.example/v1".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn custom_backend_requires_an_absolute_endpoint_and_uses_listed_protocols() {
+        let mut config = valid();
+        config.backends[0].adapter = AdapterKind::CustomChatCompletions;
+        config.backends[0].endpoint = None;
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("endpoint is required for custom adapter"));
+
+        config.backends[0].endpoint = Some("relative/path".into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("absolute HTTP(S) URL"));
+
+        config.backends[0].endpoint = Some("https://customer.example/exact".into());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn unknown_adapter_fails_during_deserialization() {
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            adapter: AdapterKind,
+        }
+
+        let error = toml::from_str::<Wrapper>("adapter = \"not-an-adapter\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown variant"));
+    }
+
+    #[test]
+    fn legacy_provider_configuration_terms_are_rejected() {
+        let backend_error = toml::from_str::<BackendConfig>(
+            r#"
+id = "go"
+kind = "opencode-go"
+credentials = []
+models = []
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(backend_error.contains("unknown field `kind`"));
+
+        let target_error = toml::from_str::<RouteTargetConfig>(
+            r#"
+provider = "go"
+credential = "go-a"
+model = "deepseek-v4-flash"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(target_error.contains("unknown field `provider`"));
+
+        let document_error = toml::from_str::<Config>(
+            r#"
+config_version = 3
+providers = []
+models = []
+[server]
+listen = "127.0.0.1:8080"
+data_dir = "data"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(document_error.contains("unknown field `providers`"));
+    }
+
+    #[test]
+    fn config_load_parse_errors_never_retain_the_source_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quotamux.toml");
+        let secret = "sk-must-never-appear-in-an-error";
+        fs::write(
+            &path,
+            format!(
+                r#"
+config_version = 3
+api_key = "{secret}"
+backends = []
+models = []
+[server]
+listen = "127.0.0.1:8080"
+data_dir = "data"
+"#
+            ),
+        )
+        .unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(!error.to_string().contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
     }
 
     #[test]
@@ -837,10 +876,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_documented_v2_shape() {
+    fn parses_documented_v3_shape() {
         let config: Config = toml::from_str(
             r#"
-config_version = 2
+config_version = 3
 [server]
 listen = "127.0.0.1:8080"
 data_dir = "data"
@@ -850,15 +889,14 @@ max_checkpoints_per_path = 1024
 max_candidates_per_prefix = 4
 max_leases = 2048
 success_ttl_ms = 60000
-[[providers]]
+[[backends]]
 id = "go"
-kind = "opencode-go"
-[[providers.credentials]]
+adapter = "opencode-go"
+[[backends.credentials]]
 id = "go-a"
 api_key = "secret"
-[[providers.models]]
+[[backends.models]]
 name = "deepseek-v4-flash"
-endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 1.0, cache_miss_input_usd_per_million = 2.0, output_usd_per_million = 3.0 }
 [[models]]
 name = "deepseek-v4-flash-0731"
@@ -867,7 +905,7 @@ protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 [[models.layers]]
 name = "plan"
 strategy = "prompt-prefix-affinity"
-targets = [{ provider = "go", credential = "go-a", model = "deepseek-v4-flash" }]
+targets = [{ backend = "go", credential = "go-a", model = "deepseek-v4-flash" }]
 "#,
         )
         .unwrap();
@@ -876,11 +914,7 @@ targets = [{ provider = "go", credential = "go-a", model = "deepseek-v4-flash" }
         assert_eq!(config.affinity.max_checkpoints_per_path, 1024);
         assert_eq!(config.affinity.max_leases, 2048);
         assert_eq!(
-            config.providers[0].models[0].endpoint_protocol,
-            Some(Protocol::OpenAiChat)
-        );
-        assert_eq!(
-            config.providers[0].models[0].pricing,
+            config.backends[0].models[0].pricing,
             Some(ModelPricingConfig {
                 cache_hit_input_usd_per_million: 1.0,
                 cache_miss_input_usd_per_million: 2.0,

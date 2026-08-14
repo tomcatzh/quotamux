@@ -33,7 +33,7 @@ async fn each_configured_kimi_k3_target_streams_successfully() {
             .await
             .expect("real Kimi stream request");
         let status = response.status();
-        let provider = header(&response, "x-relay-provider");
+        let provider = header(&response, "x-relay-backend");
         let upstream_model = header(&response, "x-relay-upstream-model");
         let body = response.text().await.expect("real Kimi stream body");
         assert!(
@@ -46,7 +46,7 @@ async fn each_configured_kimi_k3_target_streams_successfully() {
         );
         eprintln!(
             "REAL_KIMI_STREAM_EVIDENCE {}",
-            json!({"provider":provider,"upstream_model":upstream_model,"status":status.as_u16(),"done":true})
+            json!({"backend":provider,"upstream_model":upstream_model,"status":status.as_u16(),"done":true})
         );
         server.abort();
     }
@@ -71,14 +71,14 @@ async fn mixed_subscription_targets_keep_a_divergent_prefix_on_the_warm_target()
     let common = "QuotaMux Kimi real prefix affinity evidence. ".repeat(180);
 
     let first = send_nonstream(&client, &base_url, &format!("{common}Cold branch.")).await;
-    let warm_provider = header(&first, "x-relay-provider");
+    let warm_provider = header(&first, "x-relay-backend");
     assert_eq!(header(&first, "x-relay-route-layer"), "subscriptions");
     assert_eq!(header(&first, "x-relay-selection-reason"), "random");
     let first_body = first.json::<Value>().await.expect("first real Kimi JSON");
     let first_usage = Usage::from_openai(&first_body);
 
     let second = send_nonstream(&client, &base_url, &format!("{common}Divergent branch.")).await;
-    assert_eq!(header(&second, "x-relay-provider"), warm_provider);
+    assert_eq!(header(&second, "x-relay-backend"), warm_provider);
     assert_eq!(header(&second, "x-relay-route-layer"), "subscriptions");
     assert_eq!(
         header(&second, "x-relay-selection-reason"),
@@ -93,7 +93,7 @@ async fn mixed_subscription_targets_keep_a_divergent_prefix_on_the_warm_target()
     eprintln!(
         "REAL_KIMI_AFFINITY_EVIDENCE {}",
         json!({
-            "provider":warm_provider,
+            "backend":warm_provider,
             "matched_prefix_bytes":matched_prefix_bytes,
             "first_cache_hit_tokens":first_usage.cache_hit_tokens,
             "second_cache_hit_tokens":second_usage.cache_hit_tokens
@@ -128,7 +128,7 @@ async fn each_kimi_k3_target_accepts_more_than_256k_prompt_tokens() {
             .await
             .expect("real Kimi >256K request");
         let status = response.status();
-        let provider = header(&response, "x-relay-provider");
+        let provider = header(&response, "x-relay-backend");
         let upstream_model = header(&response, "x-relay-upstream-model");
         let body = response.text().await.expect("real Kimi >256K body");
         assert!(
@@ -144,7 +144,7 @@ async fn each_kimi_k3_target_accepts_more_than_256k_prompt_tokens() {
         );
         eprintln!(
             "REAL_KIMI_1M_EVIDENCE {}",
-            json!({"provider":provider,"upstream_model":upstream_model,"input_tokens":usage.input_tokens,"status":status.as_u16()})
+            json!({"backend":provider,"upstream_model":upstream_model,"input_tokens":usage.input_tokens,"status":status.as_u16()})
         );
         server.abort();
     }

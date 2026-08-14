@@ -1,8 +1,8 @@
 # QuotaMux routing verification evidence
 
-Date: 2026-08-13 (Asia/Shanghai)
+Date: 2026-08-14 (Asia/Shanghai)
 
-This report records the data produced by the configuration-v2, layered-routing,
+This report records the data produced by the configuration-v3, layered-routing,
 protocol-translation, and memory-only prompt-prefix-affinity test runs. API keys,
 prompt bodies, and model response bodies are excluded.
 
@@ -10,8 +10,10 @@ prompt bodies, and model response bodies are excluded.
 
 | Suite | Result | Concrete coverage |
 | --- | ---: | --- |
-| Library/unit tests | 81 passed, 0 failed | configuration (including official protocol matrices, the singular OpenCode Go per-model endpoint, and warning-and-ignore startup normalization), provider URL/error adapters, model-aware dashboard output, legacy provider-data migration, legacy audit-record compatibility, circuits, streaming hash partitions, prefix branches, namespace isolation, TTL epochs, capacity bounds, concurrent lookup/update/GC, and cold restart |
-| Local gateway end-to-end | 31 passed, 0 failed | all three ingress protocols, native Kimi Anthropic passthrough, mixed tool-result/text ordering, streaming and non-streaming translation, configured provider/model pricing, `system_fingerprint` passthrough, attempts, fallback, random layers, affinity, expiry, single-target bypass, and Kimi's three-provider/two-layer route |
+| Library/unit tests | 114 passed, 0 failed | configuration and protocol matrices, including the complete current OpenCode Go endpoint catalog; backend/adapter naming and persisted-record compatibility; source-free configuration parse errors; provider-specific OpenCode Go, Kimi Code, and Kimi Open Platform errors; bounded retry hints and legacy-deadline clamping; generation-safe concurrent circuits; abandoned and expired half-open leases; collision-free circuit-state migration; bounded and redacted upstream errors; HTTP-200 error envelopes; restart recovery; storage; streaming; affinity; and compatibility |
+| Local gateway end-to-end | 41 passed, 0 failed | the existing protocol/routing matrix plus a dropped half-open streaming probe, eight simultaneous delayed `429` responses counting as one circuit failure, the official Go quota fixture with an extreme `Retry-After` capped to 15 minutes, HTTP-200 error-envelope fallback, provider-aware SSE quota classification before and after response commitment, and generic malformed or semantic stream failures |
+| Real subscription quota probes on isolated `8081` | 2 passed, 0 failed | OpenCode Go five-hour `429`/`GoUsageLimitError`/`limitName`; Kimi Code short-period quota surfaced as documented usage-limit `403`; both classified as `provider_quota` with bounded circuit deadlines |
+| Isolated `8081` exhausted-subscription fallback | passed, 2 logical requests | Go quota to DeepSeek Official for `deepseek-v4-flash`; Kimi Code quota then Go quota then Kimi Official for `kimi-k3`; both final responses were HTTP 200 with `x-relay-fallback-reason: provider_quota` |
 | Real worker probe | 1 passed, 0 failed | OpenCode Go and DeepSeek configured as equivalent targets in one affinity layer |
 | Real DeepSeek V4 Pro probe | 1 passed, 0 failed | exact `deepseek-v4-pro` calls to OpenCode Go and DeepSeek Official; fingerprint presence recorded per provider |
 | Real Kimi K3 acceptance | 3 passed, 0 failed | three direct streams, mixed subscription affinity, and explicitly gated 300,095-input-token requests to all three targets |
@@ -22,6 +24,8 @@ prompt bodies, and model response bodies are excluded.
 | Upstream semantic ownership | passed | high thinking plus named tool choice reached Kimi Code, DeepSeek Official, and OpenCode Go; each selected upstream returned its own HTTP 400 without QuotaMux pre-rejection, fallback, retry, or circuit impact |
 | DeepSeek native protocol matrix | passed, 3 real requests | Chat Completions, Responses, and Anthropic Messages all reached DeepSeek Official without translation and returned HTTP 200 |
 | Production `a4c49b2` promotion | passed | Docker Compose rebuilt and recreated `127.0.0.1:8080`; Kimi/DeepSeek Claude Code and Pi high-reasoning sequential-tool loops passed, health remained OK, restart count stayed 0, and `restart: unless-stopped` remained active |
+| Unmerged provider/circuit candidate on `8080` | passed | Local image `sha256:d5d0a7200de9b51199d72d22fd08a4c89bbe909f3fcfb9f5206c45d3b9e7700a`; complete Chat, Responses, Anthropic, tools, streams, count-tokens, and persistence smoke suites passed for DeepSeek V4 Flash and Kimi K3; forged inbound provider/credential/layer headers still routed Kimi to its configured first layer; the live Go quota circuit had 824,568 ms until its next probe, below the 900,000 ms ceiling; restart count remained 0 |
+| Final config-v3 naming candidate on isolated `8081` | passed | Image `sha256:8bf9160b9dd047738c54bbc8fcd1a123922d105c98def5f0fbfd5c549b755da0`; configuration check and health passed; status and statistics exposed only `backend`/`adapter` and `backends`; the dashboard rendered `Backends`; a synthetic secret-bearing invalid configuration reported `input: None` without echoing its source document |
 | Static and frontend checks | passed | `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `git diff --check`, clean frontend dependency installation, and the Vite production build |
 
 The real-provider test is ignored during ordinary `cargo test` because it needs
@@ -31,6 +35,35 @@ explicitly with:
 ```sh
 cargo test --test real_worker_affinity -- --ignored --nocapture
 ```
+
+The destructive subscription tests were explicitly authorized for this run.
+OpenCode Go completed five cache-cold requests containing 700,570 provider-
+reported input tokens before the next request returned the five-hour limit. A
+direct verification returned HTTP `429`, `GoUsageLimitError`, `limitName =
+"5 hour"`, and a roughly 4-hour-57-minute retry hint; QuotaMux persisted an
+effective 15-minute next-probe interval instead of the raw multi-hour value.
+
+Kimi Code completed 20 cache-cold requests containing 2,802,302 provider-
+reported input tokens before it reached a quota. The direct response used the
+documented HTTP `403` usage-limit wording and an observed structured type of
+`access_terminated_error`. A same-time console screenshot showed the weekly
+allowance at 48% used while the rate-limit detail was 100% with about 22 minutes
+until reset. The evidence therefore identifies a short-period/rolling quota,
+not weekly exhaustion. QuotaMux prioritizes the explicit quota message over the
+misleading structured type.
+
+### Dashboard observations supplied after the destructive probes
+
+| Provider | Screenshot state | Reset countdown shown at capture |
+| --- | --- | ---: |
+| Kimi Code | weekly usage 48%; rate-limit detail 100% | about 22 minutes |
+| OpenCode Go | rolling usage 100%; weekly 71%; monthly 35% | about 4 hours 34 minutes |
+
+These are UI observations for the specific account and screenshot time on
+2026-08-14 (Asia/Shanghai). They corroborate that each immediate failure came
+from a shorter window while the broader allowance remained. They are not a
+fixed reset schedule, an HTTP-header observation, or a service guarantee for
+other accounts.
 
 ## Captured routing data
 
@@ -54,11 +87,11 @@ cargo test --test real_worker_affinity -- --ignored --nocapture
 
 ## Model-specific endpoint and client compatibility evidence
 
-OpenCode Go now uses one `endpoint_protocol` per configured model. The current
-Kimi K3 and DeepSeek V4 models declare `openai-chat`; provider kinds whose exact
+OpenCode Go now uses a registered model-to-protocol catalog. The current Kimi K3
+and DeepSeek V4 models resolve to `openai-chat`; adapters whose exact
 models expose several official API families continue to use `protocols`. The
-private configuration, documented example, runtime client construction, and
-real-test target discovery all use this distinction.
+private configuration, documented example, validation, runtime client
+construction, and tests all use this distinction.
 
 Claude Code's Anthropic-to-Chat conversion preserves assistant thinking as
 `reasoning_content`, maps every `tool_use` ID to the matching function
@@ -98,7 +131,7 @@ prefix and different suffixes.
 
 ```json
 {
-  "provider": "opencode-go",
+  "backend": "opencode-go",
   "matched_prefix_bytes": 5376,
   "first_cache_hit_tokens": 0,
   "first_cache_miss_tokens": 1351,
@@ -134,9 +167,11 @@ three private targets in the local ignored configuration:
 | Kimi Code Allegretto | `k3` | HTTP 200 and `[DONE]` | HTTP 200, 300,095 input tokens |
 | Kimi China Open Platform | `kimi-k3` | HTTP 200 and `[DONE]` | HTTP 200, 300,095 input tokens |
 
-The large-input test is gated behind `QUOTAMUX_CONFIRM_1M=1`. Every provider
-reported more than 256K input tokens, so these results exercise the requested
-1M-capable routes rather than merely relying on the configured model names.
+The large-input test is gated behind `QUOTAMUX_CONFIRM_1M=1`. At the time of the
+test, every credential accepted a request with 300,095 provider-reported input
+tokens. This is evidence for those specific credentials at that time; it does
+not establish future entitlement or any weekly, monthly, or rolling-window
+quota state.
 
 The standalone mixed-subscription affinity test returned the divergent request
 to OpenCode Go with an 8,064-byte matched prefix. That response did not report
@@ -160,7 +195,7 @@ QuotaMux recorded the two streaming turns as follows:
 | Tool result/final answer | `prompt-prefix-affinity` | 47,616 bytes | 53,175 | 52,992 | 30 | 1 |
 
 Both turns had ingress `openai-responses`, egress `openai-chat`,
-`translated = true`, provider `kimi-code`, credential
+`translated = true`, backend `kimi-code`, credential
 `kimi-code-allegretto`, upstream model `k3`, layer `subscriptions`, HTTP 200,
 and provider-reported usage. Codex independently summarized 106,223 input
 tokens, 54,784 cached input tokens, 82 output tokens, and 2 reasoning tokens;
@@ -178,5 +213,5 @@ Function tools such as the local shell remain available and translated.
   process memory and start empty after restart.
 - Existing request/attempt records retain only routing metadata and usage; they
   do not contain prompts or affinity fingerprints.
-- The real probe prints only provider ID, checkpoint length, and aggregate token
+- The real probe prints only backend ID, checkpoint length, and aggregate token
   counts. It does not print credentials, endpoints, prompts, or responses.

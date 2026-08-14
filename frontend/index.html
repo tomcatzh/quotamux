@@ -22,8 +22,8 @@
         <div class="page-heading"><div><p class="eyebrow">Gateway</p><h1>Overview</h1></div></div>
         <section class="grid" id="summary-cards" aria-label="Request totals"></section>
         <section>
-          <div class="section-heading"><h2>Providers</h2></div>
-          <div class="scroll"><table><caption>Provider attempt totals</caption><thead><tr><th scope="col">Provider</th><th scope="col">Served models</th><th scope="col">Upstream models</th><th scope="col" class="numeric">Attempts</th><th scope="col" class="numeric">Success</th><th scope="col" class="numeric">Errors</th><th scope="col" class="numeric">Cache hit</th><th scope="col" class="numeric">Cost estimate</th></tr></thead><tbody id="provider-rows"></tbody></table></div>
+          <div class="section-heading"><h2>Backends</h2></div>
+          <div class="scroll"><table><caption>Backend attempt totals</caption><thead><tr><th scope="col">Backend</th><th scope="col">Served models</th><th scope="col">Upstream models</th><th scope="col" class="numeric">Attempts</th><th scope="col" class="numeric">Success</th><th scope="col" class="numeric">Errors</th><th scope="col" class="numeric">Cache hit</th><th scope="col" class="numeric">Cost estimate</th></tr></thead><tbody id="backend-rows"></tbody></table></div>
         </section>
         <section>
           <div class="section-heading">
@@ -38,7 +38,7 @@
         </section>
         <section>
           <div class="section-heading"><h2>Active alerts</h2></div>
-          <div class="scroll"><table><caption>Active target alerts</caption><thead><tr><th scope="col">Provider</th><th scope="col">Key</th><th scope="col">Class</th><th scope="col">Last seen</th><th scope="col">Next probe</th></tr></thead><tbody id="alert-rows"></tbody></table></div>
+          <div class="scroll"><table><caption>Active target alerts</caption><thead><tr><th scope="col">Backend</th><th scope="col">Key</th><th scope="col">Class</th><th scope="col">Last seen</th><th scope="col">Next probe</th></tr></thead><tbody id="alert-rows"></tbody></table></div>
         </section>
       </div>
       <div id="routing-view" hidden>
@@ -51,7 +51,7 @@
           </div>
         </div>
         <div id="structure-panel" role="tabpanel">
-          <div class="scroll"><table><caption>Configured routing layers and targets</caption><thead><tr><th scope="col">Layer</th><th scope="col">Strategy</th><th scope="col">Provider</th><th scope="col">Key</th><th scope="col">Upstream model</th><th scope="col">Circuit</th><th scope="col">Reason</th><th scope="col">Next probe</th></tr></thead><tbody id="structure-rows"></tbody></table></div>
+          <div class="scroll"><table><caption>Configured routing layers and targets</caption><thead><tr><th scope="col">Layer</th><th scope="col">Strategy</th><th scope="col">Backend</th><th scope="col">Key</th><th scope="col">Upstream model</th><th scope="col">Circuit</th><th scope="col">Reason</th><th scope="col">Next probe</th></tr></thead><tbody id="structure-rows"></tbody></table></div>
         </div>
         <div id="statistics-panel" role="tabpanel" hidden>
           <div class="toolbar">
@@ -59,7 +59,7 @@
             <div class="segments" id="metric-control" aria-label="Statistics metric"></div>
           </div>
           <div class="section-heading"><h2 id="stats-period">Statistics</h2><div class="stats-total"><span class="label">Model total</span><span class="value" id="stats-total">—</span></div></div>
-          <div class="scroll"><table><caption>Request totals by routing target</caption><thead><tr><th scope="col">Entry</th><th scope="col">Layer</th><th scope="col">Provider</th><th scope="col">Key</th><th scope="col">Upstream model</th><th scope="col" class="numeric" id="metric-heading">Calls</th></tr></thead><tbody id="statistics-rows"></tbody></table></div>
+          <div class="scroll"><table><caption>Request totals by routing target</caption><thead><tr><th scope="col">Entry</th><th scope="col">Layer</th><th scope="col">Backend</th><th scope="col">Key</th><th scope="col">Upstream model</th><th scope="col" class="numeric" id="metric-heading">Calls</th></tr></thead><tbody id="statistics-rows"></tbody></table></div>
         </div>
       </div>
     </main>

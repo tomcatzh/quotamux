@@ -40,7 +40,7 @@ mod tests {
             "Served model",
             "Layer",
             "Strategy",
-            "Provider",
+            "Backend",
             "Key",
             "Upstream model",
             "Circuit",

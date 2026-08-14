@@ -1,6 +1,6 @@
-# QuotaMux configuration and routing architecture v2
+# QuotaMux configuration and routing architecture v3
 
-Status: layered routing and affinity implemented; provider expansion partially scaffolded
+Status: layered routing and affinity implemented; adapter expansion partially scaffolded
 
 This document records the product decisions for the first general-purpose
 QuotaMux configuration and routing system. It replaces the version-one
@@ -11,54 +11,65 @@ one DeepSeek credential is the fallback.
 
 QuotaMux separates configuration into three layers:
 
-1. Provider definitions describe real upstream services, credentials, and the
-   exact upstream model identifiers enabled on each service.
+1. Backend definitions describe configured upstream instances, their adapters,
+   credentials, and exact enabled model identifiers.
 2. Served models define the model names exposed by QuotaMux and the ingress
    protocols that clients may use.
-3. Route layers connect served models to provider credentials. Layers are
+3. Route layers connect served models to backend credentials. Layers are
    ordered from the preferred/free/plan capacity to progressively more
    expensive PAYG capacity.
 
-Provider choice remains private. A client chooses a served model and an ingress
-protocol, never a provider, credential, route layer, or upstream model.
+Backend choice remains private. A client chooses a served model and an ingress
+protocol, never a backend, adapter, credential, route layer, or upstream model.
 
 ## Terminology and identities
 
-- `provider`: a configured upstream service such as DeepSeek Official,
-  Kimi Official, Kimi Code, Alibaba Cloud Model Studio, Ollama Cloud,
-  OpenCode Zen, OpenCode Go, or a custom compatible endpoint.
-- `credential`: one independently routable API key within a provider. Two keys
-  of the same provider are two routing workers and may be separate cache
+- `provider`: the external company or service, used only as descriptive prose
+  (for example DeepSeek, Kimi, or OpenCode), not as a configuration identity.
+- `adapter`: QuotaMux code that owns one known API's endpoint policy, protocol
+  contract, URL construction, authentication, and error classification.
+- `backend`: one user-defined upstream instance. It has a stable `id`, selects
+  exactly one `adapter`, and enables credentials and exact upstream models.
+- `credential`: one independently routable API key within a backend. Two keys
+  on the same backend are two routing workers and may be separate cache
   domains.
-- `upstream model`: the provider's exact model ID. QuotaMux does not invent or
+- `upstream model`: the backend API's exact model ID. QuotaMux does not invent or
   normalize this value.
-- `target`: `(provider, credential, upstream model)`.
+- `target`: `(backend, credential, upstream model)`.
 - `route layer`: a non-empty set of equivalent targets at the same priority and
   price/capacity class.
 - `served model`: a QuotaMux-owned public name and its ordered route layers.
 - `cache domain`: the smallest upstream scope known to share prompt/KV cache.
-  Initially this is conservatively derived from provider, credential, endpoint,
-  upstream model, and protocol. A provider-specific adapter may later declare a
+  Initially this is conservatively derived from adapter, backend, credential,
+  resolved endpoint, upstream model, and protocol. An adapter may later declare a
   wider safe sharing scope.
 
-The distinction between provider and credential is deliberate: one provider
-type can have multiple keys, and every key must be independently selectable,
-observable, circuit-broken, and affinity-routed.
+The distinction between adapter, backend, and credential is deliberate: one
+adapter can serve multiple configured backends, one backend can have multiple
+keys, and every key must be independently selectable, observable,
+circuit-broken, and affinity-routed.
 
-## Provider layer
+Version 3 is a deliberate hard configuration boundary: `[[providers]]` became
+`[[backends]]`, backend `kind` became `adapter`, and route-target `provider`
+became `backend`. Old configuration terms are rejected rather than accepted as
+aliases. Persisted runtime records accept the former `provider` and
+`provider_kind` names on read and serialize the canonical `backend` and
+`adapter` names on subsequent writes.
 
-Every provider has a stable user-defined `id`, a provider `kind`, one or more
+## Backend and adapter layer
+
+Every backend has a stable user-defined `id`, an `adapter`, one or more
 credentials, and an explicit list of enabled models. The enabled model name is
-always the provider's standard API identifier.
+always the selected upstream API's standard identifier.
 
-The production-accepted provider adapters are currently `deepseek-official`,
-`opencode-go`, `kimi-code`, and `kimi-official`. Both Kimi adapters have
+The production-accepted official adapters are currently
+`deepseek-official`, `opencode-go`, `kimi-code`, and `kimi-official`. Both Kimi adapters have
 provider-specific URL, model identity, error, mock end-to-end, real streaming,
 and 300,095-input-token acceptance. Kimi Code supports both native OpenAI Chat
 and Anthropic Messages, so Claude Code traffic stays native whenever that
 target is selected; it also completed a live two-turn Codex
-Responses-to-Chat reasoning/tool loop. Official base endpoints may be omitted,
-and endpoint overrides remain possible for local and integration tests.
+Responses-to-Chat reasoning/tool loop. Official base endpoints belong to the
+adapter and must not appear in customer configuration.
 
 DeepSeek Official supports native OpenAI Chat Completions, OpenAI Responses,
 and Anthropic Messages. Those three protocols are enabled explicitly so an
@@ -66,27 +77,30 @@ ingress request stays byte-shape-compatible with the official upstream whenever
 DeepSeek is selected; translation is reserved for fallback targets that do not
 offer the ingress protocol.
 
-The configuration enum also reserves `aliyun-bailian`, `ollama-cloud`,
-`opencode-zen`, `custom-chat-completions`, `custom-responses`, and
-`custom-anthropic`. These entries currently provide schema/default-endpoint
-scaffolding only. They are not supported provider adapters until they have
-provider-specific authentication, URL, stream, error, mock end-to-end, and
-(where applicable) real credential tests.
+Three generic adapters, `custom-chat-completions`, `custom-responses`, and
+`custom-anthropic`, require a complete exact endpoint and deliberately use only
+generic protocol authentication and HTTP error classification. Endpoint text
+never selects an adapter or activates official-provider behavior.
 
-Each enabled model records the provider protocol contract that actually serves
-it. Official providers whose exact model exposes several API families use a
+The enum retains `aliyun-bailian`, `ollama-cloud`, and `opencode-zen` only so
+old persisted records remain readable. The runtime registry has no adapters for
+them, so configuration validation rejects them. Unknown enum strings fail while
+parsing.
+
+Each enabled model records the backend protocol contract that actually serves
+it. Official adapters whose exact model exposes several API families use a
 `protocols` list. OpenCode Go documents exactly one endpoint family for each
-model, so its entries instead require one `endpoint_protocol`. This prevents a
-provider-wide capability list from implying that one Go model accepts every Go
-endpoint family. Validation becomes provider-specific as each reserved adapter
-is implemented.
+model, so its registered adapter owns a strict model-to-protocol catalog and Go
+configuration contains only the exact model ID. Unknown IDs, the removed
+`endpoint_protocol` field, and customer-supplied Go `protocols` fail validation.
+Validation becomes adapter-specific as each reserved adapter is implemented.
 
-An enabled provider model may also declare three USD-per-million-token pricing
+An enabled backend model may also declare three USD-per-million-token pricing
 rates: cache-hit input, cache-miss input, and output. Cost calculation is
 model-agnostic and runs only when both pricing and provider-reported usage are
 available. The binary contains no provider or model prices. This keeps price
 changes local to configuration and allows the same upstream model to have
-different prices on different providers.
+different prices on different backends.
 
 These official references define the external identities used by the adapters:
 
@@ -94,7 +108,7 @@ These official references define the external identities used by the adapters:
   `deepseek-v4-flash` and `deepseek-v4-pro`:
   <https://api-docs.deepseek.com/api/list-models>
 - OpenCode Go publishes a model-by-model endpoint table and `/models` endpoint:
-  <https://opencode.ai/docs/go>
+  <https://dev.opencode.ai/docs/go/>
 - OpenCode Zen likewise mixes Responses, Anthropic, and Chat Completions models:
   <https://opencode.ai/docs/zen>
 - Kimi's China Open Platform uses the exact `kimi-k3` model ID, a 1M context
@@ -123,7 +137,7 @@ A served model defines:
 
 Ordinary names should describe the actual model family. An alias that
 impersonates another model is supported, but it must be explicit in
-configuration rather than silently introduced by provider mapping.
+configuration rather than silently introduced by adapter mapping.
 
 Supported public ingress protocols are:
 
@@ -131,21 +145,49 @@ Supported public ingress protocols are:
 - `openai-responses`: `POST /v1/responses`
 - `anthropic-messages`: `POST /v1/messages`
 
-QuotaMux owns protocol equivalence. A provider's egress protocol must not limit
-which configured ingress protocols a served model can expose. Requests and
-responses pass through a canonical representation, with adapters on both sides:
+QuotaMux owns protocol equivalence. A backend's egress protocol must not limit
+which configured ingress protocols a served model can expose. Native requests
+are forwarded directly after model rewriting. Cross-protocol requests and
+responses pass through protocol translators:
 
 ```text
-client protocol -> canonical request -> provider protocol
-provider protocol -> canonical response/stream -> client protocol
+client protocol -> canonical request -> backend protocol
+backend protocol -> canonical response/stream -> client protocol
 ```
 
-The canonical boundary must preserve message roles, tool definitions, tool
-calls/results, reasoning/thinking content, JSON response intent, stop controls,
-stream termination, usage, cache token evidence, and provider errors whenever
-the source and destination protocols have an equivalent representation.
-Unsupported lossy features must fail validation before an upstream request;
-they must never be silently dropped.
+The translation boundary maps only fields whose meaning and wire shape are
+documented on both sides: text messages, ordinary function definitions and
+calls/results, supported reasoning-effort values, compatible JSON-output
+formats, stream termination, usage, cache-token evidence, and provider errors.
+Unknown extensions and source-only structures are omitted. They are never
+copied under a guessed field name, flattened across namespaces, or serialized
+into prompt text.
+
+Provider-owned opaque state is not synthesized. In particular, translated Chat
+reasoning is not emitted as an Anthropic `thinking` block because QuotaMux
+cannot produce Anthropic's verifiable signature. Real Anthropic thinking and
+redacted-thinking blocks remain transparent only on the native Anthropic path.
+
+## Inbound control surface
+
+The request body `model` field selects the server-configured route graph.
+Protocol-defined prompt fields may reorder equivalent targets inside a
+prompt-affinity layer, and `stream` selects response transport, but neither can
+choose a backend, adapter, credential, or route layer. No client field or header has
+that authority.
+
+- `provider`, `credential`, `route_layer`, `X-Provider`, and inbound
+  `X-Relay-*` metadata are not inspected. A native request body remains
+  transparent to its upstream; a protocol translation ignores unknown fields.
+- `X-Relay-Include-Metadata: 1` opts into QuotaMux response diagnostics. The
+  returned `X-Relay-*` headers are output metadata, not inputs to routing.
+- `anthropic-version` and `anthropic-beta` are Anthropic protocol headers. They
+  are forwarded only when the selected egress protocol is Anthropic Messages.
+- `X-Claude-Code-Session-Id`, `X-Claude-Code-Agent-Id`, and
+  `X-Claude-Code-Parent-Agent-Id` are bounded correlation metadata recorded for
+  observability; they never affect selection or circuit state.
+- Client authentication headers are never used to choose an upstream and are
+  replaced by the credential named in the configured route target.
 
 ## Route-layer semantics
 
@@ -155,8 +197,8 @@ Route layers are evaluated in configuration order. Typical configuration uses:
 2. a PAYG layer;
 3. optional additional PAYG layers with increasing price or capacity.
 
-A layer may contain different providers and multiple credentials of the same
-provider. All targets in a layer are declared semantically equivalent for the
+A layer may contain different backends and multiple credentials of the same
+backend. All targets in a layer are declared semantically equivalent for the
 served model. QuotaMux is therefore allowed to select any healthy target in the
 layer.
 
@@ -175,7 +217,7 @@ the same health and fallback semantics:
 7. A client/request validation error never falls back. Once a streaming
    response is semantically committed to the client, it never switches target.
 8. Per-target circuit state survives restarts and prevents a failed credential
-   from disabling sibling credentials or the whole provider type.
+   from disabling sibling credentials or the whole backend instance.
 
 `prompt-prefix-affinity` starts from the same randomized order, then promotes
 the eligible cache domain with the longest currently warm canonical prefix.
@@ -184,7 +226,7 @@ When no prefix matches, it is exactly the normal random policy.
 ## TOML shape
 
 ```toml
-config_version = 2
+config_version = 3
 
 [server]
 listen = "0.0.0.0:8080"
@@ -197,32 +239,31 @@ max_candidates_per_prefix = 8
 max_leases = 16384
 success_ttl_ms = 300000
 
-[[providers]]
+[[backends]]
 id = "go"
-kind = "opencode-go"
+adapter = "opencode-go"
 
-[[providers.credentials]]
+[[backends.credentials]]
 id = "go-plan-a"
 api_key = "..."
 
-[[providers.credentials]]
+[[backends.credentials]]
 id = "go-plan-b"
 api_key = "..."
 
-[[providers.models]]
+[[backends.models]]
 name = "deepseek-v4-flash"
-endpoint_protocol = "openai-chat"
 pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
-[[providers]]
+[[backends]]
 id = "deepseek"
-kind = "deepseek-official"
+adapter = "deepseek-official"
 
-[[providers.credentials]]
+[[backends.credentials]]
 id = "deepseek-payg"
 api_key = "..."
 
-[[providers.models]]
+[[backends.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
@@ -236,15 +277,15 @@ protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 name = "plan"
 strategy = "random"
 targets = [
-  { provider = "go", credential = "go-plan-a", model = "deepseek-v4-flash" },
-  { provider = "go", credential = "go-plan-b", model = "deepseek-v4-flash" },
+  { backend = "go", credential = "go-plan-a", model = "deepseek-v4-flash" },
+  { backend = "go", credential = "go-plan-b", model = "deepseek-v4-flash" },
 ]
 
 [[models.layers]]
 name = "payg"
 strategy = "random"
 targets = [
-  { provider = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
+  { backend = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
 ]
 ```
 
@@ -253,15 +294,17 @@ targets = [
 Startup fails with a path-specific error when any invariant is violated:
 
 - `config_version` is unsupported;
-- provider, credential, served-model, alias, or layer IDs are empty or
+- backend, credential, served-model, alias, or layer IDs are empty or
   duplicated in their scope;
-- a provider has no credentials or no enabled models;
+- a backend has no credentials or no enabled models;
 - an API key is empty;
-- a custom/region-specific provider has no absolute HTTP(S) endpoint;
+- an official-adapter backend attempts to configure an endpoint;
+- a custom-adapter backend has no absolute HTTP(S) endpoint;
+- an adapter name is unknown or has no registered implementation;
 - an enabled model name is empty or its upstream protocol is unsupported;
 - a served model exposes no ingress protocols or has no route layers;
 - a layer is empty or uses an unknown strategy;
-- a target references a missing provider, credential, or enabled upstream
+- a target references a missing backend, credential, or enabled upstream
   model;
 - one public model name/alias resolves to more than one served model;
 - a target cannot be adapted to every ingress protocol exposed by its served
@@ -277,7 +320,7 @@ Request, attempt, alert, status, and statistics records must identify:
 
 - served model;
 - route layer name and index;
-- provider ID and kind;
+- backend ID and adapter;
 - credential ID;
 - upstream model;
 - ingress and egress protocol;
@@ -301,8 +344,8 @@ real-provider results are in [test-evidence.md](test-evidence.md).
 
 ### Phase 2: three-layer runtime with random selection
 
-- Parse and validate version-two configuration.
-- Build provider clients and per-target circuits from provider/credential/model
+- Parse and validate version-three configuration.
+- Build backend clients and per-target circuits from backend/credential/model
   identities.
 - Resolve public models dynamically in `/v1/models` and request validation.
 - Select one target without RNG overhead; randomize two or more targets.
@@ -315,14 +358,14 @@ Evidence required:
 
 - unit tests for all validation invariants and route-order behavior;
 - deterministic selector tests using an injected RNG/seed;
-- end-to-end mock-provider tests proving same-layer distribution, same-layer
+- end-to-end mock-backend tests proving same-layer distribution, same-layer
   retry, later-layer fallback, no retry after stream commit, model rewriting,
   protocol conversion, metadata, attempts, and secret redaction;
 - captured counts and concrete request/attempt records, not only exit status.
 
 ### Phase 3: prompt-prefix affinity
 
-- Implement as a library independent of HTTP/provider code.
+- Implement as a library independent of HTTP/backend transport code.
 - Keep the online lookup/index in memory.
 - Keep affinity metadata memory-only; a restart intentionally starts cold.
 - Bypass hashing/index lookup for a layer with one eligible target.
@@ -343,7 +386,7 @@ Evidence required:
 ## Non-goals for the first implementation
 
 - provider discovery that silently enables every upstream model;
-- client-directed provider or credential selection;
+- client-directed backend, adapter, or credential selection;
 - cross-router distributed affinity state;
 - correctness that depends on cache-directory freshness;
 - pricing-aware scoring within a layer;

@@ -29,9 +29,9 @@ short-prefix index entry needed by another branch is not.
 
 ## Canonical input
 
-Affinity hashes the exact effective request representation sent to the provider,
-not arbitrary raw client JSON. The representation is deterministic and
-length-delimited. It includes all cache-relevant values:
+Affinity hashes a protocol-defined projection of the effective request sent to
+the provider, not arbitrary raw client JSON. The representation is
+deterministic and length-delimited. It includes all cache-relevant values:
 
 - tenant/cache-sharing namespace;
 - provider model and revision/template namespace;
@@ -39,7 +39,11 @@ length-delimited. It includes all cache-relevant values:
 - system/developer instructions;
 - tool definitions, tool calls, and tool results;
 - multimodal object/content digests;
-- every option that changes the provider's effective prompt.
+- documented options that change the provider's effective prompt.
+
+Transport fields, model rewrites, observability controls, and unknown fields
+are excluded. In particular, selector-shaped fields such as `provider`,
+`credential`, and `route_layer` cannot perturb affinity routing.
 
 Whitespace, Unicode, and tool JSON are not normalized unless the outbound
 provider adapter performs the identical normalization. Hashing token IDs is
@@ -55,7 +59,7 @@ rather than storing every character prefix. A new random key is generated for
 each QuotaMux process because the affinity directory itself is memory-only.
 
 The current runtime places checkpoints at a fixed interval over canonical
-provider-request bytes. Message roles, content, tools, and schemas remain
+protocol prompt bytes. Message roles, content, tools, and schemas remain
 distinct because they are preserved in that deterministic representation and
 its namespace. The interval is configurable. A checkpoint key contains the
 namespace, checkpoint ordinal/length, and 128-bit fingerprint. Length is part

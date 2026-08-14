@@ -1,10 +1,12 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
     net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -14,12 +16,13 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use quotamux::{
     AppState, Config,
     app::build_app,
     config::{
-        CredentialConfig, LOGICAL_MODEL, ModelPricingConfig, ProviderConfig, ProviderKind,
-        ProviderModelConfig, RouteLayerConfig, RouteStrategy, RouteTargetConfig, ServedModelConfig,
+        AdapterKind, BackendConfig, BackendModelConfig, CredentialConfig, LOGICAL_MODEL,
+        ModelPricingConfig, RouteLayerConfig, RouteStrategy, RouteTargetConfig, ServedModelConfig,
         ServerConfig, UPSTREAM_MODEL,
     },
     types::Protocol,
@@ -31,12 +34,14 @@ use tokio::{sync::Mutex, task::JoinHandle};
 enum MockBody {
     Json(Value),
     Raw(String),
+    HangingSse(String),
 }
 
 struct MockReply {
     status: StatusCode,
     body: MockBody,
     headers: Vec<(String, String)>,
+    delay: Option<Duration>,
 }
 
 impl MockReply {
@@ -45,6 +50,7 @@ impl MockReply {
             status,
             body: MockBody::Json(body),
             headers: Vec::new(),
+            delay: None,
         }
     }
 
@@ -53,7 +59,22 @@ impl MockReply {
             status: StatusCode::OK,
             body: MockBody::Raw(body.into()),
             headers: vec![(CONTENT_TYPE.as_str().into(), "text/event-stream".into())],
+            delay: None,
         }
+    }
+
+    fn hanging_sse(body: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::OK,
+            body: MockBody::HangingSse(body.into()),
+            headers: vec![(CONTENT_TYPE.as_str().into(), "text/event-stream".into())],
+            delay: None,
+        }
+    }
+
+    fn delayed(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
+        self
     }
 
     fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
@@ -65,6 +86,13 @@ impl MockReply {
         let mut response = match self.body {
             MockBody::Json(value) => Json(value).into_response(),
             MockBody::Raw(body) => Response::new(Body::from(body)),
+            MockBody::HangingSse(body) => {
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(body));
+                    std::future::pending::<()>().await;
+                };
+                Response::new(Body::from_stream(stream))
+            }
         };
         *response.status_mut() = self.status;
         for (name, value) in self.headers {
@@ -101,6 +129,9 @@ async fn mock_provider_handler(
             json!({"error":{"message":"unexpected mock provider call"}}),
         )
     });
+    if let Some(delay) = reply.delay {
+        tokio::time::sleep(delay).await;
+    }
     reply.into_response()
 }
 
@@ -172,39 +203,37 @@ struct Gateway {
 impl Gateway {
     async fn start(primary: &MockProvider, fallback: &MockProvider) -> Self {
         let config = Config {
-            config_version: 2,
+            config_version: 3,
             server: ServerConfig {
                 listen: "127.0.0.1:0".into(),
                 data_dir: "unused-test-data".into(),
             },
             affinity: Default::default(),
-            providers: vec![
-                ProviderConfig {
+            backends: vec![
+                BackendConfig {
                     id: "opencode-go".into(),
-                    kind: ProviderKind::OpenCodeGo,
+                    adapter: AdapterKind::OpenCodeGo,
                     endpoint: Some(primary.endpoint()),
                     credentials: vec![CredentialConfig {
                         id: "go-plan".into(),
                         api_key: "test-opencode-key".into(),
                     }],
-                    models: vec![ProviderModelConfig {
+                    models: vec![BackendModelConfig {
                         name: UPSTREAM_MODEL.into(),
-                        endpoint_protocol: Some(Protocol::OpenAiChat),
                         protocols: Vec::new(),
                         pricing: None,
                     }],
                 },
-                ProviderConfig {
+                BackendConfig {
                     id: "deepseek".into(),
-                    kind: ProviderKind::DeepSeekOfficial,
+                    adapter: AdapterKind::DeepSeekOfficial,
                     endpoint: Some(fallback.endpoint()),
                     credentials: vec![CredentialConfig {
                         id: "deepseek-payg".into(),
                         api_key: "test-deepseek-key".into(),
                     }],
-                    models: vec![ProviderModelConfig {
+                    models: vec![BackendModelConfig {
                         name: UPSTREAM_MODEL.into(),
-                        endpoint_protocol: None,
                         protocols: vec![
                             Protocol::OpenAiChat,
                             Protocol::OpenAiResponses,
@@ -227,7 +256,7 @@ impl Gateway {
                         name: "plan".into(),
                         strategy: RouteStrategy::Random,
                         targets: vec![RouteTargetConfig {
-                            provider: "opencode-go".into(),
+                            backend: "opencode-go".into(),
                             credential: "go-plan".into(),
                             model: UPSTREAM_MODEL.into(),
                         }],
@@ -236,7 +265,7 @@ impl Gateway {
                         name: "payg".into(),
                         strategy: RouteStrategy::Random,
                         targets: vec![RouteTargetConfig {
-                            provider: "deepseek".into(),
+                            backend: "deepseek".into(),
                             credential: "deepseek-payg".into(),
                             model: UPSTREAM_MODEL.into(),
                         }],
@@ -248,10 +277,23 @@ impl Gateway {
     }
 
     async fn start_config(mut config: Config, seed: u64) -> Self {
+        let mut endpoint_overrides = HashMap::new();
+        for backend in &mut config.backends {
+            if matches!(
+                backend.adapter,
+                AdapterKind::DeepSeekOfficial
+                    | AdapterKind::KimiOfficial
+                    | AdapterKind::KimiCode
+                    | AdapterKind::OpenCodeGo
+            ) && let Some(endpoint) = backend.endpoint.take()
+            {
+                endpoint_overrides.insert(backend.id.clone(), endpoint);
+            }
+        }
         let data_dir = tempfile::tempdir().expect("create gateway data directory");
         config.server.data_dir = data_dir.path().to_path_buf();
         let state = Arc::new(
-            AppState::new_with_random_seed(config, seed)
+            AppState::new_with_random_seed_and_test_endpoints(config, seed, endpoint_overrides)
                 .await
                 .expect("create gateway state"),
         );
@@ -319,55 +361,59 @@ fn chat_request_with_content(content: &str) -> Value {
     })
 }
 
-fn test_provider(id: &str, credential: &str, upstream: &MockProvider) -> ProviderConfig {
-    test_provider_kind(
+fn test_backend(id: &str, credential: &str, upstream: &MockProvider) -> BackendConfig {
+    test_backend_adapter(
         id,
         credential,
         upstream,
-        ProviderKind::OpenCodeGo,
+        AdapterKind::OpenCodeGo,
         Protocol::OpenAiChat,
     )
 }
 
-fn test_provider_protocol(
+fn test_backend_protocol(
     id: &str,
     credential: &str,
     upstream: &MockProvider,
     protocol: Protocol,
-) -> ProviderConfig {
-    test_provider_kind(id, credential, upstream, ProviderKind::OpenCodeGo, protocol)
+) -> BackendConfig {
+    let kind = match protocol {
+        Protocol::OpenAiChat => AdapterKind::CustomChatCompletions,
+        Protocol::OpenAiResponses => AdapterKind::CustomResponses,
+        Protocol::AnthropicMessages => AdapterKind::CustomAnthropic,
+    };
+    test_backend_adapter(id, credential, upstream, kind, protocol)
 }
 
-fn test_provider_kind(
+fn test_backend_adapter(
     id: &str,
     credential: &str,
     upstream: &MockProvider,
-    kind: ProviderKind,
+    kind: AdapterKind,
     protocol: Protocol,
-) -> ProviderConfig {
-    test_provider_kind_model(id, credential, upstream, kind, protocol, UPSTREAM_MODEL)
+) -> BackendConfig {
+    test_backend_adapter_model(id, credential, upstream, kind, protocol, UPSTREAM_MODEL)
 }
 
-fn test_provider_kind_model(
+fn test_backend_adapter_model(
     id: &str,
     credential: &str,
     upstream: &MockProvider,
-    kind: ProviderKind,
+    kind: AdapterKind,
     protocol: Protocol,
     model: &str,
-) -> ProviderConfig {
-    ProviderConfig {
+) -> BackendConfig {
+    BackendConfig {
         id: id.into(),
-        kind,
+        adapter: kind,
         endpoint: Some(upstream.endpoint()),
         credentials: vec![CredentialConfig {
             id: credential.into(),
             api_key: format!("test-key-{credential}"),
         }],
-        models: vec![ProviderModelConfig {
+        models: vec![BackendModelConfig {
             name: model.into(),
-            endpoint_protocol: (kind == ProviderKind::OpenCodeGo).then_some(protocol),
-            protocols: if kind == ProviderKind::OpenCodeGo {
+            protocols: if kind == AdapterKind::OpenCodeGo {
                 Vec::new()
             } else {
                 vec![protocol]
@@ -377,30 +423,30 @@ fn test_provider_kind_model(
     }
 }
 
-fn target(provider: &str, credential: &str) -> RouteTargetConfig {
-    target_model(provider, credential, UPSTREAM_MODEL)
+fn target(backend: &str, credential: &str) -> RouteTargetConfig {
+    target_model(backend, credential, UPSTREAM_MODEL)
 }
 
-fn target_model(provider: &str, credential: &str, model: &str) -> RouteTargetConfig {
+fn target_model(backend: &str, credential: &str, model: &str) -> RouteTargetConfig {
     RouteTargetConfig {
-        provider: provider.into(),
+        backend: backend.into(),
         credential: credential.into(),
         model: model.into(),
     }
 }
 
 fn test_config(
-    providers: Vec<ProviderConfig>,
+    backends: Vec<BackendConfig>,
     layers: Vec<(&str, Vec<RouteTargetConfig>)>,
 ) -> Config {
     Config {
-        config_version: 2,
+        config_version: 3,
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
         },
         affinity: Default::default(),
-        providers,
+        backends,
         models: vec![ServedModelConfig {
             name: LOGICAL_MODEL.into(),
             aliases: vec![UPSTREAM_MODEL.into()],
@@ -454,17 +500,17 @@ fn attempts_for_request<'a>(body: &'a Value, request_id: &str) -> Vec<&'a Value>
         .collect()
 }
 
-fn status_target<'a>(body: &'a Value, provider: &str) -> &'a Value {
+fn status_target<'a>(body: &'a Value, backend: &str) -> &'a Value {
     body["targets"]
         .as_array()
         .expect("status targets array")
         .iter()
-        .find(|target| target["provider"].as_str() == Some(provider))
-        .unwrap_or_else(|| panic!("missing status target {provider}"))
+        .find(|target| target["backend"].as_str() == Some(backend))
+        .unwrap_or_else(|| panic!("missing status target {backend}"))
 }
 
 #[tokio::test]
-async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
+async fn openai_chat_success_exposes_reasoning_and_backend_metadata() {
     let primary = MockProvider::start(vec![MockReply::json(
         StatusCode::OK,
         chat_completion("primary reasoning", "primary answer"),
@@ -482,7 +528,8 @@ async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
         .await
         .expect("chat response");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_value(&response, "x-relay-provider"), "opencode-go");
+    assert_eq!(header_value(&response, "x-relay-backend"), "opencode-go");
+    assert!(response.headers().get("x-relay-provider").is_none());
     assert_eq!(header_value(&response, "x-relay-fallback"), "0");
     let body = response.json::<Value>().await.expect("chat JSON");
     assert_eq!(
@@ -494,39 +541,53 @@ async fn openai_chat_success_exposes_reasoning_and_provider_metadata() {
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 0);
 
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("backend status response")
+        .json::<Value>()
+        .await
+        .expect("backend status JSON");
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["adapter"], "opencode-go");
+    assert!(target.get("provider").is_none());
+    assert!(target.get("provider_kind").is_none());
+
     let stats = client
         .get(gateway.url("/api/stats"))
         .send()
         .await
-        .expect("provider stats response")
+        .expect("backend stats response")
         .json::<Value>()
         .await
-        .expect("provider stats JSON");
-    assert_eq!(stats["providers"]["deepseek"]["attempts"], 0);
+        .expect("backend stats JSON");
+    assert!(stats.get("providers").is_none());
+    assert_eq!(stats["backends"]["deepseek"]["attempts"], 0);
     assert_eq!(
-        stats["providers"]["deepseek"]["models"],
+        stats["backends"]["deepseek"]["models"],
         json!([UPSTREAM_MODEL])
     );
 }
 
 #[tokio::test]
-async fn configured_model_pricing_drives_cost_for_any_provider_kind() {
+async fn configured_model_pricing_drives_cost_for_any_adapter() {
     let upstream = MockProvider::start(vec![MockReply::json(
         StatusCode::OK,
         chat_completion("priced reasoning", "priced answer"),
     )])
     .await;
     let mut config = test_config(
-        vec![test_provider_kind(
+        vec![test_backend_adapter(
             "priced-custom",
             "priced-key",
             &upstream,
-            ProviderKind::CustomChatCompletions,
+            AdapterKind::CustomChatCompletions,
             Protocol::OpenAiChat,
         )],
         vec![("priced", vec![target("priced-custom", "priced-key")])],
     );
-    config.providers[0].models[0].pricing = Some(ModelPricingConfig {
+    config.backends[0].models[0].pricing = Some(ModelPricingConfig {
         cache_hit_input_usd_per_million: 1.0,
         cache_miss_input_usd_per_million: 2.0,
         output_usd_per_million: 3.0,
@@ -551,10 +612,111 @@ async fn configured_model_pricing_drives_cost_for_any_provider_kind() {
         .await
         .expect("priced stats JSON");
     let expected = (3.0 * 1.0 + 8.0 * 2.0 + 7.0 * 3.0) / 1_000_000.0;
-    let actual = stats["providers"]["priced-custom"]["cost_usd"]
+    let actual = stats["backends"]["priced-custom"]["cost_usd"]
         .as_f64()
         .expect("configured cost");
     assert!((actual - expected).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn custom_chat_completions_uses_exact_endpoint_and_generic_429_classification() {
+    let primary = MockProvider::start(vec![MockReply::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "type":"error",
+            "error":{
+                "type":"GoUsageLimitError",
+                "message":"Subscription quota exceeded. You can continue using free models."
+            },
+            "metadata":{"limitName":"5 hour"}
+        }),
+    )])
+    .await;
+    let fallback = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("fallback reasoning", "fallback answer"),
+    )])
+    .await;
+    let mut custom_primary = test_backend_adapter(
+        "custom-primary",
+        "custom-key",
+        &primary,
+        AdapterKind::CustomChatCompletions,
+        Protocol::OpenAiChat,
+    );
+    custom_primary.endpoint = Some(format!("{}/custom/gateway", primary.endpoint()));
+    let custom_fallback = test_backend_adapter(
+        "custom-fallback",
+        "fallback-key",
+        &fallback,
+        AdapterKind::CustomChatCompletions,
+        Protocol::OpenAiChat,
+    );
+    let config = test_config(
+        vec![custom_primary, custom_fallback],
+        vec![
+            ("custom", vec![target("custom-primary", "custom-key")]),
+            ("fallback", vec![target("custom-fallback", "fallback-key")]),
+        ],
+    );
+    let gateway = Gateway::start_config(config, 0x0c05_7429).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("custom endpoint fallback response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&response, "x-relay-backend"),
+        "custom-fallback"
+    );
+    assert_eq!(header_value(&response, "x-relay-fallback"), "1");
+    assert_eq!(
+        header_value(&response, "x-relay-fallback-reason"),
+        "provider_capacity"
+    );
+    let body = response
+        .json::<Value>()
+        .await
+        .expect("custom fallback JSON");
+    assert_eq!(body["choices"][0]["message"]["content"], "fallback answer");
+
+    assert_eq!(primary.calls().await, 1);
+    assert_eq!(fallback.calls().await, 1);
+    assert_eq!(primary.request_paths().await, vec!["/custom/gateway"]);
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=20"))
+        .send()
+        .await
+        .expect("custom endpoint attempts response")
+        .json::<Value>()
+        .await
+        .expect("custom endpoint attempts JSON");
+    let primary_attempt = attempts["attempts"]
+        .as_array()
+        .expect("custom endpoint attempts array")
+        .iter()
+        .find(|attempt| attempt["backend"] == "custom-primary")
+        .expect("custom primary attempt");
+    assert_eq!(primary_attempt["error_class"], "provider_capacity");
+    assert_ne!(primary_attempt["error_class"], "provider_quota");
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("custom endpoint status response")
+        .json::<Value>()
+        .await
+        .expect("custom endpoint status JSON");
+    let target = status_target(&status, "custom-primary");
+    assert_eq!(target["circuit"]["mode"], "open");
+    assert_eq!(target["circuit"]["reason"], "provider_capacity");
 }
 
 #[tokio::test]
@@ -572,26 +734,26 @@ async fn named_tool_choice_reaches_upstream_and_400_does_not_fallback_or_open_ci
     .await;
     let fallback = MockProvider::start(Vec::new()).await;
     let config = Config {
-        config_version: 2,
+        config_version: 3,
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
         },
         affinity: Default::default(),
-        providers: vec![
-            test_provider_kind_model(
+        backends: vec![
+            test_backend_adapter_model(
                 "kimi-primary",
                 "primary-key",
                 &primary,
-                ProviderKind::KimiOfficial,
+                AdapterKind::KimiOfficial,
                 Protocol::OpenAiChat,
                 "kimi-k3",
             ),
-            test_provider_kind_model(
+            test_backend_adapter_model(
                 "kimi-fallback",
                 "fallback-key",
                 &fallback,
-                ProviderKind::KimiOfficial,
+                AdapterKind::KimiOfficial,
                 Protocol::OpenAiChat,
                 "kimi-k3",
             ),
@@ -640,7 +802,7 @@ async fn named_tool_choice_reaches_upstream_and_400_does_not_fallback_or_open_ci
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.json::<Value>().await.expect("client error JSON");
         assert_eq!(body["error"]["type"], "client_request");
-        assert_eq!(body["error"]["message"], "named tool choice is unsupported");
+        assert_eq!(body["error"]["message"], "upstream request failed");
     }
 
     assert_eq!(primary.calls().await, 2);
@@ -668,26 +830,26 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
     .await;
     let fallback = MockProvider::start(Vec::new()).await;
     let config = Config {
-        config_version: 2,
+        config_version: 3,
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
         },
         affinity: Default::default(),
-        providers: vec![
-            test_provider_kind_model(
+        backends: vec![
+            test_backend_adapter_model(
                 "kimi-primary",
                 "primary-key",
                 &primary,
-                ProviderKind::KimiOfficial,
+                AdapterKind::KimiOfficial,
                 Protocol::OpenAiChat,
                 "kimi-k3",
             ),
-            test_provider_kind_model(
+            test_backend_adapter_model(
                 "kimi-fallback",
                 "fallback-key",
                 &fallback,
-                ProviderKind::KimiOfficial,
+                AdapterKind::KimiOfficial,
                 Protocol::OpenAiChat,
                 "kimi-k3",
             ),
@@ -743,7 +905,7 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response.json::<Value>().await.expect("client error JSON");
     assert_eq!(body["error"]["type"], "api_error");
-    assert_eq!(body["error"]["message"], "reasoning_content is required");
+    assert_eq!(body["error"]["message"], "upstream request failed");
 
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 0);
@@ -751,7 +913,8 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
     assert_eq!(upstream_requests.len(), 1);
     let upstream = &upstream_requests[0];
     assert_eq!(upstream["model"], "kimi-k3");
-    assert_eq!(upstream["reasoning_effort"], "high");
+    assert!(upstream.get("reasoning_effort").is_none());
+    assert!(upstream.get("thinking").is_none());
     assert_eq!(upstream["tool_choice"]["function"]["name"], "weather");
     assert_eq!(upstream["messages"][1]["tool_calls"][0]["id"], "tool-1");
     assert!(upstream["messages"][1].get("reasoning_content").is_none());
@@ -779,11 +942,11 @@ async fn kimi_code_anthropic_ingress_uses_native_messages_protocol() {
     )])
     .await;
     let mut config = test_config(
-        vec![test_provider_kind_model(
+        vec![test_backend_adapter_model(
             "kimi-code",
             "allegretto",
             &upstream,
-            ProviderKind::KimiCode,
+            AdapterKind::KimiCode,
             Protocol::AnthropicMessages,
             "k3",
         )],
@@ -823,7 +986,7 @@ async fn kimi_code_anthropic_ingress_uses_native_messages_protocol() {
         .await
         .expect("native Kimi Messages response");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_value(&response, "x-relay-provider"), "kimi-code");
+    assert_eq!(header_value(&response, "x-relay-backend"), "kimi-code");
     assert_eq!(
         header_value(&response, "x-relay-egress-protocol"),
         "anthropic-messages"
@@ -859,11 +1022,11 @@ async fn native_anthropic_stream_persists_accumulated_usage() {
     );
     let upstream = MockProvider::start(vec![MockReply::sse(upstream_stream)]).await;
     let mut config = test_config(
-        vec![test_provider_kind_model(
+        vec![test_backend_adapter_model(
             "kimi-code",
             "allegretto",
             &upstream,
-            ProviderKind::KimiCode,
+            AdapterKind::KimiCode,
             Protocol::AnthropicMessages,
             "k3",
         )],
@@ -937,7 +1100,7 @@ async fn native_anthropic_stream_persists_accumulated_usage() {
 }
 
 #[tokio::test]
-async fn semantic_validation_is_deferred_upstream_for_every_ingress_protocol() {
+async fn direct_validation_is_deferred_and_unknown_translation_extensions_are_ignored() {
     let primary = MockProvider::start(
         (0..3)
             .map(|_| {
@@ -1004,23 +1167,13 @@ async fn semantic_validation_is_deferred_upstream_for_every_ingress_protocol() {
     assert_eq!(fallback.calls().await, 0);
     let upstream = primary.request_bodies().await;
     assert_eq!(upstream[0]["messages"], "not-an-array");
-    assert!(
-        upstream[1]["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("future_item")
-    );
-    assert_eq!(upstream[1]["reasoning_effort"], "future_effort");
-    assert_eq!(upstream[1]["tools"][0]["type"], "future_tool");
-    assert!(
-        upstream[2]["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("future_block")
-    );
-    assert_eq!(upstream[2]["thinking"]["type"], "future_thinking");
-    assert_eq!(upstream[2]["reasoning_effort"], "future_effort");
-    assert_eq!(upstream[2]["response_format"]["type"], "future_format");
+    assert!(upstream[1]["messages"].as_array().unwrap().is_empty());
+    assert!(upstream[1].get("reasoning_effort").is_none());
+    assert!(upstream[1].get("tools").is_none());
+    assert!(upstream[2]["messages"].as_array().unwrap().is_empty());
+    assert!(upstream[2].get("thinking").is_none());
+    assert!(upstream[2].get("reasoning_effort").is_none());
+    assert!(upstream[2].get("response_format").is_none());
 }
 
 #[tokio::test]
@@ -1121,8 +1274,8 @@ async fn random_strategy_distributes_requests_within_one_layer() {
     .await;
     let config = test_config(
         vec![
-            test_provider("worker-a", "key-a", &worker_a),
-            test_provider("worker-b", "key-b", &worker_b),
+            test_backend("worker-a", "key-a", &worker_a),
+            test_backend("worker-b", "key-b", &worker_b),
         ],
         vec![(
             "plan",
@@ -1176,14 +1329,14 @@ async fn random_strategy_distributes_requests_within_one_layer() {
     assert_eq!(
         attempts
             .iter()
-            .filter(|attempt| attempt["provider"] == "worker-a")
+            .filter(|attempt| attempt["backend"] == "worker-a")
             .count(),
         count_a
     );
     assert_eq!(
         attempts
             .iter()
-            .filter(|attempt| attempt["provider"] == "worker-b")
+            .filter(|attempt| attempt["backend"] == "worker-b")
             .count(),
         count_b
     );
@@ -1194,7 +1347,7 @@ async fn random_strategy_distributes_requests_within_one_layer() {
 }
 
 #[tokio::test]
-async fn prompt_prefix_affinity_routes_a_divergent_branch_across_mixed_provider_kinds() {
+async fn prompt_prefix_affinity_routes_a_divergent_branch_across_mixed_adapters() {
     let worker_a = MockProvider::start(
         (0..4)
             .map(|_| MockReply::json(StatusCode::OK, chat_completion("a", "worker-a")))
@@ -1209,12 +1362,12 @@ async fn prompt_prefix_affinity_routes_a_divergent_branch_across_mixed_provider_
     .await;
     let mut config = test_config(
         vec![
-            test_provider("worker-a", "key-a", &worker_a),
-            test_provider_kind(
+            test_backend("worker-a", "key-a", &worker_a),
+            test_backend_adapter(
                 "worker-b",
                 "key-b",
                 &worker_b,
-                ProviderKind::DeepSeekOfficial,
+                AdapterKind::DeepSeekOfficial,
                 Protocol::OpenAiChat,
             ),
         ],
@@ -1241,7 +1394,7 @@ async fn prompt_prefix_affinity_routes_a_divergent_branch_across_mixed_provider_
         .expect("cold affinity request");
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(header_value(&first, "x-relay-selection-reason"), "random");
-    let warm_provider = header_value(&first, "x-relay-provider");
+    let warm_provider = header_value(&first, "x-relay-backend");
     let _ = first.json::<Value>().await.expect("cold response JSON");
 
     let second = client
@@ -1253,7 +1406,7 @@ async fn prompt_prefix_affinity_routes_a_divergent_branch_across_mixed_provider_
         .expect("warm branch request");
     let second_request_id = header_value(&second, "x-relay-request-id");
     assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(header_value(&second, "x-relay-provider"), warm_provider);
+    assert_eq!(header_value(&second, "x-relay-backend"), warm_provider);
     assert_eq!(
         header_value(&second, "x-relay-selection-reason"),
         "prompt-prefix-affinity"
@@ -1323,7 +1476,7 @@ async fn prompt_prefix_affinity_routes_a_divergent_branch_across_mixed_provider_
         .expect("affinity attempts JSON");
     let warm_attempt = attempts_for_request(&attempts, &second_request_id);
     assert_eq!(warm_attempt.len(), 1);
-    assert_eq!(warm_attempt[0]["provider"], warm_provider);
+    assert_eq!(warm_attempt[0]["backend"], warm_provider);
     assert_eq!(
         warm_attempt[0]["selection_reason"],
         "prompt-prefix-affinity"
@@ -1346,8 +1499,8 @@ async fn single_target_affinity_layer_skips_hashing_and_bookkeeping() {
     let unused = MockProvider::start(vec![]).await;
     let mut config = test_config(
         vec![
-            test_provider("single-worker", "single-key", &worker),
-            test_provider("unused-worker", "unused-key", &unused),
+            test_backend("single-worker", "single-key", &worker),
+            test_backend("unused-worker", "unused-key", &unused),
         ],
         vec![("plan", vec![target("single-worker", "single-key")])],
     );
@@ -1396,8 +1549,8 @@ async fn single_target_affinity_layer_skips_hashing_and_bookkeeping() {
         .json::<Value>()
         .await
         .expect("single-target stats JSON");
-    assert_eq!(stats["providers"]["single-worker"]["attempts"], 1);
-    assert_eq!(stats["providers"]["unused-worker"]["attempts"], 0);
+    assert_eq!(stats["backends"]["single-worker"]["attempts"], 1);
+    assert_eq!(stats["backends"]["unused-worker"]["attempts"], 0);
     eprintln!(
         "SINGLE_TARGET_EVIDENCE {}",
         json!({"selection_reason":"single-target","affinity_leases":0,"unused_provider_attempts":0})
@@ -1420,8 +1573,8 @@ async fn completed_stream_warms_prefix_affinity_for_the_next_request() {
     .await;
     let mut config = test_config(
         vec![
-            test_provider("worker-a", "key-a", &worker_a),
-            test_provider("worker-b", "key-b", &worker_b),
+            test_backend("worker-a", "key-a", &worker_a),
+            test_backend("worker-b", "key-b", &worker_b),
         ],
         vec![(
             "plan",
@@ -1443,7 +1596,7 @@ async fn completed_stream_warms_prefix_affinity_for_the_next_request() {
         .await
         .expect("first streaming affinity response");
     assert_eq!(first.status(), StatusCode::OK);
-    let warm_provider = header_value(&first, "x-relay-provider");
+    let warm_provider = header_value(&first, "x-relay-backend");
     assert_eq!(header_value(&first, "x-relay-selection-reason"), "random");
     let first_stream = first.text().await.expect("first stream body");
     assert!(first_stream.contains("data: [DONE]"));
@@ -1458,7 +1611,7 @@ async fn completed_stream_warms_prefix_affinity_for_the_next_request() {
         .await
         .expect("second streaming affinity response");
     assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(header_value(&second, "x-relay-provider"), warm_provider);
+    assert_eq!(header_value(&second, "x-relay-backend"), warm_provider);
     assert_eq!(
         header_value(&second, "x-relay-selection-reason"),
         "prompt-prefix-affinity"
@@ -1497,9 +1650,9 @@ async fn exhausts_every_target_in_a_layer_before_later_layer_fallback() {
     .await;
     let config = test_config(
         vec![
-            test_provider("plan-a", "key-a", &plan_a),
-            test_provider("plan-b", "key-b", &plan_b),
-            test_provider("payg", "key-payg", &payg),
+            test_backend("plan-a", "key-a", &plan_a),
+            test_backend("plan-b", "key-b", &plan_b),
+            test_backend("payg", "key-payg", &payg),
         ],
         vec![
             (
@@ -1521,7 +1674,7 @@ async fn exhausts_every_target_in_a_layer_before_later_layer_fallback() {
         .expect("layer fallback response");
     let request_id = header_value(&response, "x-relay-request-id");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_value(&response, "x-relay-provider"), "payg");
+    assert_eq!(header_value(&response, "x-relay-backend"), "payg");
     assert_eq!(header_value(&response, "x-relay-route-layer"), "payg");
     assert_eq!(header_value(&response, "x-relay-fallback"), "1");
     assert_eq!(plan_a.calls().await, 1);
@@ -1568,27 +1721,27 @@ async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallb
 
     let mut config = test_config(
         vec![
-            test_provider_kind_model(
+            test_backend_adapter_model(
                 "opencode-go-kimi",
                 "go-plan",
                 &go,
-                ProviderKind::OpenCodeGo,
+                AdapterKind::OpenCodeGo,
                 Protocol::OpenAiChat,
                 "kimi-k3",
             ),
-            test_provider_kind_model(
+            test_backend_adapter_model(
                 "kimi-code",
                 "allegretto",
                 &code,
-                ProviderKind::KimiCode,
+                AdapterKind::KimiCode,
                 Protocol::OpenAiChat,
                 "k3",
             ),
-            test_provider_kind_model(
+            test_backend_adapter_model(
                 "kimi-official",
                 "official-payg",
                 &official,
-                ProviderKind::KimiOfficial,
+                AdapterKind::KimiOfficial,
                 Protocol::OpenAiChat,
                 "kimi-k3",
             ),
@@ -1626,7 +1779,7 @@ async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallb
         .expect("Kimi layered response");
     let request_id = header_value(&response, "x-relay-request-id");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_value(&response, "x-relay-provider"), "kimi-official");
+    assert_eq!(header_value(&response, "x-relay-backend"), "kimi-official");
     assert_eq!(header_value(&response, "x-relay-route-layer"), "payg");
     assert_eq!(header_value(&response, "x-relay-fallback"), "1");
     assert_eq!(
@@ -1653,6 +1806,12 @@ async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallb
         .expect("Kimi attempts JSON");
     let attempts = attempts_for_request(&attempts, &request_id);
     assert_eq!(attempts.len(), 3);
+    assert!(attempts.iter().all(|attempt| {
+        attempt.get("backend").is_some()
+            && attempt.get("adapter").is_some()
+            && attempt.get("provider").is_none()
+            && attempt.get("provider_kind").is_none()
+    }));
     assert_eq!(
         attempts
             .iter()
@@ -1677,11 +1836,11 @@ async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallb
         .await
         .expect("Kimi stats JSON");
     assert_eq!(
-        stats["providers"]["opencode-go-kimi"]["models"][0],
+        stats["backends"]["opencode-go-kimi"]["models"][0],
         "kimi-k3"
     );
-    assert_eq!(stats["providers"]["kimi-code"]["models"][0], "k3");
-    assert_eq!(stats["providers"]["kimi-official"]["models"][0], "kimi-k3");
+    assert_eq!(stats["backends"]["kimi-code"]["models"][0], "k3");
+    assert_eq!(stats["backends"]["kimi-official"]["models"][0], "kimi-k3");
     let routes = stats["routes"].as_array().expect("Kimi stats routes");
     for (provider, upstream_model) in [
         ("opencode-go-kimi", "kimi-k3"),
@@ -1691,7 +1850,7 @@ async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallb
         let route = routes
             .iter()
             .find(|route| {
-                route["provider"].as_str() == Some(provider)
+                route["backend"].as_str() == Some(provider)
                     && route["upstream_model"].as_str() == Some(upstream_model)
             })
             .unwrap_or_else(|| panic!("missing Kimi route {provider}/{upstream_model}"));
@@ -1715,6 +1874,10 @@ async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallb
     assert_eq!(request["requested_model"], "kimi-k3-1m");
     assert_eq!(request["served_model"], "kimi-k3");
     assert_eq!(request["upstream_model"], "kimi-k3");
+    assert_eq!(request["backend"], "kimi-official");
+    assert_eq!(request["adapter"], "kimi-official");
+    assert!(request.get("provider").is_none());
+    assert!(request.get("provider_kind").is_none());
     eprintln!(
         "KIMI_LAYER_EVIDENCE {}",
         json!({"plan_attempts":2,"payg_attempts":1,"models":{"opencode-go":"kimi-k3","kimi-code":"k3","kimi-official":"kimi-k3"}})
@@ -1737,19 +1900,19 @@ async fn kimi_code_and_opencode_go_compete_by_prefix_with_isolated_model_namespa
     .await;
     let mut config = test_config(
         vec![
-            test_provider_kind_model(
+            test_backend_adapter_model(
                 "opencode-go-kimi",
                 "go-plan",
                 &go,
-                ProviderKind::OpenCodeGo,
+                AdapterKind::OpenCodeGo,
                 Protocol::OpenAiChat,
                 "kimi-k3",
             ),
-            test_provider_kind_model(
+            test_backend_adapter_model(
                 "kimi-code",
                 "allegretto",
                 &code,
-                ProviderKind::KimiCode,
+                AdapterKind::KimiCode,
                 Protocol::OpenAiChat,
                 "k3",
             ),
@@ -1785,7 +1948,7 @@ async fn kimi_code_and_opencode_go_compete_by_prefix_with_isolated_model_namespa
         .await
         .expect("cold mixed Kimi response");
     assert_eq!(first.status(), StatusCode::OK);
-    let warm_provider = header_value(&first, "x-relay-provider");
+    let warm_provider = header_value(&first, "x-relay-backend");
     assert_eq!(header_value(&first, "x-relay-selection-reason"), "random");
     let _ = first.json::<Value>().await.expect("cold mixed Kimi JSON");
 
@@ -1797,7 +1960,7 @@ async fn kimi_code_and_opencode_go_compete_by_prefix_with_isolated_model_namespa
         .await
         .expect("warm mixed Kimi response");
     assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(header_value(&second, "x-relay-provider"), warm_provider);
+    assert_eq!(header_value(&second, "x-relay-backend"), warm_provider);
     assert_eq!(
         header_value(&second, "x-relay-selection-reason"),
         "prompt-prefix-affinity"
@@ -1846,7 +2009,7 @@ async fn chat_client_uses_responses_only_provider_with_bidirectional_translation
     )])
     .await;
     let config = test_config(
-        vec![test_provider_protocol(
+        vec![test_backend_protocol(
             "responses-worker",
             "responses-key",
             &upstream,
@@ -1874,6 +2037,7 @@ async fn chat_client_uses_responses_only_provider_with_bidirectional_translation
         .json::<Value>()
         .await
         .expect("translated chat JSON");
+    assert_eq!(body["model"], LOGICAL_MODEL);
     assert_eq!(
         body["choices"][0]["message"]["reasoning_content"],
         "provider thought"
@@ -1905,7 +2069,7 @@ async fn responses_client_uses_anthropic_only_provider_with_bidirectional_transl
     )])
     .await;
     let config = test_config(
-        vec![test_provider_protocol(
+        vec![test_backend_protocol(
             "anthropic-worker",
             "anthropic-key",
             &upstream,
@@ -1933,6 +2097,7 @@ async fn responses_client_uses_anthropic_only_provider_with_bidirectional_transl
         .json::<Value>()
         .await
         .expect("translated Responses JSON");
+    assert_eq!(body["model"], LOGICAL_MODEL);
     assert_eq!(body["output"][0]["type"], "reasoning");
     assert_eq!(body["output"][1]["type"], "message");
     assert_eq!(body["output"][1]["content"][0]["text"], "anthropic answer");
@@ -1952,7 +2117,7 @@ async fn responses_provider_stream_is_translated_to_chat_stream() {
     );
     let upstream = MockProvider::start(vec![MockReply::sse(upstream_stream)]).await;
     let config = test_config(
-        vec![test_provider_protocol(
+        vec![test_backend_protocol(
             "responses-worker",
             "responses-key",
             &upstream,
@@ -1975,6 +2140,7 @@ async fn responses_provider_stream_is_translated_to_chat_stream() {
     let stream = response.text().await.expect("translated stream body");
     assert!(stream.contains("stream thought"));
     assert!(stream.contains("stream answer"));
+    assert!(stream.contains(&format!("\"model\":\"{LOGICAL_MODEL}\"")));
     assert!(stream.contains("\"cached_tokens\":7"));
     assert!(stream.contains("data: [DONE]"));
     assert_eq!(upstream.calls().await, 1);
@@ -1996,7 +2162,7 @@ async fn anthropic_provider_stream_is_translated_to_responses_stream() {
     );
     let upstream = MockProvider::start(vec![MockReply::sse(upstream_stream)]).await;
     let config = test_config(
-        vec![test_provider_protocol(
+        vec![test_backend_protocol(
             "anthropic-worker",
             "anthropic-key",
             &upstream,
@@ -2060,7 +2226,7 @@ async fn transient_primary_failure_falls_back_before_commit_and_persists_attempt
         .expect("fallback response");
     let request_id = header_value(&response, "x-relay-request-id");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_value(&response, "x-relay-provider"), "deepseek");
+    assert_eq!(header_value(&response, "x-relay-backend"), "deepseek");
     assert_eq!(header_value(&response, "x-relay-fallback"), "1");
     assert_eq!(
         header_value(&response, "x-relay-fallback-reason"),
@@ -2125,8 +2291,8 @@ async fn transient_primary_failure_falls_back_before_commit_and_persists_attempt
         .json::<Value>()
         .await
         .expect("fallback overview statistics JSON");
-    assert_eq!(overview["providers"]["opencode-go"]["attempts"], 1);
-    assert_eq!(overview["providers"]["deepseek"]["attempts"], 1);
+    assert_eq!(overview["backends"]["opencode-go"]["attempts"], 1);
+    assert_eq!(overview["backends"]["deepseek"]["attempts"], 1);
 }
 
 #[tokio::test]
@@ -2155,52 +2321,156 @@ async fn both_providers_failing_returns_terminal_error() {
         .await
         .expect("terminal response");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(header_value(&response, "x-relay-provider"), "deepseek");
+    assert_eq!(header_value(&response, "x-relay-backend"), "deepseek");
     assert_eq!(header_value(&response, "x-relay-fallback"), "1");
     let body = response.json::<Value>().await.expect("terminal JSON");
     assert_eq!(body["error"]["type"], "fallback_unavailable");
-    assert_eq!(body["error"]["message"], "fallback unavailable");
+    assert_eq!(body["error"]["message"], "upstream request failed");
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 1);
 }
 
 #[tokio::test]
-async fn client_provider_selection_is_rejected_without_upstream_calls() {
-    let primary = MockProvider::start(Vec::new()).await;
+async fn http_200_error_envelope_does_not_close_or_commit_the_primary_route() {
+    let primary = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        json!({
+            "type":"error",
+            "error":{
+                "type":"GoUsageLimitError",
+                "message":"Subscription quota exceeded"
+            }
+        }),
+    )])
+    .await;
+    let fallback = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("fallback reasoning", "fallback answer"),
+    )])
+    .await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("semantic fallback response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-backend"), "deepseek");
+    assert_eq!(
+        header_value(&response, "x-relay-fallback-reason"),
+        "provider_quota"
+    );
+    assert_eq!(primary.calls().await, 1);
+    assert_eq!(fallback.calls().await, 1);
+}
+
+#[tokio::test]
+async fn first_stream_error_uses_provider_classification_before_fallback() {
+    let primary = MockProvider::start(vec![MockReply::sse(concat!(
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"GoUsageLimitError\",\"message\":\"Subscription quota exceeded\"}}\n\n"
+    ))])
+    .await;
+    let fallback = MockProvider::start(vec![MockReply::sse(chat_stream(
+        "fallback thinking",
+        "fallback answer",
+        true,
+    ))])
+    .await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+    let mut body = chat_request();
+    body["stream"] = json!(true);
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&body)
+        .send()
+        .await
+        .expect("classified stream fallback response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-backend"), "deepseek");
+    assert_eq!(
+        header_value(&response, "x-relay-fallback-reason"),
+        "provider_quota"
+    );
+    let stream = response.text().await.expect("classified fallback stream");
+    assert!(stream.contains("fallback answer"));
+    assert!(!stream.contains("GoUsageLimitError"));
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("classified stream status")
+        .json::<Value>()
+        .await
+        .expect("classified stream status JSON");
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["circuit"]["reason"], "provider_quota");
+}
+
+#[tokio::test]
+async fn imagined_selector_fields_and_headers_do_not_select_the_route() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(StatusCode::OK, chat_completion("one", "primary")),
+        MockReply::json(StatusCode::OK, chat_completion("two", "primary")),
+        MockReply::json(StatusCode::OK, chat_completion("three", "primary")),
+        MockReply::json(StatusCode::OK, chat_completion("four", "primary")),
+        MockReply::json(StatusCode::OK, chat_completion("five", "primary")),
+        MockReply::json(StatusCode::OK, chat_completion("six", "primary")),
+    ])
+    .await;
     let fallback = MockProvider::start(Vec::new()).await;
     let gateway = Gateway::start(&primary, &fallback).await;
     let client = reqwest::Client::new();
 
     let mut field_body = chat_request();
-    field_body["provider"] = json!("deepseek");
+    field_body["provider"] = json!("fallback");
+    field_body["credential"] = json!("fallback-key");
+    field_body["route_layer"] = json!("fallback-layer");
     let field_response = client
         .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
         .json(&field_body)
         .send()
         .await
-        .expect("field validation response");
-    assert_eq!(field_response.status(), StatusCode::BAD_REQUEST);
-    let field_error = field_response
-        .json::<Value>()
-        .await
-        .expect("field validation JSON");
-    assert_eq!(field_error["error"]["type"], "invalid_request_error");
+        .expect("provider field response");
+    assert_eq!(field_response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&field_response, "x-relay-backend"),
+        "opencode-go"
+    );
 
-    let header_response = client
-        .post(gateway.url("/v1/chat/completions"))
-        .header("x-relay-provider", "opencode-go")
-        .json(&chat_request())
-        .send()
-        .await
-        .expect("header validation response");
-    assert_eq!(header_response.status(), StatusCode::BAD_REQUEST);
-    let header_error = header_response
-        .json::<Value>()
-        .await
-        .expect("header validation JSON");
-    assert_eq!(header_error["error"]["type"], "invalid_request_error");
-    assert_eq!(primary.calls().await, 0);
+    for (name, value) in [
+        ("x-relay-backend", "fallback"),
+        ("x-relay-provider", "fallback"),
+        ("x-provider", "fallback"),
+        ("x-relay-credential", "fallback-key"),
+        ("x-relay-route-layer", "fallback-layer"),
+    ] {
+        let response = client
+            .post(gateway.url("/v1/chat/completions"))
+            .header("x-relay-include-metadata", "1")
+            .header(name, value)
+            .json(&chat_request())
+            .send()
+            .await
+            .expect("ignored provider header response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_value(&response, "x-relay-backend"), "opencode-go");
+    }
+    assert_eq!(primary.calls().await, 6);
     assert_eq!(fallback.calls().await, 0);
+    let upstream_bodies = primary.request_bodies().await;
+    assert_eq!(upstream_bodies[0]["provider"], "fallback");
+    assert_eq!(upstream_bodies[0]["credential"], "fallback-key");
+    assert_eq!(upstream_bodies[0]["route_layer"], "fallback-layer");
 }
 
 #[tokio::test]
@@ -2264,7 +2534,7 @@ async fn empty_primary_stream_falls_back_before_first_semantic_event() {
         .await
         .expect("fallback stream response");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_value(&response, "x-relay-provider"), "deepseek");
+    assert_eq!(header_value(&response, "x-relay-backend"), "deepseek");
     assert_eq!(header_value(&response, "x-relay-fallback"), "1");
     assert_eq!(
         header_value(&response, "x-relay-fallback-reason"),
@@ -2274,6 +2544,40 @@ async fn empty_primary_stream_falls_back_before_first_semantic_event() {
     assert!(stream.contains("fallback thinking"));
     assert!(stream.contains("fallback answer"));
     assert!(stream.contains("data: [DONE]"));
+    assert_eq!(primary.calls().await, 1);
+    assert_eq!(fallback.calls().await, 1);
+}
+
+#[tokio::test]
+async fn malformed_first_sse_event_falls_back_before_response_commitment() {
+    let primary = MockProvider::start(vec![MockReply::sse("data: not-json\n\n")]).await;
+    let fallback = MockProvider::start(vec![MockReply::sse(chat_stream(
+        "fallback thinking",
+        "fallback after malformed SSE",
+        true,
+    ))])
+    .await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+    let mut body = chat_request();
+    body["stream"] = json!(true);
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&body)
+        .send()
+        .await
+        .expect("malformed SSE fallback response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-backend"), "deepseek");
+    assert_eq!(
+        header_value(&response, "x-relay-fallback-reason"),
+        "stream_failure"
+    );
+    let stream = response.text().await.expect("fallback stream body");
+    assert!(stream.contains("fallback after malformed SSE"));
+    assert!(!stream.contains("not-json"));
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 1);
 }
@@ -2301,7 +2605,7 @@ async fn semantic_stream_eof_records_failure_without_fallback_and_opens_circuit(
         .expect("partial stream response");
     let request_id = header_value(&response, "x-relay-request-id");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_value(&response, "x-relay-provider"), "opencode-go");
+    assert_eq!(header_value(&response, "x-relay-backend"), "opencode-go");
     assert_eq!(header_value(&response, "x-relay-fallback"), "0");
     let stream = response.text().await.expect("partial stream body");
     assert!(stream.contains("partial answer"));
@@ -2335,6 +2639,117 @@ async fn semantic_stream_eof_records_failure_without_fallback_and_opens_circuit(
 }
 
 #[tokio::test]
+async fn native_semantic_stream_error_after_commit_opens_circuit() {
+    let upstream = concat!(
+        "data: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "event: error\n",
+        "data: {\"error\":{\"message\":\"upstream stream failed\"}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let primary = MockProvider::start(vec![MockReply::sse(upstream)]).await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+    let mut body = chat_request();
+    body["stream"] = json!(true);
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&body)
+        .send()
+        .await
+        .expect("semantic error stream response");
+    let request_id = header_value(&response, "x-relay-request-id");
+    assert_eq!(response.status(), StatusCode::OK);
+    let stream = response.text().await.expect("semantic error stream body");
+    assert!(stream.contains("partial"));
+    assert!(stream.contains("event: error"));
+    assert!(!stream.contains("data: [DONE]"));
+    assert_eq!(fallback.calls().await, 0);
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=20"))
+        .send()
+        .await
+        .expect("semantic error attempts response")
+        .json::<Value>()
+        .await
+        .expect("semantic error attempts JSON");
+    let request_attempts = attempts_for_request(&attempts, &request_id);
+    assert_eq!(request_attempts.len(), 1);
+    assert_eq!(request_attempts[0]["error_class"], "stream_failure");
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("semantic error status response")
+        .json::<Value>()
+        .await
+        .expect("semantic error status JSON");
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["circuit"]["mode"], "open");
+    assert_eq!(target["circuit"]["reason"], "stream_failure");
+}
+
+#[tokio::test]
+async fn provider_quota_stream_error_after_commit_keeps_response_and_classifies_circuit() {
+    let upstream = concat!(
+        "data: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"GoUsageLimitError\",\"message\":\"Subscription quota exceeded\"}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let primary = MockProvider::start(vec![MockReply::sse(upstream)]).await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+    let mut body = chat_request();
+    body["stream"] = json!(true);
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&body)
+        .send()
+        .await
+        .expect("committed quota stream response");
+    let request_id = header_value(&response, "x-relay-request-id");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-backend"), "opencode-go");
+    let stream = response.text().await.expect("committed quota stream body");
+    assert!(stream.contains("partial"));
+    assert!(stream.contains("GoUsageLimitError"));
+    assert!(!stream.contains("data: [DONE]"));
+    assert_eq!(fallback.calls().await, 0);
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=20"))
+        .send()
+        .await
+        .expect("committed quota attempts response")
+        .json::<Value>()
+        .await
+        .expect("committed quota attempts JSON");
+    let request_attempts = attempts_for_request(&attempts, &request_id);
+    assert_eq!(request_attempts.len(), 1);
+    assert_eq!(request_attempts[0]["error_class"], "provider_quota");
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("committed quota status response")
+        .json::<Value>()
+        .await
+        .expect("committed quota status JSON");
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["circuit"]["mode"], "open");
+    assert_eq!(target["circuit"]["reason"], "provider_quota");
+}
+
+#[tokio::test]
 async fn responses_nonstream_contains_translated_reasoning_output() {
     let primary = MockProvider::start(vec![MockReply::json(
         StatusCode::OK,
@@ -2359,6 +2774,8 @@ async fn responses_nonstream_contains_translated_reasoning_output() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.json::<Value>().await.expect("Responses JSON");
     assert_eq!(body["model"], LOGICAL_MODEL);
+    assert_eq!(body["instructions"], "be concise");
+    assert!(body.get("store").is_none());
     assert_eq!(body["output"][0]["type"], "reasoning");
     assert_eq!(
         body["output"][0]["content"][0]["text"],
@@ -2371,7 +2788,7 @@ async fn responses_nonstream_contains_translated_reasoning_output() {
 }
 
 #[tokio::test]
-async fn anthropic_nonstream_contains_thinking_and_text() {
+async fn anthropic_translation_does_not_fabricate_thinking_signatures() {
     let primary = MockProvider::start(vec![MockReply::json(
         StatusCode::OK,
         chat_completion("anthropic thinking", "anthropic text"),
@@ -2394,10 +2811,11 @@ async fn anthropic_nonstream_contains_thinking_and_text() {
         .expect("Anthropic response");
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.json::<Value>().await.expect("Anthropic JSON");
-    assert_eq!(body["content"][0]["type"], "thinking");
-    assert_eq!(body["content"][0]["thinking"], "anthropic thinking");
-    assert_eq!(body["content"][1]["type"], "text");
-    assert_eq!(body["content"][1]["text"], "anthropic text");
+    assert_eq!(body["model"], LOGICAL_MODEL);
+    assert_eq!(body["content"].as_array().unwrap().len(), 1);
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][0]["text"], "anthropic text");
+    assert!(!body.to_string().contains("signature"));
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 0);
 }
@@ -2474,10 +2892,7 @@ async fn tool_call_history_is_preserved_and_upstream_validates_missing_reasoning
         .await
         .expect("missing reasoning JSON");
     assert_eq!(missing_error["error"]["type"], "client_request");
-    assert_eq!(
-        missing_error["error"]["message"],
-        "reasoning_content is required"
-    );
+    assert_eq!(missing_error["error"]["message"], "upstream request failed");
     assert_eq!(primary.calls().await, 2);
     assert_eq!(fallback.calls().await, 0);
     let sent_bodies = primary.request_bodies().await;
@@ -2523,7 +2938,7 @@ async fn circuit_recovers_primary_after_persisted_transient_failure() {
         .await
         .expect("first recovery request");
     assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(header_value(&first, "x-relay-provider"), "deepseek");
+    assert_eq!(header_value(&first, "x-relay-backend"), "deepseek");
     let _ = first.json::<Value>().await.expect("first recovery JSON");
 
     let second = client
@@ -2534,7 +2949,7 @@ async fn circuit_recovers_primary_after_persisted_transient_failure() {
         .await
         .expect("recovery probe request");
     assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(header_value(&second, "x-relay-provider"), "opencode-go");
+    assert_eq!(header_value(&second, "x-relay-backend"), "opencode-go");
     assert_eq!(header_value(&second, "x-relay-fallback"), "0");
     let second_body = second.json::<Value>().await.expect("second recovery JSON");
     assert_eq!(
@@ -2565,6 +2980,284 @@ async fn circuit_recovers_primary_after_persisted_transient_failure() {
         .await
         .expect("recovery attempts JSON");
     assert_eq!(attempts["attempts"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn abandoned_half_open_stream_probe_is_released_before_primary_recovers() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"trip primary"}}),
+        )
+        .with_header("retry-after", "0"),
+        MockReply::hanging_sse(chat_stream("probe reasoning", "probe chunk", false)),
+        MockReply::sse(chat_stream("recovered reasoning", "recovered answer", true)),
+    ])
+    .await;
+    let fallback = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("fallback reasoning", "fallback answer"),
+    )])
+    .await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("initial transient response");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(header_value(&first, "x-relay-backend"), "deepseek");
+    assert_eq!(header_value(&first, "x-relay-fallback"), "1");
+    assert_eq!(
+        header_value(&first, "x-relay-fallback-reason"),
+        "provider_transient"
+    );
+    let _ = first.json::<Value>().await.expect("initial fallback JSON");
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("initial circuit status response")
+        .json::<Value>()
+        .await
+        .expect("initial circuit status JSON");
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["circuit"]["mode"], "open");
+    assert_eq!(target["circuit"]["reason"], "provider_transient");
+
+    let mut abandoned_probe = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&{
+            let mut body = chat_request();
+            body["stream"] = json!(true);
+            body
+        })
+        .send()
+        .await
+        .expect("half-open streaming probe response");
+    assert_eq!(abandoned_probe.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&abandoned_probe, "x-relay-backend"),
+        "opencode-go"
+    );
+    assert_eq!(header_value(&abandoned_probe, "x-relay-fallback"), "0");
+    let chunk = abandoned_probe
+        .chunk()
+        .await
+        .expect("half-open probe first chunk")
+        .expect("half-open probe chunk present");
+    assert!(String::from_utf8_lossy(&chunk).contains("probe chunk"));
+    drop(abandoned_probe);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = client
+                .get(gateway.url("/api/status"))
+                .send()
+                .await
+                .expect("abandoned probe status response")
+                .json::<Value>()
+                .await
+                .expect("abandoned probe status JSON");
+            let target = status_target(&status, "opencode-go");
+            if target["circuit"]["mode"] == "open" && target["circuit"]["probe_in_flight"] == false
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("abandoned probe released");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    let mut recovered_body = chat_request();
+    recovered_body["stream"] = json!(true);
+    let recovered = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&recovered_body)
+        .send()
+        .await
+        .expect("recovered primary stream response");
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert_eq!(header_value(&recovered, "x-relay-backend"), "opencode-go");
+    assert_eq!(header_value(&recovered, "x-relay-fallback"), "0");
+    let stream = recovered.text().await.expect("recovered primary stream");
+    assert!(stream.contains("recovered answer"));
+    assert!(stream.contains("data: [DONE]"));
+    assert_eq!(primary.calls().await, 3);
+    assert_eq!(fallback.calls().await, 1);
+}
+
+#[tokio::test]
+async fn concurrent_delayed_primary_429s_count_one_circuit_failure() {
+    let primary = MockProvider::start(
+        (0..8)
+            .map(|_| {
+                MockReply::json(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    json!({"error":{"message":"primary capacity reached"}}),
+                )
+                .delayed(Duration::from_millis(500))
+            })
+            .collect(),
+    )
+    .await;
+    let fallback = MockProvider::start(
+        (0..8)
+            .map(|index| {
+                MockReply::json(
+                    StatusCode::OK,
+                    chat_completion("fallback reasoning", &format!("fallback answer {index}")),
+                )
+            })
+            .collect(),
+    )
+    .await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    let requests = (0..8)
+        .map(|_| {
+            let client = client.clone();
+            let url = gateway.url("/v1/chat/completions");
+            tokio::spawn(async move {
+                client
+                    .post(url)
+                    .header("x-relay-include-metadata", "1")
+                    .json(&chat_request())
+                    .send()
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if primary.calls().await == 8 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("all delayed primary 429s reached upstream");
+
+    let responses = futures_util::future::join_all(requests).await;
+    for response in responses {
+        let response = response
+            .expect("concurrent gateway request task")
+            .expect("concurrent gateway response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_value(&response, "x-relay-backend"), "deepseek");
+        assert_eq!(header_value(&response, "x-relay-fallback"), "1");
+        let _ = response
+            .json::<Value>()
+            .await
+            .expect("concurrent fallback JSON");
+    }
+
+    assert_eq!(primary.calls().await, 8);
+    assert_eq!(fallback.calls().await, 8);
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("concurrent circuit status response")
+        .json::<Value>()
+        .await
+        .expect("concurrent circuit status JSON");
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["circuit"]["mode"], "open");
+    assert_eq!(target["circuit"]["reason"], "provider_capacity");
+    assert_eq!(target["circuit"]["consecutive_failures"], 1);
+    assert_eq!(target["circuit"]["backoff_level"], 1);
+}
+
+#[tokio::test]
+async fn opencode_go_usage_limit_error_is_quota_and_caps_retry_after() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({
+                "type":"error",
+                "error":{
+                    "type":"GoUsageLimitError",
+                    "message":"Subscription quota exceeded. You can continue using free models."
+                },
+                "metadata":{"limitName":"5 hour"}
+            }),
+        )
+        .with_header("retry-after", "999999999999"),
+    ])
+    .await;
+    let fallback = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("fallback reasoning", "fallback answer"),
+    )])
+    .await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("quota fallback response");
+    let request_id = header_value(&response, "x-relay-request-id");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-backend"), "deepseek");
+    assert_eq!(header_value(&response, "x-relay-fallback"), "1");
+    assert_eq!(
+        header_value(&response, "x-relay-fallback-reason"),
+        "provider_quota"
+    );
+    let _ = response.json::<Value>().await.expect("quota fallback JSON");
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=20"))
+        .send()
+        .await
+        .expect("quota attempts response")
+        .json::<Value>()
+        .await
+        .expect("quota attempts JSON");
+    let request_attempts = attempts_for_request(&attempts, &request_id);
+    let primary_attempt = request_attempts
+        .iter()
+        .find(|attempt| attempt["backend"] == "opencode-go")
+        .expect("quota primary attempt");
+    assert_eq!(primary_attempt["error_class"], "provider_quota");
+    assert!(primary_attempt["retry_after_ms"].as_i64().unwrap() > 900_000);
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("quota circuit status response")
+        .json::<Value>()
+        .await
+        .expect("quota circuit status JSON");
+    let target = status_target(&status, "opencode-go");
+    assert_eq!(target["circuit"]["mode"], "open");
+    assert_eq!(target["circuit"]["reason"], "provider_quota");
+    let opened_at = target["circuit"]["opened_at_ms"]
+        .as_i64()
+        .expect("quota circuit opened timestamp");
+    let next_probe_at = target["circuit"]["next_probe_at_ms"]
+        .as_i64()
+        .expect("quota next probe timestamp");
+    assert!(next_probe_at >= opened_at);
+    assert!(next_probe_at - opened_at <= Duration::from_secs(15 * 60).as_millis() as i64);
 }
 
 #[tokio::test]
@@ -2617,7 +3310,7 @@ async fn unused_later_layer_does_not_claim_a_half_open_probe() {
         .await
         .expect("primary recovery probe");
     assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(header_value(&second, "x-relay-provider"), "opencode-go");
+    assert_eq!(header_value(&second, "x-relay-backend"), "opencode-go");
     assert_eq!(fallback.calls().await, 1);
 
     let third = client
@@ -2628,7 +3321,7 @@ async fn unused_later_layer_does_not_claim_a_half_open_probe() {
         .await
         .expect("fallback recovery probe");
     assert_eq!(third.status(), StatusCode::OK);
-    assert_eq!(header_value(&third, "x-relay-provider"), "deepseek");
+    assert_eq!(header_value(&third, "x-relay-backend"), "deepseek");
     assert_eq!(primary.calls().await, 3);
     assert_eq!(fallback.calls().await, 2);
 }
@@ -2665,6 +3358,15 @@ async fn routing_endpoints_report_configured_hierarchy_and_final_key_usage() {
     assert_eq!(routing["models"][0]["layers"][0]["name"], "plan");
     assert_eq!(routing["models"][0]["layers"][0]["strategy"], "random");
     assert_eq!(
+        routing["models"][0]["layers"][0]["targets"][0]["backend"],
+        "opencode-go"
+    );
+    assert!(
+        routing["models"][0]["layers"][0]["targets"][0]
+            .get("provider")
+            .is_none()
+    );
+    assert_eq!(
         routing["models"][0]["layers"][0]["targets"][0]["credential"],
         "go-plan"
     );
@@ -2690,6 +3392,7 @@ async fn routing_endpoints_report_configured_hierarchy_and_final_key_usage() {
     assert_eq!(stats["totals"]["total_tokens"], 18);
     assert_eq!(stats["layers"][0]["totals"]["calls"], 1);
     assert_eq!(stats["layers"][0]["targets"][0]["totals"]["calls"], 1);
+    assert_eq!(stats["layers"][0]["targets"][0]["backend"], "opencode-go");
     assert_eq!(stats["layers"][1]["totals"]["calls"], 0);
     assert_eq!(stats["unattributed"]["calls"], 0);
     assert_eq!(stats["historical_targets"].as_array().unwrap().len(), 0);
@@ -2716,8 +3419,9 @@ async fn routing_endpoints_report_configured_hierarchy_and_final_key_usage() {
         .await
         .expect("overview stats JSON");
     assert_eq!(overview["requests"]["total"], 1);
-    assert_eq!(overview["providers"]["opencode-go"]["attempts"], 1);
-    assert_eq!(overview["providers"]["opencode-go"]["successes"], 1);
+    assert_eq!(overview["backends"]["opencode-go"]["attempts"], 1);
+    assert_eq!(overview["backends"]["opencode-go"]["successes"], 1);
+    assert!(overview.get("providers").is_none());
 
     let unknown = client
         .get(gateway.url("/api/routing/stats?model=missing&window=all"))

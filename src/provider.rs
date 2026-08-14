@@ -5,21 +5,35 @@ use reqwest::{
     header::{HeaderMap, RETRY_AFTER},
 };
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::{
     config::{
-        CredentialConfig, ModelPricingConfig, ProviderConfig, ProviderKind, ProviderModelConfig,
+        AdapterKind, BackendConfig, BackendModelConfig, CredentialConfig, ModelPricingConfig,
     },
     types::{FailureClass, Protocol},
 };
 
+mod adapters;
+
+use adapters::ProviderAdapter;
+pub(crate) use adapters::{EndpointPolicy, ModelProtocolPolicy, adapter_for};
+
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 
+#[derive(Debug)]
+pub(super) struct ErrorDetails {
+    pub(super) classification_message: String,
+    pub(super) safe_message: String,
+    pub(super) error_type: Option<String>,
+}
+
 #[derive(Clone)]
-pub struct ProviderClient {
-    provider_id: String,
+pub struct BackendClient {
+    backend_id: String,
     credential_id: String,
-    kind: ProviderKind,
+    adapter_kind: AdapterKind,
+    adapter: &'static dyn ProviderAdapter,
     endpoint: String,
     api_key: String,
     model: String,
@@ -29,19 +43,60 @@ pub struct ProviderClient {
 }
 
 #[derive(Debug)]
-pub struct ProviderError {
+pub struct BackendError {
     pub class: FailureClass,
     pub status: Option<StatusCode>,
     pub retry_after: Option<Duration>,
     pub safe_message: String,
 }
 
-impl ProviderClient {
+#[derive(Debug, Error)]
+pub enum BackendBuildError {
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error("adapter {0} is not registered")]
+    UnsupportedAdapter(&'static str),
+    #[error("custom backend {0} has no validated endpoint")]
+    MissingEndpoint(String),
+    #[error("custom backend {0} endpoint is not an absolute HTTP(S) URL")]
+    InvalidEndpoint(String),
+    #[error("backend {backend} has no protocol contract for model {model}")]
+    UnknownModel { backend: String, model: String },
+    #[error("backend {backend} model {model} has no validated protocols")]
+    MissingProtocols { backend: String, model: String },
+    #[error("backend {backend} model {model} does not support protocol {protocol}")]
+    UnsupportedProtocol {
+        backend: String,
+        model: String,
+        protocol: &'static str,
+    },
+}
+
+impl BackendClient {
     pub fn new(
-        provider: &ProviderConfig,
+        backend: &BackendConfig,
         credential: &CredentialConfig,
-        model: &ProviderModelConfig,
-    ) -> Result<Self, reqwest::Error> {
+        model: &BackendModelConfig,
+    ) -> Result<Self, BackendBuildError> {
+        Self::build(backend, credential, model, None)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn new_with_endpoint_override(
+        backend: &BackendConfig,
+        credential: &CredentialConfig,
+        model: &BackendModelConfig,
+        endpoint_override: Option<&str>,
+    ) -> Result<Self, BackendBuildError> {
+        Self::build(backend, credential, model, endpoint_override)
+    }
+
+    fn build(
+        backend: &BackendConfig,
+        credential: &CredentialConfig,
+        model: &BackendModelConfig,
+        endpoint_override: Option<&str>,
+    ) -> Result<Self, BackendBuildError> {
         let client = reqwest::Client::builder()
             .user_agent(concat!("quotamux/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
@@ -50,30 +105,74 @@ impl ProviderClient {
             .pool_idle_timeout(Duration::from_secs(90))
             .http2_adaptive_window(true)
             .build()?;
+        let adapter = adapter_for(backend.adapter).ok_or(BackendBuildError::UnsupportedAdapter(
+            backend.adapter.as_str(),
+        ))?;
+        let endpoint_policy = adapter.endpoint_policy();
+        let endpoint = endpoint_override.unwrap_or_else(|| match endpoint_policy {
+            EndpointPolicy::Official(endpoint) => endpoint,
+            EndpointPolicy::ConfiguredExact => backend.endpoint.as_deref().unwrap_or_default(),
+        });
+        if endpoint.is_empty() {
+            return Err(BackendBuildError::MissingEndpoint(backend.id.clone()));
+        }
+        if endpoint_override.is_none() && endpoint_policy == EndpointPolicy::ConfiguredExact {
+            let valid = reqwest::Url::parse(endpoint).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+            });
+            if !valid {
+                return Err(BackendBuildError::InvalidEndpoint(backend.id.clone()));
+            }
+        }
+        let protocols = match adapter.model_protocol_policy() {
+            ModelProtocolPolicy::Listed => model.protocols.clone(),
+            ModelProtocolPolicy::OfficialCatalog => {
+                vec![adapter.protocol_for_model(&model.name).ok_or_else(|| {
+                    BackendBuildError::UnknownModel {
+                        backend: backend.id.clone(),
+                        model: model.name.clone(),
+                    }
+                })?]
+            }
+        };
+        if protocols.is_empty() {
+            return Err(BackendBuildError::MissingProtocols {
+                backend: backend.id.clone(),
+                model: model.name.clone(),
+            });
+        }
+        if let Some(protocol) = protocols
+            .iter()
+            .find(|protocol| !adapter.supports_protocol(**protocol))
+        {
+            return Err(BackendBuildError::UnsupportedProtocol {
+                backend: backend.id.clone(),
+                model: model.name.clone(),
+                protocol: protocol.as_str(),
+            });
+        }
         Ok(Self {
-            provider_id: provider.id.clone(),
+            backend_id: backend.id.clone(),
             credential_id: credential.id.clone(),
-            kind: provider.kind,
-            endpoint: provider
-                .endpoint()
-                .expect("validated provider endpoint")
-                .to_string(),
+            adapter_kind: backend.adapter,
+            adapter,
+            endpoint: endpoint.to_string(),
             api_key: credential.api_key.clone(),
             model: model.name.clone(),
-            protocols: model.native_protocols().to_vec(),
+            protocols,
             pricing: model.pricing,
             client,
         })
     }
 
-    pub fn provider_id(&self) -> &str {
-        &self.provider_id
+    pub fn backend_id(&self) -> &str {
+        &self.backend_id
     }
     pub fn credential_id(&self) -> &str {
         &self.credential_id
     }
-    pub const fn kind(&self) -> ProviderKind {
-        self.kind
+    pub const fn adapter_kind(&self) -> AdapterKind {
+        self.adapter_kind
     }
     pub fn model(&self) -> &str {
         &self.model
@@ -102,29 +201,15 @@ impl ProviderClient {
         protocol: Protocol,
         body: &Value,
         inbound_headers: &HeaderMap,
-    ) -> Result<Response, ProviderError> {
+    ) -> Result<Response, BackendError> {
         debug_assert!(self.protocols.contains(&protocol));
-        let url = self.url(protocol);
+        let url = self.request_url(protocol);
         let mut request = self.client.post(url).json(body);
-        match (self.kind, protocol) {
-            (ProviderKind::DeepSeekOfficial, Protocol::AnthropicMessages)
-            | (ProviderKind::KimiCode, Protocol::AnthropicMessages)
-            | (ProviderKind::CustomAnthropic, Protocol::AnthropicMessages) => {
-                request = request.header("x-api-key", &self.api_key).header(
-                    "anthropic-version",
-                    inbound_headers
-                        .get("anthropic-version")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("2023-06-01"),
-                );
-                if let Some(beta) = inbound_headers.get("anthropic-beta") {
-                    request = request.header("anthropic-beta", beta);
-                }
-            }
-            _ => request = request.bearer_auth(&self.api_key),
-        }
+        request = self
+            .adapter
+            .apply_auth(request, &self.api_key, protocol, inbound_headers);
 
-        let response = request.send().await.map_err(|error| ProviderError {
+        let response = request.send().await.map_err(|error| BackendError {
             class: classify_transport(&error),
             status: error.status(),
             retry_after: None,
@@ -136,76 +221,75 @@ impl ProviderClient {
 
         let status = response.status();
         let retry_after = parse_retry_after(response.headers());
-        let body = response.bytes().await.unwrap_or_default();
-        let body = &body[..body.len().min(MAX_ERROR_BYTES)];
-        let safe_message = extract_error_message(body);
-        let class = classify_provider_status(self.kind, status, &safe_message);
-        Err(ProviderError {
+        let body = read_error_body(response).await;
+        let details = extract_error_details(&body);
+        let class = self.adapter.classify_error(status, &details);
+        Err(BackendError {
             class,
             status: Some(status),
             retry_after,
-            safe_message,
+            safe_message: details.safe_message,
         })
     }
 
-    fn url(&self, protocol: Protocol) -> String {
-        if self.kind.uses_exact_endpoint() {
-            return self.endpoint.clone();
+    pub fn request_url(&self, protocol: Protocol) -> String {
+        self.adapter.build_url(&self.endpoint, protocol)
+    }
+
+    pub fn classify_semantic_error(
+        &self,
+        status: StatusCode,
+        value: &Value,
+    ) -> Option<BackendError> {
+        let is_error = value.get("error").is_some_and(|error| !error.is_null())
+            || matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("error" | "response.failed")
+            );
+        if !is_error {
+            return None;
         }
-        let base = self.endpoint.trim_end_matches('/');
-        match (self.kind, protocol) {
-            (_, Protocol::OpenAiChat) => format!("{base}/chat/completions"),
-            (_, Protocol::OpenAiResponses) => format!("{base}/responses"),
-            (ProviderKind::DeepSeekOfficial, Protocol::AnthropicMessages) => {
-                format!("{base}/anthropic/v1/messages")
-            }
-            (_, Protocol::AnthropicMessages) => format!("{base}/messages"),
-        }
+        let details = extract_error_details_from_value(value).unwrap_or_else(|| ErrorDetails {
+            classification_message: String::new(),
+            safe_message: "upstream returned an error envelope".into(),
+            error_type: None,
+        });
+        Some(BackendError {
+            class: self.adapter.classify_error(status, &details),
+            status: Some(status),
+            retry_after: None,
+            safe_message: details.safe_message,
+        })
     }
 }
 
-pub fn classify_status(status: StatusCode, message: &str) -> FailureClass {
+async fn read_error_body(mut response: Response) -> Vec<u8> {
+    let mut body = Vec::with_capacity(MAX_ERROR_BYTES);
+    while body.len() < MAX_ERROR_BYTES {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
+        };
+        let remaining = MAX_ERROR_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    body
+}
+
+pub fn classify_status(status: StatusCode, _message: &str) -> FailureClass {
     match status.as_u16() {
-        400 | 422 => FailureClass::ClientRequest,
+        400 | 409 | 413 | 414 | 422 | 431 => FailureClass::ClientRequest,
         401 => FailureClass::ProviderAuth,
         402 => FailureClass::ProviderBilling,
-        403 if contains_any(message, &["china", "region", "hosted in", "configuration"]) => {
-            FailureClass::ProviderConfiguration
-        }
         403 => FailureClass::ProviderAuth,
-        404 => FailureClass::ProviderConfiguration,
-        408 | 425 | 500 | 502 | 503 | 504 => FailureClass::ProviderTransient,
+        404 | 405 | 415 => FailureClass::ProviderConfiguration,
+        408 | 425 => FailureClass::ProviderTransient,
         429 => FailureClass::ProviderCapacity,
+        499 => FailureClass::ClientCancelled,
         code if (400..500).contains(&code) => FailureClass::ProviderUnknown4xx,
+        code if (500..600).contains(&code) => FailureClass::ProviderTransient,
         _ => FailureClass::ProviderUnknown5xxOrTransport,
     }
-}
-
-fn classify_provider_status(kind: ProviderKind, status: StatusCode, message: &str) -> FailureClass {
-    if kind == ProviderKind::KimiCode {
-        match status.as_u16() {
-            401 if contains_any(
-                message,
-                &[
-                    "does not have access",
-                    "supports only",
-                    "model id does not exist",
-                ],
-            ) =>
-            {
-                return FailureClass::ProviderConfiguration;
-            }
-            402 => return FailureClass::ProviderTransient,
-            403 if contains_any(message, &["usage limit", "quota", "billing cycle"]) => {
-                return FailureClass::ProviderBilling;
-            }
-            429 if contains_any(message, &["usage limit", "quota", "billing cycle"]) => {
-                return FailureClass::ProviderBilling;
-            }
-            _ => {}
-        }
-    }
-    classify_status(status, message)
 }
 
 fn classify_transport(error: &reqwest::Error) -> FailureClass {
@@ -225,29 +309,62 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     when.duration_since(std::time::SystemTime::now()).ok()
 }
 
-fn extract_error_message(bytes: &[u8]) -> String {
-    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-        if let Some(error) = value.get("error") {
-            if let Some(message) = error.get("message").and_then(Value::as_str) {
-                return truncate(message);
-            }
-            if let Some(message) = error.as_str() {
-                return truncate(message);
-            }
-        }
-        if let Some(message) = value.get("message").and_then(Value::as_str) {
-            return truncate(message);
-        }
+fn extract_error_details(bytes: &[u8]) -> ErrorDetails {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes)
+        && let Some(details) = extract_error_details_from_value(&value)
+    {
+        return details;
     }
     let text = String::from_utf8_lossy(bytes);
     if text.to_ascii_lowercase().contains("error code: 1010") {
-        return "Cloudflare rejected the HTTP client signature (error 1010)".into();
+        return ErrorDetails {
+            classification_message: truncate(text.trim()),
+            safe_message: "Cloudflare rejected the HTTP client signature (error 1010)".into(),
+            error_type: None,
+        };
     }
-    if text.trim().is_empty() {
-        "upstream request failed".into()
+    ErrorDetails {
+        classification_message: truncate(text.trim()),
+        safe_message: "upstream request failed".into(),
+        error_type: None,
+    }
+}
+
+fn extract_error_details_from_value(value: &Value) -> Option<ErrorDetails> {
+    let (message, error_type) = if let Some(error) = value.get("error") {
+        if let Some(message) = error.get("message").and_then(Value::as_str) {
+            (
+                message,
+                error
+                    .get("type")
+                    .or_else(|| error.get("code"))
+                    .and_then(Value::as_str),
+            )
+        } else {
+            let message = error.as_str()?;
+            (
+                message,
+                value
+                    .get("type")
+                    .or_else(|| value.get("code"))
+                    .and_then(Value::as_str),
+            )
+        }
     } else {
-        truncate(text.trim())
-    }
+        let message = value.get("message").and_then(Value::as_str)?;
+        (
+            message,
+            value
+                .get("type")
+                .or_else(|| value.get("code"))
+                .and_then(Value::as_str),
+        )
+    };
+    Some(ErrorDetails {
+        classification_message: truncate(message),
+        safe_message: "upstream request failed".into(),
+        error_type: error_type.map(truncate),
+    })
 }
 
 fn sanitize_transport_error(error: &reqwest::Error) -> String {
@@ -263,32 +380,48 @@ fn sanitize_transport_error(error: &reqwest::Error) -> String {
 }
 
 fn truncate(value: &str) -> String {
-    value.chars().take(512).collect()
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    let haystack = haystack.to_ascii_lowercase();
-    needles.iter().any(|needle| haystack.contains(needle))
+    value
+        .split_whitespace()
+        .map(|word| if word.contains("://") { "[url]" } else { word })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(512)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn client_for(kind: ProviderKind, model: &str) -> ProviderClient {
-        let provider = ProviderConfig {
+    fn classify(
+        kind: AdapterKind,
+        status: StatusCode,
+        message: &str,
+        error_type: Option<&str>,
+    ) -> FailureClass {
+        adapter_for(kind).unwrap().classify_error(
+            status,
+            &ErrorDetails {
+                classification_message: message.into(),
+                safe_message: message.into(),
+                error_type: error_type.map(str::to_string),
+            },
+        )
+    }
+
+    fn client_for(kind: AdapterKind, model: &str) -> BackendClient {
+        let backend = BackendConfig {
             id: kind.as_str().into(),
-            kind,
+            adapter: kind,
             endpoint: None,
             credentials: vec![CredentialConfig {
                 id: "test-key".into(),
                 api_key: "secret".into(),
             }],
-            models: vec![ProviderModelConfig {
+            models: vec![BackendModelConfig {
                 name: model.into(),
-                endpoint_protocol: (kind == ProviderKind::OpenCodeGo)
-                    .then_some(Protocol::OpenAiChat),
-                protocols: if kind == ProviderKind::OpenCodeGo {
+                protocols: if kind == AdapterKind::OpenCodeGo {
                     Vec::new()
                 } else {
                     vec![Protocol::OpenAiChat]
@@ -296,19 +429,19 @@ mod tests {
                 pricing: None,
             }],
         };
-        ProviderClient::new(&provider, &provider.credentials[0], &provider.models[0]).unwrap()
+        BackendClient::new(&backend, &backend.credentials[0], &backend.models[0]).unwrap()
     }
 
     #[test]
-    fn kimi_k3_provider_kinds_use_their_distinct_official_urls() {
-        let mut code = client_for(ProviderKind::KimiCode, "k3");
+    fn kimi_k3_adapters_use_their_distinct_official_urls() {
+        let mut code = client_for(AdapterKind::KimiCode, "k3");
         code.protocols.push(Protocol::AnthropicMessages);
         assert_eq!(
-            code.url(Protocol::OpenAiChat),
+            code.request_url(Protocol::OpenAiChat),
             "https://api.kimi.com/coding/v1/chat/completions"
         );
         assert_eq!(
-            code.url(Protocol::AnthropicMessages),
+            code.request_url(Protocol::AnthropicMessages),
             "https://api.kimi.com/coding/v1/messages"
         );
         assert_eq!(
@@ -316,34 +449,34 @@ mod tests {
             Protocol::AnthropicMessages
         );
 
-        let official = client_for(ProviderKind::KimiOfficial, "kimi-k3");
+        let official = client_for(AdapterKind::KimiOfficial, "kimi-k3");
         assert_eq!(
-            official.url(Protocol::OpenAiChat),
+            official.request_url(Protocol::OpenAiChat),
             "https://api.moonshot.cn/v1/chat/completions"
         );
 
-        let go = client_for(ProviderKind::OpenCodeGo, "kimi-k3");
+        let go = client_for(AdapterKind::OpenCodeGo, "kimi-k3");
         assert_eq!(
-            go.url(Protocol::OpenAiChat),
+            go.request_url(Protocol::OpenAiChat),
             "https://opencode.ai/zen/go/v1/chat/completions"
         );
 
-        let mut deepseek = client_for(ProviderKind::DeepSeekOfficial, "deepseek-v4-pro");
+        let mut deepseek = client_for(AdapterKind::DeepSeekOfficial, "deepseek-v4-pro");
         deepseek.protocols = vec![
             Protocol::OpenAiChat,
             Protocol::OpenAiResponses,
             Protocol::AnthropicMessages,
         ];
         assert_eq!(
-            deepseek.url(Protocol::OpenAiChat),
+            deepseek.request_url(Protocol::OpenAiChat),
             "https://api.deepseek.com/chat/completions"
         );
         assert_eq!(
-            deepseek.url(Protocol::OpenAiResponses),
+            deepseek.request_url(Protocol::OpenAiResponses),
             "https://api.deepseek.com/responses"
         );
         assert_eq!(
-            deepseek.url(Protocol::AnthropicMessages),
+            deepseek.request_url(Protocol::AnthropicMessages),
             "https://api.deepseek.com/anthropic/v1/messages"
         );
         for protocol in [
@@ -357,25 +490,118 @@ mod tests {
 
     #[test]
     fn opencode_go_uses_each_models_explicit_official_protocol() {
-        let chat = client_for(ProviderKind::OpenCodeGo, "kimi-k3");
+        let adapter = adapter_for(AdapterKind::OpenCodeGo).unwrap();
+        for (protocol, models) in [
+            (Protocol::OpenAiResponses, &["grok-4.5", "gpt-5.6-luna"][..]),
+            (
+                Protocol::OpenAiChat,
+                &[
+                    "glm-5.3",
+                    "glm-5.2",
+                    "glm-5.1",
+                    "kimi-k3",
+                    "kimi-k2.7-code",
+                    "kimi-k2.6",
+                    "deepseek-v4-pro",
+                    "deepseek-v4-flash",
+                    "mimo-v2.5",
+                    "mimo-v2.5-pro",
+                    "hy3",
+                ][..],
+            ),
+            (
+                Protocol::AnthropicMessages,
+                &[
+                    "minimax-m3",
+                    "minimax-m2.7",
+                    "minimax-m2.5",
+                    "qwen3.8-max",
+                    "qwen3.7-max",
+                    "qwen3.7-plus",
+                    "qwen3.6-plus",
+                ][..],
+            ),
+        ] {
+            for model in models {
+                assert_eq!(adapter.protocol_for_model(model), Some(protocol), "{model}");
+                let client = client_for(AdapterKind::OpenCodeGo, model);
+                assert_eq!(client.protocol_for(protocol), protocol, "{model}");
+            }
+        }
         assert_eq!(
-            chat.protocol_for(Protocol::AnthropicMessages),
-            Protocol::OpenAiChat
+            adapter.protocol_for_model("not-in-the-official-catalog"),
+            None
         );
+    }
 
-        let mut anthropic = client_for(ProviderKind::OpenCodeGo, "qwen3.8-max");
-        anthropic.protocols = vec![Protocol::AnthropicMessages];
+    #[test]
+    fn custom_endpoint_is_exact_and_never_uses_official_error_classification() {
+        let backend = BackendConfig {
+            id: "customer".into(),
+            adapter: AdapterKind::CustomChatCompletions,
+            endpoint: Some("https://customer.example/private/inference".into()),
+            credentials: vec![CredentialConfig {
+                id: "customer-key".into(),
+                api_key: "secret".into(),
+            }],
+            models: vec![BackendModelConfig {
+                name: "customer-model".into(),
+                protocols: vec![Protocol::OpenAiChat],
+                pricing: None,
+            }],
+        };
+        let client =
+            BackendClient::new(&backend, &backend.credentials[0], &backend.models[0]).unwrap();
         assert_eq!(
-            anthropic.protocol_for(Protocol::AnthropicMessages),
-            Protocol::AnthropicMessages
+            client.request_url(Protocol::OpenAiChat),
+            "https://customer.example/private/inference"
         );
+        assert_eq!(
+            classify(
+                AdapterKind::CustomChatCompletions,
+                StatusCode::TOO_MANY_REQUESTS,
+                "Subscription quota exceeded",
+                Some("GoUsageLimitError"),
+            ),
+            FailureClass::ProviderCapacity
+        );
+    }
 
-        let mut responses = client_for(ProviderKind::OpenCodeGo, "gpt-5.6-luna");
-        responses.protocols = vec![Protocol::OpenAiResponses];
-        assert_eq!(
-            responses.protocol_for(Protocol::OpenAiResponses),
-            Protocol::OpenAiResponses
-        );
+    #[test]
+    fn public_client_constructor_rejects_unvalidated_backend_shapes_without_panicking() {
+        let mut backend = BackendConfig {
+            id: "bad".into(),
+            adapter: AdapterKind::OllamaCloud,
+            endpoint: None,
+            credentials: vec![CredentialConfig {
+                id: "key".into(),
+                api_key: "secret".into(),
+            }],
+            models: vec![BackendModelConfig {
+                name: "model".into(),
+                protocols: vec![Protocol::OpenAiChat],
+                pricing: None,
+            }],
+        };
+        assert!(matches!(
+            BackendClient::new(&backend, &backend.credentials[0], &backend.models[0]),
+            Err(BackendBuildError::UnsupportedAdapter("ollama-cloud"))
+        ));
+
+        backend.adapter = AdapterKind::CustomChatCompletions;
+        backend.endpoint = Some("relative/path".into());
+        assert!(matches!(
+            BackendClient::new(&backend, &backend.credentials[0], &backend.models[0]),
+            Err(BackendBuildError::InvalidEndpoint(_))
+        ));
+
+        backend.adapter = AdapterKind::KimiOfficial;
+        backend.endpoint = None;
+        backend.models[0].protocols = vec![Protocol::AnthropicMessages];
+        assert!(matches!(
+            BackendClient::new(&backend, &backend.credentials[0], &backend.models[0]),
+            Err(BackendBuildError::UnsupportedProtocol { .. })
+        ));
     }
 
     #[test]
@@ -401,43 +627,241 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "model is hosted in China; enable region"
             ),
-            FailureClass::ProviderConfiguration
+            FailureClass::ProviderAuth
         );
     }
 
     #[test]
     fn classifies_kimi_code_entitlement_and_quota_errors() {
         assert_eq!(
-            classify_provider_status(
-                ProviderKind::KimiCode,
+            classify(
+                AdapterKind::KimiCode,
                 StatusCode::UNAUTHORIZED,
-                "Your current plan supports only kimi-k3 up to 256K context"
+                "Your current plan supports only kimi-k3 up to 256K context",
+                None,
             ),
             FailureClass::ProviderConfiguration
         );
         assert_eq!(
-            classify_provider_status(
-                ProviderKind::KimiCode,
-                StatusCode::FORBIDDEN,
-                "You've reached your usage limit for this billing cycle"
+            classify(
+                AdapterKind::KimiCode,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_argument: bot_id value does not match id_kinds: [uuid_v4]",
+                None,
             ),
-            FailureClass::ProviderBilling
+            FailureClass::ClientRequest
         );
         assert_eq!(
-            classify_provider_status(
-                ProviderKind::KimiCode,
+            classify(
+                AdapterKind::KimiCode,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unauthenticated: failed_precondition: 该账号已被禁用。",
+                None,
+            ),
+            FailureClass::ProviderConfiguration
+        );
+        assert_eq!(
+            classify(
+                AdapterKind::KimiCode,
+                StatusCode::FORBIDDEN,
+                "You've reached your usage limit for this billing cycle",
+                Some("access_terminated_error"),
+            ),
+            FailureClass::ProviderQuota
+        );
+        assert_eq!(
+            classify(
+                AdapterKind::KimiCode,
                 StatusCode::PAYMENT_REQUIRED,
-                "unable to verify membership benefits"
+                "unable to verify membership benefits",
+                None,
             ),
             FailureClass::ProviderTransient
         );
         assert_eq!(
-            classify_provider_status(
-                ProviderKind::KimiCode,
+            classify(
+                AdapterKind::KimiCode,
                 StatusCode::TOO_MANY_REQUESTS,
-                "the engine is currently overloaded"
+                "the engine is currently overloaded",
+                None,
             ),
             FailureClass::ProviderCapacity
         );
+        assert_eq!(
+            classify(
+                AdapterKind::KimiCode,
+                StatusCode::TOO_MANY_REQUESTS,
+                "You've reached your usage limit for this period. Your quota will be refreshed in the next period.",
+                None,
+            ),
+            FailureClass::ProviderQuota
+        );
+        assert_eq!(
+            classify(
+                AdapterKind::KimiCode,
+                StatusCode::TOO_MANY_REQUESTS,
+                "You've reached kimi monthly usage limit for this billing cycle.",
+                None,
+            ),
+            FailureClass::ProviderQuota
+        );
+        assert_eq!(
+            classify(
+                AdapterKind::KimiCode,
+                StatusCode::FORBIDDEN,
+                "Access terminated.",
+                None,
+            ),
+            FailureClass::ProviderConfiguration
+        );
+    }
+
+    #[test]
+    fn classifies_opencode_go_usage_limit_from_official_error_shape() {
+        let details = extract_error_details(
+            br#"{"type":"error","error":{"type":"GoUsageLimitError","message":"Subscription quota exceeded. You can continue using free models."},"metadata":{"limitName":"5 hour"}}"#,
+        );
+        assert_eq!(details.error_type.as_deref(), Some("GoUsageLimitError"));
+        assert_eq!(
+            adapter_for(AdapterKind::OpenCodeGo)
+                .unwrap()
+                .classify_error(StatusCode::TOO_MANY_REQUESTS, &details),
+            FailureClass::ProviderQuota
+        );
+        assert_eq!(
+            classify(
+                AdapterKind::OpenCodeGo,
+                StatusCode::TOO_MANY_REQUESTS,
+                "5-hour usage limit reached. Resets in 4hr 57min.",
+                Some("GoUsageLimitError"),
+            ),
+            FailureClass::ProviderQuota
+        );
+        assert_eq!(
+            classify(
+                AdapterKind::OpenCodeGo,
+                StatusCode::TOO_MANY_REQUESTS,
+                "the upstream is overloaded",
+                None,
+            ),
+            FailureClass::ProviderCapacity
+        );
+    }
+
+    #[test]
+    fn classifies_kimi_open_platform_structured_error_types() {
+        for (error_type, expected) in [
+            ("engine_overloaded_error", FailureClass::ProviderCapacity),
+            ("rate_limit_reached_error", FailureClass::ProviderCapacity),
+            (
+                "exceeded_current_quota_error",
+                FailureClass::ProviderBilling,
+            ),
+            ("incorrect_api_key_error", FailureClass::ProviderAuth),
+            ("invalid_request_error", FailureClass::ClientRequest),
+            ("server_unavailable", FailureClass::ProviderTransient),
+        ] {
+            assert_eq!(
+                classify(
+                    AdapterKind::KimiOfficial,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "documented error",
+                    Some(error_type),
+                ),
+                expected,
+                "{error_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_request_specific_4xx_does_not_poison_a_target() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::URI_TOO_LONG,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+        ] {
+            assert_eq!(classify_status(status, ""), FailureClass::ClientRequest);
+        }
+        assert_eq!(
+            classify_status(StatusCode::METHOD_NOT_ALLOWED, ""),
+            FailureClass::ProviderConfiguration
+        );
+    }
+
+    #[test]
+    fn retry_after_supports_standard_seconds_and_rejects_unknown_formats() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(30)));
+
+        headers.insert(RETRY_AFTER, "not-a-delay".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
+
+        headers.remove(RETRY_AFTER);
+        headers.insert("retry-after-ms", "250".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn stored_upstream_errors_never_copy_untrusted_upstream_text() {
+        let details = extract_error_details(
+            br#"{"error":{"message":"Incorrect API key provided: sk-live-secret-value; manage it at https://example.com/workspace/private-id/settings"}}"#,
+        );
+        assert_eq!(details.safe_message, "upstream request failed");
+        assert!(!details.safe_message.contains("sk-live-secret-value"));
+        assert!(!details.safe_message.contains("private-id"));
+        assert!(details.classification_message.contains("Incorrect API key"));
+    }
+
+    #[test]
+    fn plain_text_upstream_errors_are_also_replaced_by_a_controlled_summary() {
+        let details = extract_error_details(
+            b"Authorization: Bearer secret-token cookie=session-secret user@example.com",
+        );
+        assert_eq!(details.safe_message, "upstream request failed");
+        assert!(!details.safe_message.contains("secret"));
+        assert!(!details.safe_message.contains('@'));
+    }
+
+    #[test]
+    fn successful_http_status_with_error_envelope_is_not_accepted_as_success() {
+        let client = client_for(AdapterKind::OpenCodeGo, "kimi-k3");
+        let error = client
+            .classify_semantic_error(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "type":"error",
+                    "error":{
+                        "type":"GoUsageLimitError",
+                        "message":"Subscription quota exceeded"
+                    }
+                }),
+            )
+            .expect("semantic error");
+        assert_eq!(error.class, FailureClass::ProviderQuota);
+        assert_eq!(error.safe_message, "upstream request failed");
+    }
+
+    #[tokio::test]
+    async fn error_response_reader_has_a_hard_memory_bound() {
+        let app = axum::Router::new().route(
+            "/error",
+            axum::routing::get(|| async { vec![b'x'; MAX_ERROR_BYTES * 4] }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let response = reqwest::get(format!("http://{address}/error"))
+            .await
+            .unwrap();
+        let body = read_error_body(response).await;
+        server.abort();
+        assert_eq!(body.len(), MAX_ERROR_BYTES);
     }
 }

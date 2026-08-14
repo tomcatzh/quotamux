@@ -1,67 +1,86 @@
 # QuotaMux
 
-QuotaMux is a local, layered gateway for equivalent LLM providers. It exposes
-user-defined model names, translates between OpenAI Chat Completions, OpenAI
-Responses, and Anthropic Messages, distributes requests across equivalent
-credentials, and falls back to later capacity or price layers before a response
-is committed.
+QuotaMux is a local LLM gateway for quota-aware routing. It exposes stable
+model names, distributes requests across equivalent upstream credentials, and
+falls back through ordered capacity layers when an upstream cannot serve a
+request.
 
-## Design principles
-
-**Native first. Transparent always. The selected upstream owns semantic
-validity.**
-
-- If the selected provider model officially supports the ingress protocol,
-  QuotaMux uses that native protocol directly and does not translate the
-  request.
-- Translation is a best-effort compatibility path used only when the selected
-  target lacks the ingress protocol. It must preserve reasoning, tool calls,
-  tool-result ordering, streaming behavior, and usage as faithfully as the
-  destination permits.
-- QuotaMux does not apply one provider's semantic restrictions to another. It
-  forwards provider-specific combinations such as thinking, `tool_choice`, and
-  tool history to the selected upstream for validation.
-- Upstream request-semantic HTTP `400`/`422` responses are returned without
-  fallback, retry, or circuit impact. Fallback is for provider and transport
-  failures covered by the routing policy, not for changing the verdict on an
-  invalid request.
-- Provider protocol capabilities are checked at startup. Unsupported declared
-  protocols produce a warning and are ignored; the request/attempt audit trail
-  records ingress, egress, provider, model, and whether translation occurred.
-
-Key capabilities:
-
-- provider definitions with exact upstream model IDs and multiple API keys;
-- public model names and explicit compatibility aliases;
-- ordered free/plan/PAYG route layers;
-- random or memory-only prompt-prefix-affinity selection inside a layer;
-- per-target circuit breaking, streaming-safe fallback, usage, cache, and cost
-  metadata;
-- protocol translation between all three public API shapes;
-- no prompt, response body, API key, or affinity fingerprint persistence.
+It accepts OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
+When the selected upstream uses another supported protocol, QuotaMux translates
+the request and response at the protocol boundary.
 
 > [!IMPORTANT]
-> QuotaMux does not currently authenticate incoming clients. Keep it on
-> `127.0.0.1`, a private network, or behind an authenticated reverse proxy. The
-> included Compose file publishes only to `127.0.0.1`.
+> QuotaMux does not authenticate inbound clients. Bind it to localhost, keep it
+> on a private network, or place it behind an authenticated reverse proxy. The
+> included Compose configuration publishes only on `127.0.0.1`.
+
+## Principles
+
+- **Configuration owns routing.** A client selects a served model and protocol;
+  it cannot select a backend, adapter, credential, or route layer.
+- **Layers express priority.** Every eligible target in one layer is exhausted
+  before QuotaMux enters the next layer.
+- **Targets inside one layer are equivalent.** They may be tried in any order.
+  Different prices or service priorities belong in different layers.
+- **Native protocol first.** QuotaMux forwards natively whenever the selected
+  target supports the ingress protocol. Translation is used only when needed.
+- **Adapters own provider behavior.** Official endpoints, authentication,
+  protocol rules, URL construction, and provider error classification live in
+  adapter code, not in user configuration.
+- **Custom endpoints stay generic.** A customer URL never inherits the special
+  behavior of an official provider adapter.
+- **Fail closed at startup.** Unknown adapters, invalid endpoints, unsupported
+  model/protocol combinations, and broken route references reject the complete
+  configuration.
+- **Fallback stops at response commitment.** QuotaMux may switch targets before
+  the first semantic response event, never after it.
+- **Routing metadata is content-free.** Prompts, responses, API keys, and
+  affinity fingerprints are not persisted.
+
+## Configuration model
+
+QuotaMux separates implementation, deployment, and routing:
+
+| Term | Meaning |
+| --- | --- |
+| provider | The external service or company. Used only as a descriptive term. |
+| adapter | QuotaMux code that implements one upstream API contract. |
+| backend | One configured upstream instance using an adapter. |
+| credential | One independently routed API key on a backend. |
+| upstream model | The exact model ID sent to that backend. |
+| target | One `(backend, credential, upstream model)` tuple. |
+| served model | The public model name accepted from clients. |
+| layer | An ordered priority group containing equivalent targets. |
+
+The relationship is:
+
+```text
+served model
+  └─ ordered layers
+       └─ targets
+            └─ backend + credential + upstream model
+                 └─ adapter
+```
+
+Configuration uses TOML and requires `config_version = 3`. Array entries belong
+to their closest preceding parent: `[[backends.credentials]]` and
+`[[backends.models]]` belong to the preceding `[[backends]]`, while
+`[[models.layers]]` belongs to the preceding `[[models]]`.
 
 ## Quick start
 
-### Docker Compose
-
 ```sh
 cp quotamux.example.toml quotamux.toml
-# Edit quotamux.toml and fill in every API key referenced by a route.
+# Add the API keys required by your routes.
 cargo run --bin quotamux -- --check
 docker compose up --build -d
 curl http://127.0.0.1:8080/healthz
 ```
 
-The dashboard and API are then available at <http://127.0.0.1:8080>. Compose
-mounts `quotamux.toml` read-only and stores request/circuit metadata in the
-`quotamux-data` volume.
+The API and dashboard are available at <http://127.0.0.1:8080>. Compose mounts
+`quotamux.toml` read-only and stores operational data in a named volume.
 
-Useful container commands:
+Useful commands:
 
 ```sh
 docker compose logs -f quotamux
@@ -69,539 +88,195 @@ docker compose restart quotamux
 docker compose down
 ```
 
-### Native Rust process
-
-Rust 1.97 or newer is recommended because that is the version used by the
-container build.
+For a native process, use a localhost listener:
 
 ```sh
-cp quotamux.example.toml quotamux.toml
-# For a native-only process, prefer listen = "127.0.0.1:8080".
-cargo run --bin quotamux -- --check
-cargo run --release --bin quotamux
+cargo run --release --bin quotamux -- --config ./quotamux.toml
 ```
 
-The default configuration path is `./quotamux.toml`. It can be changed with
-either form:
+The default configuration path is `./quotamux.toml`. `QUOTAMUX_CONFIG` sets
+another path, `QUOTAMUX_DATA_DIR` overrides `server.data_dir`, and `RUST_LOG`
+controls logging.
 
-```sh
-cargo run --release --bin quotamux -- --config /path/to/quotamux.toml
-QUOTAMUX_CONFIG=/path/to/quotamux.toml cargo run --release --bin quotamux
-```
+## Complete example
 
-`QUOTAMUX_DATA_DIR` overrides `server.data_dir`. `RUST_LOG` controls logging,
-for example `RUST_LOG=quotamux=debug`.
-
-### Frontend build
-
-The dashboard source is under `frontend/`. Vite builds hashed static assets and
-the precompression step creates gzip and Brotli siblings in `frontend/dist/`:
-
-```sh
-cd frontend
-npm ci
-npm run build
-cd ..
-cargo build --release --locked
-```
-
-The Rust binary embeds `frontend/dist/` through `embedded-spa` v0.1.1. The
-Docker build runs these steps automatically. API routes have explicit 404
-fallbacks before the SPA handler, while missing browser routes that accept HTML
-receive `index.html`.
-
-## Configuration model
-
-QuotaMux configuration has three independent levels:
-
-```text
-providers and credentials     exact upstream services, keys, models, protocols
-            ↓
-ordered route layers          selection within a layer, fallback across layers
-            ↓
-served models                 public names and client-facing protocols
-```
-
-The distinction matters:
-
-- A provider model name is the exact identifier accepted by that upstream.
-- A served model name belongs to QuotaMux and is what clients send.
-- A target is one `(provider, credential, provider model)` tuple.
-- Targets in one layer are declared equivalent and may be selected in any
-  order.
-- Layers are tried in configuration order. Put PAYG in a later layer if it must
-  only run after plan capacity is exhausted.
-
-TOML array entries are attached to the most recently declared parent:
-`[[providers.credentials]]` and `[[providers.models]]` belong to the preceding
-`[[providers]]`; `[[models.layers]]` belongs to the preceding `[[models]]`.
-
-## Complete plan → PAYG example
-
-This is a complete configuration with two OpenCode Go keys in a plan layer and
-DeepSeek Official in a later PAYG layer. Requests with no affinity evidence are
-randomly distributed between the two Go keys. Requests sharing a warm prompt
-prefix prefer the Go key that processed that prefix. DeepSeek is tried only
-after both Go targets are unavailable or fail before response commitment.
+This configuration tries an OpenCode Go subscription first and DeepSeek
+Official pay-as-you-go capacity second. The public model supports all three
+ingress protocols even though each target may use a different native protocol.
 
 ```toml
-config_version = 2
+config_version = 3
 
 [server]
-# Use 0.0.0.0 inside the included container; use 127.0.0.1 for a native process.
 listen = "0.0.0.0:8080"
 data_dir = "./data"
 
-[affinity]
-checkpoint_bytes = 128
-max_checkpoints_per_path = 4096
-max_candidates_per_prefix = 8
-max_leases = 16384
-success_ttl_ms = 300000
-
-[[providers]]
+[[backends]]
 id = "go"
-kind = "opencode-go"
-# endpoint is omitted because this provider kind has an official default.
+adapter = "opencode-go"
 
-[[providers.credentials]]
-id = "go-plan-a"
-api_key = "replace-with-first-go-key"
+[[backends.credentials]]
+id = "go-plan"
+api_key = "replace-with-opencode-go-key"
 
-[[providers.credentials]]
-id = "go-plan-b"
-api_key = "replace-with-second-go-key"
-
-[[providers.models]]
-# Always use the exact upstream model ID.
+[[backends.models]]
 name = "deepseek-v4-flash"
-endpoint_protocol = "openai-chat"
-pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
-[[providers]]
+[[backends]]
 id = "deepseek"
-kind = "deepseek-official"
+adapter = "deepseek-official"
 
-[[providers.credentials]]
+[[backends.credentials]]
 id = "deepseek-payg"
 api_key = "replace-with-deepseek-key"
 
-[[providers.models]]
+[[backends.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
-pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
 
 [[models]]
-# Public QuotaMux name. It does not need to equal an upstream model ID.
-name = "deepseek-v4-flash-0731"
-aliases = ["deepseek-v4-flash"]
+name = "deepseek-v4-flash"
+aliases = ["deepseek-v4-flash-0731"]
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 
 [[models.layers]]
-name = "plan"
-strategy = "prompt-prefix-affinity"
+name = "subscription"
+strategy = "random"
 targets = [
-  { provider = "go", credential = "go-plan-a", model = "deepseek-v4-flash" },
-  { provider = "go", credential = "go-plan-b", model = "deepseek-v4-flash" },
+  { backend = "go", credential = "go-plan", model = "deepseek-v4-flash" },
 ]
 
 [[models.layers]]
 name = "payg"
 strategy = "random"
 targets = [
-  { provider = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
+  { backend = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
 ]
 ```
 
-## Complete Kimi K3 1M example
+See [`quotamux.example.toml`](quotamux.example.toml) for a ready-to-copy
+configuration.
 
-This configuration exposes one public `kimi-k3` model through all three client
-protocols. OpenCode Go and Kimi Code Allegretto are equivalent subscription
-targets in the first layer. Kimi's China Open Platform is the single PAYG
-fallback in the second layer.
+## Backends and adapters
 
-The exact upstream IDs are intentionally different: OpenCode Go and the Open
-Platform use `kimi-k3`; Kimi Code API calls use `k3`. Do not send `k3[1m]` as an
-API model ID. Kimi documents that form only for a Claude Code environment
-variable; Allegretto unlocks the normal `k3` API ID up to 1M context.
+A backend declares a local identity, one adapter, one or more credentials, and
+the exact upstream models allowed on that instance:
 
 ```toml
-config_version = 2
+[[backends]]
+id = "backend-id"
+adapter = "adapter-id"
 
-[server]
-listen = "0.0.0.0:8080"
-data_dir = "./data"
+[[backends.credentials]]
+id = "credential-id"
+api_key = "secret"
 
-[affinity]
-checkpoint_bytes = 128
-max_checkpoints_per_path = 4096
-max_candidates_per_prefix = 8
-max_leases = 16384
-success_ttl_ms = 300000
-
-[[providers]]
-id = "opencode-go"
-kind = "opencode-go"
-
-[[providers.credentials]]
-id = "opencode-go-plan"
-api_key = "replace-with-opencode-go-key"
-
-[[providers.models]]
-name = "kimi-k3"
-endpoint_protocol = "openai-chat"
-pricing = { cache_hit_input_usd_per_million = 0.30, cache_miss_input_usd_per_million = 3.00, output_usd_per_million = 15.00 }
-
-[[providers]]
-id = "kimi-code"
-kind = "kimi-code"
-
-[[providers.credentials]]
-id = "kimi-code-allegretto"
-api_key = "replace-with-kimi-code-key"
-
-[[providers.models]]
-name = "k3"
-protocols = ["openai-chat", "anthropic-messages"]
-
-[[providers]]
-id = "kimi-official"
-kind = "kimi-official"
-
-[[providers.credentials]]
-id = "kimi-official-payg"
-api_key = "replace-with-kimi-open-platform-key"
-
-[[providers.models]]
-name = "kimi-k3"
-protocols = ["openai-chat"]
-pricing = { cache_hit_input_usd_per_million = 0.30, cache_miss_input_usd_per_million = 3.00, output_usd_per_million = 15.00 }
-
-[[models]]
-name = "kimi-k3"
-aliases = ["kimi-k3-1m"]
-protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
-
-[[models.layers]]
-name = "subscriptions"
-strategy = "prompt-prefix-affinity"
-targets = [
-  { provider = "opencode-go", credential = "opencode-go-plan", model = "kimi-k3" },
-  { provider = "kimi-code", credential = "kimi-code-allegretto", model = "k3" },
-]
-
-[[models.layers]]
-name = "payg"
-strategy = "random"
-targets = [
-  { provider = "kimi-official", credential = "kimi-official-payg", model = "kimi-k3" },
-]
-```
-
-Provider kind, egress protocol, and exact upstream model ID form the affinity
-namespace. Consequently `opencode-go/kimi-k3` and `kimi-code/k3` have isolated
-prefix trees and cache evidence. On each request QuotaMux queries every eligible
-target in its own namespace and ranks candidates by the longest matched prefix.
-The single-target PAYG layer skips hashing and affinity bookkeeping.
-
-Official references:
-
-- [OpenCode Go Kimi K3 model ID and endpoint](https://opencode.ai/docs/go#endpoints)
-- [Kimi Code API endpoints and 1M Allegretto entitlement](https://www.kimi.com/code/docs/)
-- [Kimi Open Platform K3, 1M context, and recharge requirement](https://platform.kimi.com/docs/guide/kimi-k3-quickstart)
-
-### Codex worker through QuotaMux `/v1`
-
-Codex uses the Responses wire protocol for custom providers. Add this to the
-user-level Codex `config.toml`; the `/v1` suffix on `base_url` is required:
-
-```toml
-model = "kimi-k3"
-model_provider = "quotamux"
-model_reasoning_effort = "low"
-model_context_window = 1048576
-web_search = "disabled"
-
-[model_providers.quotamux]
-name = "QuotaMux"
-base_url = "http://127.0.0.1:8080/v1"
-env_key = "QUOTAMUX_WORKER_API_KEY"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-```
-
-Then define the credential variable before starting Codex:
-
-```sh
-export QUOTAMUX_WORKER_API_KEY=local-worker-test
-```
-
-QuotaMux does not currently authenticate inbound requests, so this value is a
-local placeholder required by Codex's custom-provider configuration; it is not
-one of the upstream Kimi keys. Keep `web_search = "disabled"`: Kimi is reached
-through Chat Completions and cannot execute the Responses API's hosted web
-search tool. Function tools such as Codex's local shell remain enabled and are
-translated normally.
-
-Codex 0.145 can warn that `kimi-k3` has no Codex-native model-catalog entry and
-fall back to generic metadata. The worker path is nevertheless accepted, and
-the explicit context-window setting preserves the intended 1M limit. QuotaMux
-continues to expose the standard OpenAI `GET /v1/models` shape rather than a
-Codex-private catalog shape.
-
-### Claude Code and Pi through QuotaMux
-
-Claude Code speaks Anthropic Messages. Point it at the QuotaMux origin (without
-an added `/v1`); a placeholder local token is sufficient because inbound
-authentication is not currently enforced:
-
-```sh
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
-unset ANTHROPIC_API_KEY
-export ANTHROPIC_AUTH_TOKEN="local-quotamux"
-export ANTHROPIC_MODEL="kimi-k3[1m]"
-export CLAUDE_CODE_EFFORT_LEVEL=high
-claude
-```
-
-Kimi Code and DeepSeek Official use their native Anthropic endpoints. If a
-route instead selects an OpenCode Go Kimi or DeepSeek model, QuotaMux converts
-the request through that model's single Chat Completions endpoint. In tool
-history the conversion preserves assistant reasoning as `reasoning_content`,
-maps each `tool_use` to a function `tool_call` with the same ID, and emits every
-matching `tool_result` as a `role = "tool"` message before later user text.
-
-Pi can use QuotaMux as a custom OpenAI Chat provider. Its model configuration
-should disable the OpenAI `developer` role because a route can select Kimi or
-DeepSeek Chat endpoints that expect `system` instead:
-
-```json
-{
-  "providers": {
-    "quotamux": {
-      "baseUrl": "http://127.0.0.1:8080/v1",
-      "api": "openai-completions",
-      "apiKey": "local-quotamux",
-      "authHeader": true,
-      "compat": {
-        "supportsDeveloperRole": false,
-        "maxTokensField": "max_tokens"
-      },
-      "models": [
-        { "id": "kimi-k3", "reasoning": true, "contextWindow": 1048576, "maxTokens": 32000 },
-        { "id": "deepseek-v4-pro", "reasoning": true, "contextWindow": 1048576, "maxTokens": 32000 }
-      ]
-    }
-  }
-}
-```
-
-Save that object as `~/.pi/agent/models.json`, then select, for example,
-`quotamux/kimi-k3:high`. Without `supportsDeveloperRole = false`, the request is
-still transparently forwarded, but the selected upstream returns HTTP `400`
-for the unsupported role.
-
-Validate before every restart:
-
-```sh
-cargo run --bin quotamux -- --check
-```
-
-Validation rejects empty keys, duplicate IDs, invalid endpoints, unknown
-providers/credentials/models, unsupported provider protocol declarations,
-empty layers, and duplicate public aliases. Error messages do not contain API
-key values.
-
-## Provider configuration reference
-
-Each provider has:
-
-```toml
-[[providers]]
-id = "stable-user-defined-id"
-kind = "provider-kind"
-endpoint = "optional-or-required-base-url"
-
-[[providers.credentials]]
-id = "stable-key-id"
-api_key = "plaintext-secret"
-
-[[providers.models]]
+[[backends.models]]
 name = "exact-upstream-model-id"
 protocols = ["openai-chat"]
+```
+
+Backend and credential IDs are visible in routing metadata. They must be stable
+and must not contain secrets.
+
+### Official adapters
+
+Official adapters own their endpoint. Configuring `endpoint` on them is an
+error.
+
+| `adapter` | Adapter-owned endpoint | Native egress protocols |
+| --- | --- | --- |
+| `opencode-go` | `https://opencode.ai/zen/go/v1` | Model-specific: Chat, Responses, or Anthropic |
+| `deepseek-official` | `https://api.deepseek.com` | Chat, Responses, Anthropic |
+| `kimi-code` | `https://api.kimi.com/coding/v1` | Chat, Anthropic |
+| `kimi-official` | `https://api.moonshot.cn/v1` | Chat |
+
+For `opencode-go`, the adapter contains the official model-to-protocol catalog.
+Declare only the exact model ID and omit `protocols`:
+
+```toml
+[[backends.models]]
+name = "kimi-k3"
+```
+
+QuotaMux rejects a Go model that is not in the adapter catalog. The catalog
+follows the [OpenCode Go endpoint table](https://dev.opencode.ai/docs/go/#endpoints).
+
+For the other official adapters, declare the native protocols enabled for each
+model. The adapter verifies that every declaration is supported by that API.
+Kimi Code and the Kimi Open Platform are separate services with separate keys;
+their adapters and backends must remain separate. See the
+[Kimi Code API overview](https://www.kimi.com/code/docs/) and
+[Kimi Platform API overview](https://platform.kimi.com/docs/api/overview).
+
+### Custom adapters
+
+Use a custom adapter for a proxy, regional deployment, mock server, or any
+customer-controlled endpoint:
+
+| `adapter` | Protocol | Authentication |
+| --- | --- | --- |
+| `custom-chat-completions` | OpenAI Chat Completions | Bearer token |
+| `custom-responses` | OpenAI Responses | Bearer token |
+| `custom-anthropic` | Anthropic Messages | `x-api-key` |
+
+Custom adapters require the complete request URL:
+
+```toml
+[[backends]]
+id = "customer-chat"
+adapter = "custom-chat-completions"
+endpoint = "https://gateway.example/v1/chat/completions"
+
+[[backends.credentials]]
+id = "customer-key"
+api_key = "secret"
+
+[[backends.models]]
+name = "model-id"
+protocols = ["openai-chat"]
+```
+
+QuotaMux uses generic protocol, authentication, and HTTP-status behavior for a
+custom backend. Its hostname, response body, and model name cannot activate an
+official adapter's special handling.
+
+Only the adapters listed above are accepted by startup validation.
+
+### Pricing
+
+Pricing is optional and belongs to one backend/model pair:
+
+```toml
 pricing = { cache_hit_input_usd_per_million = 0.0, cache_miss_input_usd_per_million = 0.0, output_usd_per_million = 0.0 }
 ```
 
-Official providers that expose several API families use `protocols` to declare
-all native protocols supported by that exact model. OpenCode Go is different:
-its catalog assigns one endpoint family to each model, so each Go model must
-declare exactly one `endpoint_protocol` instead:
+Values are USD per one million tokens and must be finite and non-negative.
+QuotaMux combines them with upstream-reported usage. If pricing is absent,
+usage is recorded without an estimated cost. No model price is built into the
+binary; configure the provider's current prices yourself.
 
-```toml
-[[providers.models]]
-name = "deepseek-v4-pro"
-endpoint_protocol = "openai-chat"
-```
+## Served models
 
-QuotaMux rejects `protocols` on `opencode-go`, and rejects
-`endpoint_protocol` on provider kinds whose models may expose multiple native
-protocols. This keeps the configuration shape aligned with the upstream API
-rather than suggesting capabilities that a specific Go model does not have.
-
-`pricing` is optional and belongs to this exact provider/model pair. When it is
-present, QuotaMux estimates cost from provider-reported cache-hit input,
-cache-miss input, and output tokens. The three values are USD per one million
-tokens; they must be finite and non-negative. When it is absent, QuotaMux
-records usage but does not invent a cost. No provider or model price is built
-into the binary, so price changes require only a private configuration update.
-Subscription-only routes may omit pricing when a per-token estimate is not
-meaningful.
-
-Kimi's China platform bills K3 in CNY (`¥2 / ¥20 / ¥100` per million tokens),
-while its official English pricing publishes the corresponding USD estimate
-(`$0.30 / $3 / $15`). Because the dashboard aggregates `cost_usd`, use the USD
-values in these fields rather than copying the CNY numbers.
-
-`id` values are local routing identities. They are visible in metadata and
-statistics, so use useful names such as `go-plan-a` or `bailian-payg-cn` but do
-not put secrets in them. API keys are written in plaintext in the private TOML;
-keep it out of Git and restrict its file permissions:
-
-```sh
-chmod 600 quotamux.toml
-```
-
-### Production-accepted provider kinds
-
-The currently implemented provider adapters are intentionally narrower than
-the provider-kind enum in the configuration schema:
-
-| `kind` | Default endpoint | Current acceptance status |
-| --- | --- | --- |
-| `opencode-go` | `https://opencode.ai/zen/go/v1` | Real-worker accepted for `deepseek-v4-flash` and `deepseek-v4-pro`; real stream and 300,095-input-token acceptance also pass for `kimi-k3`. The Pro response omitted `system_fingerprint`. Protocol remains model-specific. |
-| `deepseek-official` | `https://api.deepseek.com` | Native OpenAI Chat, OpenAI Responses, and Anthropic Messages are enabled; real V4 Pro acceptance returns `system_fingerprint`, and configured cost estimation is supported. |
-| `kimi-code` | `https://api.kimi.com/coding/v1` | Native OpenAI Chat and Anthropic Messages are supported with exact model `k3`; real Allegretto streaming, 300,095-input-token acceptance, Claude Code tool loops, and a live Codex worker have passed. |
-| `kimi-official` | `https://api.moonshot.cn/v1` | Real paid-account streaming and 300,095-input-token acceptance pass with exact model `kimi-k3`; layered fallback and provider-specific model rewrites are covered end to end. |
-
-Kimi Code exposes both `openai-chat` and `anthropic-messages` upstream. QuotaMux
-uses native Anthropic Messages for Claude Code and only translates when a
-selected fallback target lacks that protocol. Kimi Open Platform remains
-`openai-chat` only.
-
-DeepSeek Official exposes `openai-chat`, `openai-responses`, and
-`anthropic-messages`. QuotaMux keeps each matching ingress protocol native and
-only translates when routing to a target that does not expose that protocol.
-
-OpenCode Go publishes one native endpoint per model rather than one uniform
-protocol for the whole catalog. The current Kimi K3 and DeepSeek V4 entries use
-Chat Completions; Qwen and MiniMax entries use Anthropic Messages; GPT 5.6 Luna
-uses Responses. QuotaMux therefore follows each Go model's configured
-`endpoint_protocol` exactly.
-
-For these kinds, `endpoint` is a base URL and QuotaMux appends the protocol
-path. An endpoint override is allowed for local tests.
-
-Provider model lists change over time. Configure the exact ID and protocol
-shown by the provider rather than guessing from the marketing name:
-
-- [DeepSeek model API](https://api-docs.deepseek.com/api/list-models/)
-- [DeepSeek model pricing](https://api-docs.deepseek.com/quick_start/pricing/)
-- [OpenCode Go model IDs and endpoints](https://opencode.ai/docs/go#endpoints)
-- [Kimi K3 pricing](https://www.kimi.com/resources/kimi-k3-pricing)
-
-### Reserved provider kinds — not supported yet
-
-The following names are already reserved in the configuration enum, but their
-presence is scaffolding, not a support claim:
-
-- `aliyun-bailian`
-- `ollama-cloud`
-- `opencode-zen`
-- `custom-chat-completions`
-- `custom-responses`
-- `custom-anthropic`
-
-They currently have no provider-specific end-to-end acceptance suite or real
-worker evidence. Do not use them as production routes yet. Each one must receive
-its authentication/URL/stream/error compatibility tests and, for official
-providers, a real credential smoke test before moving into the implemented
-table. The parser may recognize these names while that work is in progress.
-
-### Multiple credentials on one provider
-
-Declare each key under the same provider and reference it as a separate target:
-
-```toml
-[[providers]]
-id = "go"
-kind = "opencode-go"
-
-[[providers.credentials]]
-id = "go-team-a"
-api_key = "..."
-
-[[providers.credentials]]
-id = "go-team-b"
-api_key = "..."
-
-[[providers.models]]
-name = "deepseek-v4-flash"
-endpoint_protocol = "openai-chat"
-```
-
-One provider kind may also be declared multiple times when endpoints,
-accounts, regions, or cache domains need distinct provider identities.
-
-### Multiple upstream models on one provider
-
-```toml
-[[providers.models]]
-name = "deepseek-v4-flash"
-endpoint_protocol = "openai-chat"
-
-[[providers.models]]
-name = "another-upstream-model"
-endpoint_protocol = "openai-chat"
-```
-
-Only explicitly listed models can be referenced by route targets. QuotaMux does
-not silently enable everything returned by an upstream `/models` endpoint.
-
-## Served models and protocol conversion
-
-A served model is the public contract seen by clients:
+A served model is the public contract exposed to clients:
 
 ```toml
 [[models]]
 name = "public-model-name"
-aliases = ["optional-compatible-name"]
+aliases = ["compatible-name"]
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 ```
 
-- `name` is returned by `GET /v1/models` and accepted in requests.
-- `aliases` are also accepted and returned by `/v1/models`. Intentional model
-  impersonation should be explicit here.
-- `protocols` controls the public endpoints through which the model is exposed.
+- `name` and `aliases` are accepted in inference requests and returned by
+  `GET /v1/models`.
+- `protocols` controls which public inference endpoints accept the model.
+- Every target references a declared backend, credential, and upstream model.
+- QuotaMux rewrites the public model name to the selected upstream model ID.
 
-The target provider does not need to expose the same protocol as the client.
-For example, a served model may expose all three public protocols while its Go
-target only accepts Chat Completions. QuotaMux translates the request, response,
-stream, reasoning/thinking, tools, and usage on a best-effort basis. It does not
-reject provider-specific semantic combinations locally: the selected upstream
-receives the closest destination-protocol representation and owns the validity
-decision.
-
-Supported public protocols and endpoints:
-
-| Protocol | Endpoint |
-| --- | --- |
-| `openai-chat` | `POST /v1/chat/completions` |
-| `openai-responses` | `POST /v1/responses` |
-| `anthropic-messages` | `POST /v1/messages` |
-
-`POST /v1/messages/count_tokens` returns a clearly labelled local estimate; it
-does not bill or call an upstream provider.
+The request's `model` selects this server-configured route graph. No request
+field or header selects a backend, credential, adapter, or layer. Extra fields
+may be preserved during native forwarding, but they never control QuotaMux
+routing.
 
 ## Route layers
 
@@ -609,269 +284,235 @@ Each served model has one or more ordered layers:
 
 ```toml
 [[models.layers]]
-name = "plan"
-strategy = "random"
+name = "subscription"
+strategy = "prompt-prefix-affinity"
 targets = [
-  { provider = "go", credential = "go-a", model = "deepseek-v4-flash" },
+  { backend = "go", credential = "team-a", model = "kimi-k3" },
+  { backend = "go", credential = "team-b", model = "kimi-k3" },
 ]
 ```
 
-Rules:
+Routing follows these rules:
 
-1. Layers are evaluated from top to bottom.
-2. Every target in the current layer is tried at most once in selector order.
-3. A later layer is reached only after the current layer is exhausted.
-4. Client validation errors and client cancellation do not fall back.
-5. A stream can fall back before the first semantic event, but never after it is
-   committed to the client.
-6. Circuits are maintained per target, so one bad key does not disable its
-   siblings.
+1. Layers are evaluated in configuration order.
+2. Each eligible target in the active layer is tried at most once.
+3. A later layer is reached only after the active layer is exhausted.
+4. Request errors and client cancellation do not trigger fallback.
+5. Provider, transport, capacity, quota, authentication, billing, and
+   configuration failures may trigger fallback before response commitment.
+6. A streaming response may fall back before its first semantic event. It
+   never switches target after that event.
+7. Circuit state belongs to an exact target, so one credential does not disable
+   another.
 
 ### `random`
 
-- Zero targets are rejected by configuration validation.
-- One target is selected directly without random-number work.
-- Multiple targets start in random order; failures continue through the rest of
-  the same layer before the next layer.
+Targets are tried in random order. A one-target layer bypasses randomization.
 
 ### `prompt-prefix-affinity`
 
-- One target is selected directly without canonicalization, hashing, lookup, or
-  affinity bookkeeping.
-- Multiple targets begin with random ordering when cold.
-- After a successful request, a later request sharing a long canonical prompt
-  prefix prefers the warm cache domain with the longest valid match.
-- An unrelated prompt or expired lease returns to normal random selection.
-- The index, keyed-hash secret, leases, and TTL epochs are process-local memory
-  only. Restarting QuotaMux intentionally starts cold.
-- Capacity eviction can reduce cache hits but cannot change response semantics.
+QuotaMux prefers the eligible target with the longest known warm canonical
+prompt prefix. With no valid match it uses random order. Successful requests
+create short-lived cache evidence; expired or evicted evidence changes cache
+efficiency only, never request semantics.
 
-Affinity tuning:
+Affinity state is bounded, keyed, process-local memory. It contains no prompt
+text and is discarded on restart. A one-target layer bypasses canonicalization,
+hashing, lookup, and affinity bookkeeping.
 
-| Field | Default | Meaning |
-| --- | ---: | --- |
-| `checkpoint_bytes` | 128 | Distance between canonical-byte prefix checkpoints. |
-| `max_checkpoints_per_path` | 4096 | Hard checkpoint limit for one request path. |
-| `max_candidates_per_prefix` | 8 | Maximum lease candidates retained for one prefix. |
-| `max_leases` | 16384 | Global in-memory lease limit. |
-| `success_ttl_ms` | 300000 | Lifetime of successful-request affinity evidence in milliseconds. |
-
-### Mixed providers in one affinity layer
-
-Different provider kinds and credentials may be mixed when they are truly
-equivalent in priority, price, output behavior, and capacity policy:
+Optional tuning:
 
 ```toml
-[[models.layers]]
-name = "equivalent-capacity"
-strategy = "prompt-prefix-affinity"
-targets = [
-  { provider = "go", credential = "go-plan-a", model = "deepseek-v4-flash" },
-  { provider = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
-]
+[affinity]
+checkpoint_bytes = 128
+max_checkpoints_per_path = 4096
+max_candidates_per_prefix = 8
+max_leases = 16384
+success_ttl_ms = 300000
 ```
 
-This does **not** mean “Go first, then DeepSeek.” On a cold prompt either target
-may be selected. To guarantee plan-before-PAYG behavior, put DeepSeek in a
-separate later layer as shown in the complete example.
+These values are the defaults. See
+[`docs/prompt-prefix-affinity.md`](docs/prompt-prefix-affinity.md) for the
+canonicalization and evidence model.
 
-### Additional PAYG tiers
+## Failure and circuit behavior
 
-Add more layers in increasing cost/capacity order:
+Adapters classify failures by provider meaning, not by status code alone:
 
-```toml
-[[models.layers]]
-name = "payg-standard"
-strategy = "random"
-targets = [
-  { provider = "bailian", credential = "bailian-standard", model = "model-id" },
-]
+- OpenCode Go distinguishes documented subscription exhaustion from ordinary
+  rate pressure.
+- Kimi Code distinguishes membership quota, capacity, entitlement,
+  authentication, and request errors using its
+  [error reference](https://www.kimi.com/code/docs/en/kimi-code/error-reference.html).
+- Kimi Official uses the structured Kimi Platform `error.type` values described
+  in the [platform error reference](https://platform.kimi.com/docs/api/errors).
+- Custom adapters use generic HTTP classification only.
 
-[[models.layers]]
-name = "payg-premium"
-strategy = "random"
-targets = [
-  { provider = "premium", credential = "premium-key", model = "model-id" },
-]
-```
+Request-specific `4xx` failures such as `400` and `422` are returned without
+fallback or circuit impact. Provider-side failures open or suspend the exact
+target and allow the router to continue.
 
-## Client examples
+Concurrent attempts share a circuit generation. The first accepted failure
+advances that generation; late results from the previous generation cannot
+raise the backoff level again.
 
-### OpenAI Chat Completions
+| Failure class | Retry schedule | Maximum `Retry-After` |
+| --- | --- | --- |
+| transient, stream, transport | 1, 2, 4, 8, 16, 32, 60 seconds | 60 seconds |
+| capacity or rate pressure | 5, 30, 300 seconds | 300 seconds |
+| subscription quota | 60, 300, 900 seconds | 900 seconds |
+| authentication, configuration, unknown provider `4xx` | 5, 30, 60 minutes | ignored |
+| billing or balance | 60 minutes | ignored |
+
+`Retry-After` accepts HTTP seconds or an HTTP date. It is advisory, allowed only
+for retryable classes, and capped before the effective next-probe deadline is
+persisted.
+
+When a deadline expires, one request receives a half-open probe lease. Success
+closes the circuit; a provider failure advances the schedule once. Cancellation
+or an abandoned stream releases the probe and makes it eligible again after one
+second without increasing backoff. A probe lease has a ten-minute hard limit,
+and process startup releases any half-open state immediately.
+
+Provider error bodies are inspected only for classification, with a 16 KiB
+limit. QuotaMux records and returns a controlled summary rather than copying
+upstream text that may contain credentials or account data.
+
+See [`docs/provider-failure-policy.md`](docs/provider-failure-policy.md) for the
+complete classification and recovery contract.
+
+## Protocol gateway
+
+| Protocol | Endpoint |
+| --- | --- |
+| Model catalog | `GET /v1/models` |
+| OpenAI Chat Completions | `POST /v1/chat/completions` |
+| OpenAI Responses | `POST /v1/responses` |
+| Anthropic Messages | `POST /v1/messages` |
+| Anthropic token estimate | `POST /v1/messages/count_tokens` |
+
+`count_tokens` is a local estimate. It does not call or bill an upstream.
+
+When ingress and egress protocols match, QuotaMux preserves the native request
+apart from the upstream model rewrite and Chat streaming usage option. The
+upstream remains responsible for semantic validation.
+
+Cross-protocol translation covers the shared semantics of text, system and
+developer instructions, ordinary function tools and results, reasoning where
+representable, output format, termination, streaming events, usage, and cache
+usage. Fields with no valid destination representation are omitted. QuotaMux
+does not serialize unsupported features into prompts or fabricate Anthropic
+thinking signatures.
+
+Example:
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-Relay-Include-Metadata: 1' \
   -d '{
-    "model": "deepseek-v4-flash-0731",
+    "model": "deepseek-v4-flash",
     "messages": [{"role": "user", "content": "Reply with OK."}],
     "stream": false
   }'
 ```
 
-### OpenAI Responses
+## Routing metadata
 
-```sh
-curl http://127.0.0.1:8080/v1/responses \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "deepseek-v4-flash-0731",
-    "input": "Reply with OK.",
-    "reasoning": {"effort": "high"}
-  }'
-```
-
-### Anthropic Messages
-
-```sh
-curl http://127.0.0.1:8080/v1/messages \
-  -H 'Content-Type: application/json' \
-  -H 'anthropic-version: 2023-06-01' \
-  -d '{
-    "model": "deepseek-v4-flash-0731",
-    "max_tokens": 128,
-    "messages": [{"role": "user", "content": "Reply with OK."}]
-  }'
-```
-
-Clients cannot select a provider or credential. Request body `provider` and
-provider-selection headers are rejected.
-
-## Routing metadata and operations API
-
-Add `X-Relay-Include-Metadata: 1` to an inference request to receive routing
-headers:
+Routing response headers are opt-in. Add `X-Relay-Include-Metadata: 1` to an
+inference request to receive:
 
 - `X-Relay-Request-Id`
-- `X-Relay-Provider`
+- `X-Relay-Backend`
 - `X-Relay-Credential`
-- `X-Relay-Route-Layer` and `X-Relay-Route-Layer-Index`
-- `X-Relay-Selection-Reason` (`single-target`, `random`, or
-  `prompt-prefix-affinity`)
+- `X-Relay-Route-Layer`
+- `X-Relay-Route-Layer-Index`
+- `X-Relay-Selection-Reason`
 - `X-Relay-Matched-Prefix-Bytes` when affinity matched
 - `X-Relay-Upstream-Model`
-- `X-Relay-Fallback` and `X-Relay-Fallback-Reason`
-- `X-Relay-Ingress-Protocol`, `X-Relay-Egress-Protocol`, and
-  `X-Relay-Translated`
+- `X-Relay-Fallback`
+- `X-Relay-Fallback-Reason`
+- `X-Relay-Ingress-Protocol`
+- `X-Relay-Egress-Protocol`
+- `X-Relay-Translated`
 
-Operational endpoints:
+These are response metadata. They do not provide a client-side routing
+interface.
+
+## Operations API
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /` | Local Overview and Routing dashboard. |
-| `GET /healthz` | Health, models, and uptime. |
-| `GET /v1/models` | Public served names and aliases. |
-| `GET /api/status` | Served models, targets, safe endpoints, per-target circuits, affinity limits/count, and alerts. |
-| `GET /api/stats` | All-time request, provider, and provider/upstream-model totals from aggregate tables. |
-| `GET /api/routing` | Current served-model, layer, strategy, target, and per-target circuit hierarchy. |
-| `GET /api/routing/stats?model=NAME&window=1d` | Calls and token totals by final target/key for `1h`, `1d`, `1w`, `1m`, or `all`. |
-| `GET /api/requests?limit=20&before=CURSOR` | Recent request metadata in newest-first cursor pages; default limit 100, maximum 1000, and `next_cursor` is null on the last page. |
-| `GET /api/attempts?limit=100` | Recent per-target attempts; maximum limit 1000. |
+| `GET /` | Local dashboard. |
+| `GET /healthz` | Health, served models, and uptime. |
+| `GET /api/status` | Configuration summary, target circuits, affinity state, and alerts. |
+| `GET /api/stats` | Aggregate request, backend, model, token, and cost totals. |
+| `GET /api/routing` | Served models, ordered layers, targets, and circuit state. |
+| `GET /api/routing/stats?model=NAME&window=1d` | Target/key routing totals for `1h`, `1d`, `1w`, `1m`, or `all`. |
+| `GET /api/requests?limit=20&before=CURSOR` | Cursor-paginated logical request records. |
+| `GET /api/attempts?limit=100` | Recent per-target attempts. |
 
-The **Overview** page keeps provider totals, recent logical requests, and active
-alerts together. Recent requests are shown 20 at a time with Newer and Older
-controls backed by exclusive record-key cursors, not offsets. A recorded route
-is shown as `served model -> layer -> provider (key) -> upstream model`;
-protocol is not a visible routing dimension. The
-**Routing** page shows the configured ordered layers and each target's real
-circuit state, reason, and next-probe time. Aliases appear only in parentheses
-beside their canonical served model.
-
-Routing statistics are a plain ledger rather than a proportional chart. The
-page switches between Calls, Total tokens, Input tokens, and Output tokens and
-between rolling 1-hour, 1-day, 1-week, 30-day, and all-time windows. A Call is
-one persisted logical request attributed to its final recorded target/key;
-failed intermediate targets remain attempts and are not counted as additional
-Calls. Historical targets and requests missing a complete final target identity
-are kept as separate reconciliation rows when present.
+Request and attempt limits have a maximum of 1000. Routing statistics attribute
+one logical request to its final recorded target; failed intermediate targets
+remain separate attempts.
 
 ## Storage and privacy
 
-- `server.data_dir/quotamux.redb` stores request/attempt metadata, target circuit
-  state, alerts, and versioned fixed-width statistics rollups.
-- New request and attempt records update their raw audit row and rollup counters
-  atomically in one redb transaction. Statistics queries read bounded
-  minute/hour aggregate ranges or compact all-time tables rather than scanning
-  the raw audit tables.
-- Existing databases are backfilled automatically in restartable batches before
-  the listener starts. A new database creates the complete current schema
-  directly; there is no separate one-time migration script to retain or run.
-- Prompt bodies, model response bodies, and API keys are not written to that
-  database.
-- Prompt-prefix-affinity metadata is never written to redb. It is pure memory
-  and disappears on restart.
-- `quotamux.toml`, `AGENTS.md`, `CLAUDE.md`, `data/`, Rust build outputs, and
-  `frontend/node_modules/` are ignored by this repository. The generated
-  `frontend/dist/` files are committed so debug and release Cargo builds remain
-  reproducible without running Node first.
+QuotaMux stores data in `server.data_dir/quotamux.redb`:
 
-## Tests
+- logical request metadata;
+- per-target attempt metadata;
+- alerts;
+- fixed-width statistics rollups;
+- per-target circuit state.
 
-Run the complete local suite:
+Prompt bodies, response bodies, API keys, affinity fingerprints, and affinity
+leases are not stored in the database. Affinity remains memory-only.
+
+The configuration file contains plaintext API keys. Keep it out of version
+control and restrict access:
+
+```sh
+chmod 600 quotamux.toml
+```
+
+## Validation and development
+
+Validate configuration without starting the listener:
+
+```sh
+cargo run --bin quotamux -- --check
+```
+
+Validation covers adapter registration, endpoint ownership, credentials,
+model/protocol contracts, aliases, layer structure, target references, pricing,
+and affinity bounds. Errors do not include API key values.
+
+Run the local checks:
 
 ```sh
 npm --prefix frontend ci
 npm --prefix frontend run build
-cargo test --all-targets
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
 ```
 
-Run the credential-free smoke suite against a live QuotaMux:
+Run a credential-free smoke test against a live instance:
 
 ```sh
 cargo run --bin quotamux-smoke -- --base-url http://127.0.0.1:8080
 ```
 
-The real affinity probe is ignored by default because it consumes live quota.
-It reads the local ignored config, temporarily mixes OpenCode Go and DeepSeek in
-one in-memory layer, sends two low-output requests, and prints only sanitized
-cache/route evidence:
+The container build uses Rust 1.97, builds the frontend, embeds its compressed
+assets in the binary, and runs as an unprivileged user in a read-only scratch
+image.
 
-```sh
-cargo test --test real_worker_affinity -- --ignored --nocapture
-```
+## Design documents
 
-The V4 Pro probe makes one low-output request to each configured DeepSeek target
-and records whether the provider returns `system_fingerprint`:
-
-```sh
-cargo test --test real_deepseek_v4_pro -- --ignored --nocapture
-```
-
-Kimi has a separate ignored real suite. It uses the existing private
-`quotamux.toml`, directly smokes all three configured K3 targets, and verifies
-the mixed subscription layer's prompt-prefix affinity:
-
-```sh
-cargo test --test real_kimi_k3 -- --ignored --nocapture
-```
-
-The >256K confirmation is additionally gated because it deliberately sends a
-large paid prompt to every target:
-
-```sh
-QUOTAMUX_CONFIRM_1M=1 \
-  cargo test --test real_kimi_k3 \
-  each_kimi_k3_target_accepts_more_than_256k_prompt_tokens \
-  -- --ignored --nocapture
-```
-
-Captured test counts and real provider cache data are in
-[docs/test-evidence.md](docs/test-evidence.md).
-
-The verified Codex worker configuration above uses the official custom-provider
-keys `base_url`, `env_key`, and `wire_api = "responses"`, with web search
-disabled because that hosted Responses tool is not available on the translated
-Chat route. See the
-[Codex configuration reference](https://developers.openai.com/codex/config-reference).
-
-## Design documentation
-
-- [Configuration and layered-routing architecture](docs/routing-architecture-v2.md)
-- [Prompt-prefix-affinity design](docs/prompt-prefix-affinity.md)
-- [Verification evidence](docs/test-evidence.md)
+- [Routing architecture](docs/routing-architecture-v3.md)
+- [Prompt-prefix affinity](docs/prompt-prefix-affinity.md)
+- [Provider failure policy](docs/provider-failure-policy.md)
 
 ## License
 

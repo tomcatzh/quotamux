@@ -36,7 +36,7 @@ async fn main() -> Result<(), AnyError> {
     anthropic_stream(&client, base, model).await?;
     count_tokens(&client, base, model).await?;
     stats(&client, base).await?;
-    println!("PASS all QuotaMux smoke tests (provider: {first})");
+    println!("PASS all QuotaMux smoke tests (backend: {first})");
     Ok(())
 }
 
@@ -50,10 +50,10 @@ async fn health(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
 async fn chat(client: &reqwest::Client, base: &str, model: &str) -> Result<String, AnyError> {
     let response = client.post(format!("{base}/v1/chat/completions"))
         .header("X-Relay-Include-Metadata", "1")
-        .json(&json!({"model":model,"messages":[{"role":"user","content":"Reply with exactly OK."}],"thinking":{"type":"enabled"},"reasoning_effort":"high","max_tokens":128}))
+        .json(&json!({"model":model,"messages":[{"role":"user","content":"Reply with exactly OK."}],"reasoning_effort":"high","max_tokens":128}))
         .send().await?;
     ensure(response.status().is_success(), "chat request failed")?;
-    let provider = relay_provider(response.headers())?;
+    let backend = relay_backend(response.headers())?;
     let value: Value = response.json().await?;
     let message = value
         .pointer("/choices/0/message")
@@ -74,7 +74,7 @@ async fn chat(client: &reqwest::Client, base: &str, model: &str) -> Result<Strin
     )?;
     ensure(value.get("usage").is_some(), "chat usage missing")?;
     println!("PASS chat + reasoning + usage");
-    Ok(provider)
+    Ok(backend)
 }
 
 async fn chat_stream(client: &reqwest::Client, base: &str, model: &str) -> Result<(), AnyError> {
@@ -271,10 +271,10 @@ async fn stats(client: &reqwest::Client, base: &str) -> Result<(), AnyError> {
     Ok(())
 }
 
-fn relay_provider(headers: &HeaderMap) -> Result<String, AnyError> {
+fn relay_backend(headers: &HeaderMap) -> Result<String, AnyError> {
     Ok(headers
-        .get("x-relay-provider")
-        .ok_or("X-Relay-Provider missing")?
+        .get("x-relay-backend")
+        .ok_or("X-Relay-Backend missing")?
         .to_str()?
         .to_string())
 }

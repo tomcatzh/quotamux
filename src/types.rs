@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::ProviderKind;
+use crate::config::AdapterKind;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Protocol {
@@ -31,6 +31,7 @@ pub enum FailureClass {
     ProviderBilling,
     ProviderConfiguration,
     ProviderCapacity,
+    ProviderQuota,
     ProviderTransient,
     StreamFailure,
     ProviderUnknown4xx,
@@ -47,6 +48,7 @@ impl FailureClass {
             Self::ProviderBilling => "provider_billing",
             Self::ProviderConfiguration => "provider_configuration",
             Self::ProviderCapacity => "provider_capacity",
+            Self::ProviderQuota => "provider_quota",
             Self::ProviderTransient => "provider_transient",
             Self::StreamFailure => "stream_failure",
             Self::ProviderUnknown4xx => "provider_unknown_4xx",
@@ -111,7 +113,7 @@ impl Usage {
             total_tokens: usage
                 .get("total_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(prompt + output),
+                .unwrap_or_else(|| prompt.saturating_add(output)),
             provider_reported: true,
         }
     }
@@ -157,7 +159,7 @@ impl Usage {
             total_tokens: usage
                 .get("total_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(input + output),
+                .unwrap_or_else(|| input.saturating_add(output)),
             provider_reported: true,
         }
     }
@@ -238,9 +240,10 @@ pub struct RequestRecord {
     pub streaming: bool,
     pub status: u16,
     pub error_class: Option<FailureClass>,
-    pub provider: Option<String>,
-    #[serde(default)]
-    pub provider_kind: Option<ProviderKind>,
+    #[serde(alias = "provider")]
+    pub backend: Option<String>,
+    #[serde(default, alias = "provider_kind")]
+    pub adapter: Option<AdapterKind>,
     #[serde(default)]
     pub credential: Option<String>,
     #[serde(default)]
@@ -268,9 +271,10 @@ pub struct AttemptRecord {
     pub id: String,
     pub request_id: Option<String>,
     pub sequence: u32,
-    pub provider: String,
-    #[serde(default)]
-    pub provider_kind: Option<ProviderKind>,
+    #[serde(alias = "provider")]
+    pub backend: String,
+    #[serde(default, alias = "provider_kind")]
+    pub adapter: Option<AdapterKind>,
     #[serde(default)]
     pub credential: Option<String>,
     #[serde(default)]
@@ -303,9 +307,10 @@ pub struct AttemptRecord {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AlertRecord {
     pub id: String,
-    pub provider: String,
-    #[serde(default)]
-    pub provider_kind: Option<ProviderKind>,
+    #[serde(alias = "provider")]
+    pub backend: String,
+    #[serde(default, alias = "provider_kind")]
+    pub adapter: Option<AdapterKind>,
     #[serde(default)]
     pub credential: Option<String>,
     pub class: FailureClass,
@@ -341,6 +346,31 @@ mod tests {
     }
 
     #[test]
+    fn persisted_provider_fields_migrate_to_backend_and_adapter_names() {
+        let legacy = serde_json::json!({
+            "id": "alert-1",
+            "provider": "go",
+            "provider_kind": "opencode-go",
+            "credential": "go-a",
+            "class": "provider_quota",
+            "active": true,
+            "first_seen_ms": 1,
+            "last_seen_ms": 2,
+            "next_probe_at_ms": 3,
+            "request_id": "request-1"
+        });
+        let record = serde_json::from_value::<AlertRecord>(legacy).unwrap();
+        assert_eq!(record.backend, "go");
+        assert_eq!(record.adapter, Some(AdapterKind::OpenCodeGo));
+
+        let current = serde_json::to_value(record).unwrap();
+        assert_eq!(current["backend"], "go");
+        assert_eq!(current["adapter"], "opencode-go");
+        assert!(current.get("provider").is_none());
+        assert!(current.get("provider_kind").is_none());
+    }
+
+    #[test]
     fn parses_go_cache_usage() {
         let value = json!({"usage": {
             "prompt_tokens": 100,
@@ -366,6 +396,21 @@ mod tests {
         let usage = Usage::from_openai(&value);
         assert_eq!(usage.cache_hit_tokens, 40);
         assert_eq!(usage.cache_miss_tokens, 10);
+    }
+
+    #[test]
+    fn provider_usage_totals_saturate_when_upstream_counts_are_malformed() {
+        let openai = Usage::from_openai(&json!({"usage": {
+            "prompt_tokens": u64::MAX,
+            "completion_tokens": 1
+        }}));
+        assert_eq!(openai.total_tokens, u64::MAX);
+
+        let responses = Usage::from_responses(&json!({"usage": {
+            "input_tokens": u64::MAX,
+            "output_tokens": 1
+        }}));
+        assert_eq!(responses.total_tokens, u64::MAX);
     }
 
     #[test]

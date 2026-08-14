@@ -5,9 +5,10 @@ use quotamux::{
     AppState, Config,
     app::build_app,
     config::{
-        CredentialConfig, ProviderConfig, ProviderKind, ProviderModelConfig, RouteLayerConfig,
+        AdapterKind, BackendConfig, BackendModelConfig, CredentialConfig, RouteLayerConfig,
         RouteStrategy, RouteTargetConfig, ServedModelConfig, ServerConfig,
     },
+    provider::BackendClient,
     types::{Protocol, Usage},
 };
 use serde_json::{Value, json};
@@ -40,7 +41,7 @@ async fn mixed_go_and_deepseek_workers_keep_a_divergent_branch_on_the_warm_targe
         &format!("{common}\nFirst branch. Reply with OK."),
     )
     .await;
-    let warm_provider = header(&first, "x-relay-provider");
+    let warm_provider = header(&first, "x-relay-backend");
     assert_eq!(header(&first, "x-relay-selection-reason"), "random");
     let first_body = first
         .json::<Value>()
@@ -55,7 +56,7 @@ async fn mixed_go_and_deepseek_workers_keep_a_divergent_branch_on_the_warm_targe
         &format!("{common}\nSecond divergent branch. Reply with OK."),
     )
     .await;
-    assert_eq!(header(&second, "x-relay-provider"), warm_provider);
+    assert_eq!(header(&second, "x-relay-backend"), warm_provider);
     assert_eq!(
         header(&second, "x-relay-selection-reason"),
         "prompt-prefix-affinity"
@@ -73,7 +74,7 @@ async fn mixed_go_and_deepseek_workers_keep_a_divergent_branch_on_the_warm_targe
     eprintln!(
         "REAL_AFFINITY_EVIDENCE {}",
         json!({
-            "provider": warm_provider,
+            "backend": warm_provider,
             "matched_prefix_bytes": matched_prefix_bytes,
             "first_cache_hit_tokens": first_usage.cache_hit_tokens,
             "first_cache_miss_tokens": first_usage.cache_miss_tokens,
@@ -137,14 +138,14 @@ fn real_probe_config(path: &PathBuf, data_dir: &TempDir) -> (Config, String) {
         .get("config_version")
         .and_then(toml::Value::as_integer)
         .expect("config_version");
-    let mut config = if version == 2 {
-        Config::load(path).expect("load v2 private config")
-    } else {
-        assert_eq!(version, 1, "real probe supports config versions 1 and 2");
-        legacy_v1_config(&document)
+    let mut config = match version {
+        3 => Config::load(path).expect("load v3 private config"),
+        2 => migrate_legacy_v2_config(document.clone()),
+        1 => legacy_v1_config(&document),
+        _ => panic!("real probe supports config versions 1, 2, and 3"),
     };
 
-    let targets = [ProviderKind::OpenCodeGo, ProviderKind::DeepSeekOfficial]
+    let targets = [AdapterKind::OpenCodeGo, AdapterKind::DeepSeekOfficial]
         .map(|kind| first_chat_target(&config, kind));
     let served_model = "quotamux-real-affinity-probe".to_string();
     config.server = ServerConfig {
@@ -165,20 +166,23 @@ fn real_probe_config(path: &PathBuf, data_dir: &TempDir) -> (Config, String) {
     (config, served_model)
 }
 
-fn first_chat_target(config: &Config, kind: ProviderKind) -> RouteTargetConfig {
+fn first_chat_target(config: &Config, kind: AdapterKind) -> RouteTargetConfig {
     let provider = config
-        .providers
+        .backends
         .iter()
-        .find(|provider| provider.kind == kind)
+        .find(|provider| provider.adapter == kind)
         .unwrap_or_else(|| panic!("private config has no {} provider", kind.as_str()));
     let credential = provider.credentials.first().expect("provider credential");
     let model = provider
         .models
         .iter()
-        .find(|model| model.native_protocols().contains(&Protocol::OpenAiChat))
+        .find(|model| {
+            BackendClient::new(provider, credential, model)
+                .is_ok_and(|client| client.protocols().contains(&Protocol::OpenAiChat))
+        })
         .expect("provider OpenAI Chat model");
     RouteTargetConfig {
-        provider: provider.id.clone(),
+        backend: provider.id.clone(),
         credential: credential.id.clone(),
         model: model.name.clone(),
     }
@@ -186,28 +190,28 @@ fn first_chat_target(config: &Config, kind: ProviderKind) -> RouteTargetConfig {
 
 fn legacy_v1_config(document: &toml::Value) -> Config {
     let logical_name = text_at(document, &["model", "logical_name"]);
-    let providers = vec![
+    let backends = vec![
         legacy_provider(
             document,
             "opencode_go",
             "opencode-go",
-            ProviderKind::OpenCodeGo,
+            AdapterKind::OpenCodeGo,
         ),
         legacy_provider(
             document,
             "deepseek",
             "deepseek",
-            ProviderKind::DeepSeekOfficial,
+            AdapterKind::DeepSeekOfficial,
         ),
     ];
     Config {
-        config_version: 2,
+        config_version: 3,
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: PathBuf::from("unused-real-probe-data"),
         },
         affinity: Default::default(),
-        providers,
+        backends,
         models: vec![ServedModelConfig {
             name: logical_name,
             aliases: Vec::new(),
@@ -217,24 +221,65 @@ fn legacy_v1_config(document: &toml::Value) -> Config {
     }
 }
 
+fn migrate_legacy_v2_config(mut document: toml::Value) -> Config {
+    let root = document.as_table_mut().expect("v2 config root table");
+    root.insert("config_version".into(), toml::Value::Integer(3));
+    let mut backends = root.remove("providers").expect("v2 providers");
+    for backend in backends
+        .as_array_mut()
+        .expect("v2 providers array")
+        .iter_mut()
+    {
+        let backend = backend.as_table_mut().expect("v2 provider table");
+        let adapter = backend.remove("kind").expect("v2 provider kind");
+        backend.insert("adapter".into(), adapter);
+    }
+    root.insert("backends".into(), backends);
+
+    for model in root
+        .get_mut("models")
+        .and_then(toml::Value::as_array_mut)
+        .expect("v2 models array")
+    {
+        for layer in model
+            .get_mut("layers")
+            .and_then(toml::Value::as_array_mut)
+            .expect("v2 model layers")
+        {
+            for target in layer
+                .get_mut("targets")
+                .and_then(toml::Value::as_array_mut)
+                .expect("v2 layer targets")
+            {
+                let target = target.as_table_mut().expect("v2 target table");
+                let backend = target.remove("provider").expect("v2 target provider");
+                target.insert("backend".into(), backend);
+            }
+        }
+    }
+
+    let config = document.try_into::<Config>().expect("migrate v2 config");
+    config.validate().expect("validate migrated v2 config");
+    config
+}
+
 fn legacy_provider(
     document: &toml::Value,
     legacy_id: &str,
     id: &str,
-    kind: ProviderKind,
-) -> ProviderConfig {
-    ProviderConfig {
+    kind: AdapterKind,
+) -> BackendConfig {
+    BackendConfig {
         id: id.into(),
-        kind,
-        endpoint: Some(text_at(document, &["providers", legacy_id, "endpoint"])),
+        adapter: kind,
+        endpoint: None,
         credentials: vec![CredentialConfig {
             id: format!("{id}-real"),
             api_key: text_at(document, &["providers", legacy_id, "api_key"]),
         }],
-        models: vec![ProviderModelConfig {
+        models: vec![BackendModelConfig {
             name: text_at(document, &["providers", legacy_id, "model"]),
-            endpoint_protocol: (kind == ProviderKind::OpenCodeGo).then_some(Protocol::OpenAiChat),
-            protocols: if kind == ProviderKind::OpenCodeGo {
+            protocols: if kind == AdapterKind::OpenCodeGo {
                 Vec::new()
             } else {
                 vec![Protocol::OpenAiChat]

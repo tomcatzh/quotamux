@@ -5,10 +5,19 @@ use super::{ValidationError, set_model, validate_model};
 pub fn prepare(mut body: Value, upstream_model: &str) -> Result<Value, ValidationError> {
     validate_model(&body)?;
     if body.get("stream").and_then(Value::as_bool) == Some(true) {
-        body.as_object_mut().expect("validated object").insert(
-            "stream_options".into(),
-            serde_json::json!({"include_usage": true}),
-        );
+        let object = body.as_object_mut().expect("validated object");
+        match object.get_mut("stream_options") {
+            Some(Value::Object(options)) => {
+                options.insert("include_usage".into(), Value::Bool(true));
+            }
+            None | Some(Value::Null) => {
+                object.insert(
+                    "stream_options".into(),
+                    serde_json::json!({"include_usage": true}),
+                );
+            }
+            Some(_) => {}
+        }
     }
     set_model(&mut body, upstream_model);
     Ok(body)
@@ -75,5 +84,28 @@ mod tests {
         let prepared = prepare(body, "kimi-k3").unwrap();
         assert_eq!(prepared["messages"], "not-an-array");
         assert_eq!(prepared["temperature"], "not-a-number");
+    }
+
+    #[test]
+    fn merges_usage_into_valid_stream_options_without_repairing_invalid_values() {
+        let prepared = prepare(
+            json!({
+                "model":"logical",
+                "messages":[],
+                "stream":true,
+                "stream_options":{"include_obfuscation":false}
+            }),
+            "provider-model",
+        )
+        .unwrap();
+        assert_eq!(prepared["stream_options"]["include_usage"], true);
+        assert_eq!(prepared["stream_options"]["include_obfuscation"], false);
+
+        let invalid = prepare(
+            json!({"model":"logical","messages":[],"stream":true,"stream_options":"invalid"}),
+            "provider-model",
+        )
+        .unwrap();
+        assert_eq!(invalid["stream_options"], "invalid");
     }
 }
