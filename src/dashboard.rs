@@ -36,6 +36,7 @@ mod tests {
 
     #[test]
     fn dashboard_shows_only_recorded_routing_concepts() {
+        assert!(APP.contains("Route: Fallback exhausted"));
         for expected in [
             "Served model",
             "Layer",

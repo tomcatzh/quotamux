@@ -657,7 +657,8 @@ async fn handle_nonstream(
         route_layer_index: Some(outcome.candidate.layer_index),
         selection_reason: Some(outcome.candidate.selection_reason.clone()),
         matched_prefix_bytes: outcome.candidate.matched_prefix_bytes,
-        fallback: outcome.candidate.layer_index > 0,
+        fallback: Some(outcome.candidate.layer_index > 0),
+        fallback_exhausted: false,
         translated: outcome.translated,
         request_bytes,
         response_bytes: response_bytes.len() as u64,
@@ -1150,7 +1151,8 @@ async fn handle_stream(
             route_layer_index:Some(candidate_for_stream.layer_index),
             selection_reason:Some(candidate_for_stream.selection_reason.clone()),
             matched_prefix_bytes:candidate_for_stream.matched_prefix_bytes,
-            fallback:candidate_for_stream.layer_index>0,
+            fallback:Some(candidate_for_stream.layer_index>0),
+            fallback_exhausted:false,
             translated,
             request_bytes,
             response_bytes,
@@ -1471,6 +1473,7 @@ async fn terminal_failure(
     } else {
         failure.error.class
     };
+    let fallback_exhausted = class == FailureClass::FallbackUnavailable;
     let status = failure.error.status.unwrap_or(StatusCode::BAD_GATEWAY);
     let record = RequestRecord {
         id: request_id.into(),
@@ -1494,7 +1497,8 @@ async fn terminal_failure(
         route_layer_index: candidate.map(|candidate| candidate.layer_index),
         selection_reason: candidate.map(|candidate| candidate.selection_reason.clone()),
         matched_prefix_bytes: candidate.and_then(|candidate| candidate.matched_prefix_bytes),
-        fallback: candidate.is_some_and(|candidate| candidate.layer_index > 0),
+        fallback: candidate.map(|candidate| candidate.layer_index > 0),
+        fallback_exhausted,
         translated: false,
         request_bytes,
         response_bytes: 0,

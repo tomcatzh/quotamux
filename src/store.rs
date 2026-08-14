@@ -801,7 +801,7 @@ fn apply_request_rollup(
     let delta = RequestRollup {
         calls: 1,
         errors: u64::from(record.error_class.is_some()),
-        fallbacks: u64::from(record.fallback),
+        fallbacks: u64::from(record.fallback == Some(true)),
         input_tokens: record.usage.input_tokens,
         output_tokens: record.usage.output_tokens,
         total_tokens: record.usage.total_tokens,
@@ -1530,6 +1530,21 @@ mod tests {
         assert_eq!(last.next_cursor, None);
     }
 
+    #[test]
+    fn request_records_read_boolean_fallback_without_exhaustion_marker() {
+        let mut stored = serde_json::to_value(request_record(
+            "legacy-fallback-shape",
+            Utc::now().timestamp_millis(),
+        ))
+        .unwrap();
+        stored["fallback"] = Value::Bool(false);
+        stored.as_object_mut().unwrap().remove("fallback_exhausted");
+
+        let record = serde_json::from_value::<RequestRecord>(stored).unwrap();
+        assert_eq!(record.fallback, Some(false));
+        assert!(!record.fallback_exhausted);
+    }
+
     fn request_record(id: &str, started_at_ms: i64) -> RequestRecord {
         RequestRecord {
             id: id.into(),
@@ -1549,7 +1564,8 @@ mod tests {
             route_layer_index: Some(0),
             selection_reason: Some("single-target".into()),
             matched_prefix_bytes: None,
-            fallback: false,
+            fallback: Some(false),
+            fallback_exhausted: false,
             translated: false,
             request_bytes: 100,
             response_bytes: 200,

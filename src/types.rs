@@ -254,7 +254,10 @@ pub struct RequestRecord {
     pub selection_reason: Option<String>,
     #[serde(default)]
     pub matched_prefix_bytes: Option<u64>,
-    pub fallback: bool,
+    #[serde(default)]
+    pub fallback: Option<bool>,
+    #[serde(default)]
+    pub fallback_exhausted: bool,
     pub translated: bool,
     pub request_bytes: u64,
     pub response_bytes: u64,

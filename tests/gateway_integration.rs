@@ -2293,6 +2293,17 @@ async fn transient_primary_failure_falls_back_before_commit_and_persists_attempt
         .expect("fallback overview statistics JSON");
     assert_eq!(overview["backends"]["opencode-go"]["attempts"], 1);
     assert_eq!(overview["backends"]["deepseek"]["attempts"], 1);
+
+    let recent = client
+        .get(gateway.url("/api/requests?limit=1"))
+        .send()
+        .await
+        .expect("fallback request record")
+        .json::<Value>()
+        .await
+        .expect("fallback request record JSON");
+    assert_eq!(recent["requests"][0]["fallback"], true);
+    assert_eq!(recent["requests"][0]["fallback_exhausted"], false);
 }
 
 #[tokio::test]
@@ -2328,6 +2339,106 @@ async fn both_providers_failing_returns_terminal_error() {
     assert_eq!(body["error"]["message"], "upstream request failed");
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 1);
+}
+
+#[tokio::test]
+async fn all_skipped_targets_record_fallback_exhausted_without_false_selection() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"primary unavailable"}}),
+        )
+        .with_header("retry-after", "60"),
+    ])
+    .await;
+    let fallback = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"fallback unavailable"}}),
+        )
+        .with_header("retry-after", "60"),
+    ])
+    .await;
+    let gateway = Gateway::start(&primary, &fallback).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("open both circuits");
+    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = first.json::<Value>().await.expect("first terminal error");
+
+    let second = client
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("all targets skipped");
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = second
+        .json::<Value>()
+        .await
+        .expect("skipped terminal error");
+    assert_eq!(body["error"]["type"], "fallback_unavailable");
+    assert_eq!(
+        body["error"]["message"],
+        "no route target is currently available"
+    );
+    assert_eq!(primary.calls().await, 1);
+    assert_eq!(fallback.calls().await, 1);
+
+    let recent = client
+        .get(gateway.url("/api/requests?limit=2"))
+        .send()
+        .await
+        .expect("request records")
+        .json::<Value>()
+        .await
+        .expect("request records JSON");
+    let requests = recent["requests"].as_array().expect("request array");
+    assert_eq!(requests.len(), 2);
+
+    let skipped = &requests[0];
+    assert_eq!(skipped["error_class"], "fallback_unavailable");
+    assert_eq!(skipped["fallback"], Value::Null);
+    assert_eq!(skipped["fallback_exhausted"], true);
+    assert_eq!(skipped["backend"], Value::Null);
+    assert_eq!(skipped["route_layer"], Value::Null);
+    assert_eq!(skipped["selection_reason"], Value::Null);
+
+    let attempted_and_exhausted = &requests[1];
+    assert_eq!(
+        attempted_and_exhausted["error_class"],
+        "fallback_unavailable"
+    );
+    assert_eq!(attempted_and_exhausted["fallback"], true);
+    assert_eq!(attempted_and_exhausted["fallback_exhausted"], true);
+    assert_eq!(attempted_and_exhausted["backend"], "deepseek");
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=10"))
+        .send()
+        .await
+        .expect("attempt records")
+        .json::<Value>()
+        .await
+        .expect("attempt records JSON");
+    assert_eq!(attempts["attempts"].as_array().unwrap().len(), 2);
+
+    let overview = client
+        .get(gateway.url("/api/stats"))
+        .send()
+        .await
+        .expect("overview statistics")
+        .json::<Value>()
+        .await
+        .expect("overview statistics JSON");
+    assert_eq!(overview["requests"]["total"], 2);
+    assert_eq!(overview["requests"]["errors"], 2);
+    assert_eq!(overview["requests"]["fallbacks"], 1);
 }
 
 #[tokio::test]

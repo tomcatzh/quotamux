@@ -454,7 +454,9 @@ interface.
 
 Request and attempt limits have a maximum of 1000. Routing statistics attribute
 one logical request to its final recorded target; failed intermediate targets
-remain separate attempts.
+remain separate attempts. In request records, `fallback` is `null` when no
+target was attempted; `fallback_exhausted` is `true` when every configured
+route was unavailable or failed.
 
 ## Storage and privacy
 
