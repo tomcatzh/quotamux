@@ -8,6 +8,16 @@ config_version = 3
 listen = "0.0.0.0:8080"
 data_dir = "./data"
 
+# Active upstream streams may legitimately pause during long reasoning. Keep
+# their idle-read deadline separate from ordinary responses and from the total
+# request deadline. QuotaMux emits downstream SSE comments while it waits.
+[server.timeouts]
+upstream_connect_ms = 10000
+upstream_read_ms = 90000
+upstream_stream_read_ms = 300000
+upstream_total_ms = 7200000
+downstream_sse_heartbeat_ms = 15000
+
 # Prefix affinity metadata is process-local and never written to redb.
 [affinity]
 checkpoint_bytes = 128

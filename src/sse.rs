@@ -5,6 +5,23 @@ use futures_util::{Stream, StreamExt};
 
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SseDecodeError {
+    FrameTooLarge,
+    ReadTimeout,
+    Transport,
+}
+
+impl SseDecodeError {
+    pub const fn safe_message(self) -> &'static str {
+        match self {
+            Self::FrameTooLarge => "upstream SSE frame exceeded 2 MiB",
+            Self::ReadTimeout => "upstream SSE read timed out",
+            Self::Transport => "upstream SSE transport failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SseEvent {
     pub event: Option<String>,
@@ -51,7 +68,7 @@ impl SseDecoder {
         }
     }
 
-    pub async fn next_event(&mut self) -> Result<Option<SseEvent>, String> {
+    pub async fn next_event(&mut self) -> Result<Option<SseEvent>, SseDecodeError> {
         loop {
             if let Some((end, separator_len)) = find_separator(&self.buffer) {
                 let frame = self.buffer.split_to(end);
@@ -72,10 +89,13 @@ impl SseDecoder {
                 Some(Ok(bytes)) => {
                     self.buffer.extend_from_slice(&bytes);
                     if self.buffer.len() > 2 * 1024 * 1024 {
-                        return Err("upstream SSE frame exceeded 2 MiB".into());
+                        return Err(SseDecodeError::FrameTooLarge);
                     }
                 }
-                Some(Err(_)) => return Err("upstream SSE stream failed".into()),
+                Some(Err(error)) if error.is_timeout() => {
+                    return Err(SseDecodeError::ReadTimeout);
+                }
+                Some(Err(_)) => return Err(SseDecodeError::Transport),
                 None => self.complete = true,
             }
         }

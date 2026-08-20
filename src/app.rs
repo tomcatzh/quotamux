@@ -152,11 +152,17 @@ impl AppState {
                             credential,
                             model,
                             endpoint_overrides.get(&backend.id).map(String::as_str),
+                            config.server.timeouts,
                         )?;
                         #[cfg(not(feature = "test-support"))]
                         let client = {
                             debug_assert!(endpoint_overrides.is_empty());
-                            BackendClient::new(backend, credential, model)?
+                            BackendClient::new_with_timeouts(
+                                backend,
+                                credential,
+                                model,
+                                config.server.timeouts,
+                            )?
                         };
                         let legacy_circuit_key = format!(
                             "circuit:{}:{}:{}",
@@ -1005,6 +1011,7 @@ async fn handle_stream(
     let upstream_model = prepared.runtime.client.model().to_string();
     let upstream_pricing = prepared.runtime.client.pricing().copied();
     let provider_client = prepared.runtime.client.clone();
+    let downstream_sse_heartbeat_ms = state.config.server.timeouts.downstream_sse_heartbeat_ms;
     let permit = prepared
         .permit
         .expect("route permit attached after prepare");
@@ -1013,6 +1020,7 @@ async fn handle_stream(
         let mut response_bytes = 0_u64;
         let mut usage = Usage::default();
         let mut stream_error = None;
+        let mut stream_error_message = None;
         let mut response_translator =
             responses::ChatToResponsesStream::new(requested_model.clone(), body.clone());
         let mut anthropic_translator =
@@ -1021,11 +1029,23 @@ async fn handle_stream(
         let mut anthropic_source =
             anthropic::AnthropicToChatStream::new(requested_model.clone());
         let mut pending_event = Some(first_event);
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(downstream_sse_heartbeat_ms));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
         loop {
             let next = if let Some(event) = pending_event.take() {
-                Ok(Some(event))
+                Some(Ok(Some(event)))
             } else {
-                decoder.next_event().await
+                tokio::select! {
+                    event = decoder.next_event() => Some(event),
+                    _ = heartbeat.tick() => None,
+                }
+            };
+            let Some(next) = next else {
+                let bytes = Bytes::from_static(b": keep-alive\n\n");
+                response_bytes += bytes.len() as u64;
+                yield Ok::<Bytes, Infallible>(bytes);
+                continue;
             };
             match next {
                 Ok(Some(event)) => {
@@ -1048,6 +1068,7 @@ async fn handle_stream(
                                 let upstream_type=upstream_chunk.get("type").and_then(Value::as_str);
                                 if let Some(class) = stream_error_class(&provider_client, upstream_status, &event, Some(&upstream_chunk)) {
                                     stream_error=Some(class);
+                                    stream_error_message=Some("upstream returned a semantic SSE error".into());
                                     break;
                                 }
                                 let upstream_terminal = match egress {
@@ -1079,27 +1100,44 @@ async fn handle_stream(
                                     break;
                                 }
                             }
-                            Err(_) => { stream_error=Some(FailureClass::StreamFailure); break; }
+                            Err(_) => {
+                                stream_error=Some(FailureClass::StreamFailure);
+                                stream_error_message=Some("upstream sent malformed SSE".into());
+                                break;
+                            }
                         }
                     } else {
                         let parsed=match serde_json::from_str::<Value>(&event.data) {
                             Ok(value)=>value,
-                            Err(_)=>{stream_error=Some(FailureClass::StreamFailure);break;}
+                            Err(_)=>{
+                                stream_error=Some(FailureClass::StreamFailure);
+                                stream_error_message=Some("upstream sent malformed SSE".into());
+                                break;
+                            }
                         };
                         let semantic_error=stream_error_class(&provider_client, upstream_status, &event, Some(&parsed));
                         observe_stream_usage(protocol, &mut usage, &parsed);
                         let event_type=event.event.as_deref().or_else(||parsed.get("type")?.as_str());
                         let bytes=event.encode(); response_bytes+=bytes.len() as u64; yield Ok::<Bytes, Infallible>(bytes);
-                        if let Some(class)=semantic_error { stream_error=Some(class); break; }
+                        if let Some(class)=semantic_error {
+                            stream_error=Some(class);
+                            stream_error_message=Some("upstream returned a semantic SSE error".into());
+                            break;
+                        }
                         if protocol == Protocol::OpenAiResponses && matches!(event_type, Some("response.completed"|"response.incomplete"|"response.failed")) { break; }
                         if protocol == Protocol::AnthropicMessages && event_type==Some("message_stop") { break; }
                     }
                 }
                 Ok(None) => {
                     stream_error=Some(FailureClass::StreamFailure);
+                    stream_error_message=Some("upstream SSE ended before a terminal event".into());
                     break;
                 }
-                Err(_) => { stream_error=Some(FailureClass::StreamFailure); break; }
+                Err(error) => {
+                    stream_error=Some(FailureClass::StreamFailure);
+                    stream_error_message=Some(error.safe_message().into());
+                    break;
+                }
             }
         }
         let completed_at_ms=Utc::now().timestamp_millis();
@@ -1130,7 +1168,7 @@ async fn handle_stream(
             total_ms:started.elapsed().as_millis() as u64,
             usage:usage.clone(),
             provider_cost_usd:provider_cost(upstream_pricing.as_ref(),&usage),
-            sanitized_error:stream_error.map(|_|"upstream stream ended unexpectedly".into())
+            sanitized_error:stream_error_message
         };
         persist_attempt(&state_for_stream,&attempt);
         let request = RequestRecord {
@@ -1270,12 +1308,37 @@ async fn prepare_stream_attempt(
     let mut decoder = SseDecoder::new(Box::pin(response.bytes_stream()));
     let event = match decoder.next_event().await {
         Ok(Some(event)) => event,
-        Ok(None) | Err(_) => {
+        Ok(None) => {
             let error = BackendError {
                 class: FailureClass::StreamFailure,
                 status: Some(status),
                 retry_after: None,
-                safe_message: "upstream stream failed before its first semantic event".into(),
+                safe_message: "upstream SSE ended before its first semantic event".into(),
+            };
+            let record = failed_attempt(
+                &attempt_id,
+                Some(request_id),
+                sequence,
+                candidate,
+                runtime.client.adapter_kind(),
+                runtime.client.model(),
+                egress,
+                translated,
+                candidate.probe,
+                attempt_started_at_ms,
+                attempt_started,
+                request_bytes,
+                &error,
+            );
+            persist_attempt(&state, &record);
+            return Err(AttemptFailure { error });
+        }
+        Err(decode_error) => {
+            let error = BackendError {
+                class: FailureClass::StreamFailure,
+                status: Some(status),
+                retry_after: None,
+                safe_message: decode_error.safe_message().into(),
             };
             let record = failed_attempt(
                 &attempt_id,
@@ -1997,6 +2060,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "models":state.config.models.iter().map(|model|model.name.as_str()).collect::<Vec<_>>(),
         "targets":target_rows,
+        "timeouts":state.config.server.timeouts,
         "affinity":{
             "storage":"memory-only",
             "leases":state.affinity.lease_count(),

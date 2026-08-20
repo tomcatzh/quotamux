@@ -32,6 +32,65 @@ pub struct Config {
 pub struct ServerConfig {
     pub listen: String,
     pub data_dir: PathBuf,
+    #[serde(default)]
+    pub timeouts: ServerTimeoutConfig,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerTimeoutConfig {
+    pub upstream_connect_ms: u64,
+    pub upstream_read_ms: u64,
+    pub upstream_stream_read_ms: u64,
+    pub upstream_total_ms: u64,
+    pub downstream_sse_heartbeat_ms: u64,
+}
+
+impl Default for ServerTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            upstream_connect_ms: 10_000,
+            upstream_read_ms: 90_000,
+            upstream_stream_read_ms: 300_000,
+            upstream_total_ms: 2 * 60 * 60 * 1_000,
+            downstream_sse_heartbeat_ms: 15_000,
+        }
+    }
+}
+
+impl ServerTimeoutConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (name, value) in [
+            ("upstream_connect_ms", self.upstream_connect_ms),
+            ("upstream_read_ms", self.upstream_read_ms),
+            ("upstream_stream_read_ms", self.upstream_stream_read_ms),
+            ("upstream_total_ms", self.upstream_total_ms),
+            (
+                "downstream_sse_heartbeat_ms",
+                self.downstream_sse_heartbeat_ms,
+            ),
+        ] {
+            if value == 0 {
+                return Err(invalid(format!("server.timeouts.{name} must be positive")));
+            }
+        }
+        if self.upstream_total_ms < self.upstream_connect_ms {
+            return Err(invalid(
+                "server.timeouts.upstream_total_ms must be at least upstream_connect_ms",
+            ));
+        }
+        if self.upstream_total_ms < self.upstream_read_ms {
+            return Err(invalid(
+                "server.timeouts.upstream_total_ms must be at least upstream_read_ms",
+            ));
+        }
+        if self.upstream_total_ms < self.upstream_stream_read_ms {
+            return Err(invalid(
+                "server.timeouts.upstream_total_ms must be at least upstream_stream_read_ms",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -227,6 +286,7 @@ impl Config {
             .listen
             .parse::<std::net::SocketAddr>()
             .map_err(|_| invalid("server.listen must be an IP socket address"))?;
+        self.server.timeouts.validate()?;
         if self.backends.is_empty() {
             return Err(invalid("backends must not be empty"));
         }
@@ -514,6 +574,7 @@ mod tests {
             server: ServerConfig {
                 listen: "127.0.0.1:8080".into(),
                 data_dir: "data".into(),
+                timeouts: ServerTimeoutConfig::default(),
             },
             affinity: PrefixAffinityConfig::default(),
             backends: vec![
@@ -590,6 +651,48 @@ mod tests {
             config.resolve_model(UPSTREAM_MODEL).unwrap().name,
             LOGICAL_MODEL
         );
+    }
+
+    #[test]
+    fn server_timeouts_default_for_existing_configuration_files() {
+        let server: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:8080"
+data_dir = "data"
+"#,
+        )
+        .unwrap();
+        let defaults = ServerTimeoutConfig::default();
+        assert_eq!(
+            server.timeouts.upstream_connect_ms,
+            defaults.upstream_connect_ms
+        );
+        assert_eq!(server.timeouts.upstream_read_ms, defaults.upstream_read_ms);
+        assert_eq!(
+            server.timeouts.upstream_stream_read_ms,
+            defaults.upstream_stream_read_ms
+        );
+        assert_eq!(
+            server.timeouts.upstream_total_ms,
+            defaults.upstream_total_ms
+        );
+        assert_eq!(
+            server.timeouts.downstream_sse_heartbeat_ms,
+            defaults.downstream_sse_heartbeat_ms
+        );
+    }
+
+    #[test]
+    fn validates_positive_ordered_server_timeouts() {
+        let mut config = valid();
+        config.server.timeouts.upstream_stream_read_ms = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("upstream_stream_read_ms must be positive"));
+
+        config.server.timeouts.upstream_stream_read_ms = 301_000;
+        config.server.timeouts.upstream_total_ms = 300_000;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("upstream_total_ms must be at least upstream_stream_read_ms"));
     }
 
     #[test]
@@ -883,6 +986,12 @@ config_version = 3
 [server]
 listen = "127.0.0.1:8080"
 data_dir = "data"
+[server.timeouts]
+upstream_connect_ms = 5000
+upstream_read_ms = 60000
+upstream_stream_read_ms = 300000
+upstream_total_ms = 7200000
+downstream_sse_heartbeat_ms = 15000
 [affinity]
 checkpoint_bytes = 256
 max_checkpoints_per_path = 1024
@@ -913,6 +1022,9 @@ targets = [{ backend = "go", credential = "go-a", model = "deepseek-v4-flash" }]
         assert_eq!(config.affinity.checkpoint_bytes, 256);
         assert_eq!(config.affinity.max_checkpoints_per_path, 1024);
         assert_eq!(config.affinity.max_leases, 2048);
+        assert_eq!(config.server.timeouts.upstream_connect_ms, 5_000);
+        assert_eq!(config.server.timeouts.upstream_stream_read_ms, 300_000);
+        assert_eq!(config.server.timeouts.downstream_sse_heartbeat_ms, 15_000);
         assert_eq!(
             config.backends[0].models[0].pricing,
             Some(ModelPricingConfig {

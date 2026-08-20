@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::{
     config::{
         AdapterKind, BackendConfig, BackendModelConfig, CredentialConfig, ModelPricingConfig,
+        ServerTimeoutConfig,
     },
     types::{FailureClass, Protocol},
 };
@@ -40,6 +41,7 @@ pub struct BackendClient {
     protocols: Vec<Protocol>,
     pricing: Option<ModelPricingConfig>,
     client: reqwest::Client,
+    stream_client: reqwest::Client,
 }
 
 #[derive(Debug)]
@@ -78,7 +80,23 @@ impl BackendClient {
         credential: &CredentialConfig,
         model: &BackendModelConfig,
     ) -> Result<Self, BackendBuildError> {
-        Self::build(backend, credential, model, None)
+        Self::build(
+            backend,
+            credential,
+            model,
+            None,
+            ServerTimeoutConfig::default(),
+        )
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn new_with_timeouts(
+        backend: &BackendConfig,
+        credential: &CredentialConfig,
+        model: &BackendModelConfig,
+        timeouts: ServerTimeoutConfig,
+    ) -> Result<Self, BackendBuildError> {
+        Self::build(backend, credential, model, None, timeouts)
     }
 
     #[cfg(feature = "test-support")]
@@ -87,8 +105,9 @@ impl BackendClient {
         credential: &CredentialConfig,
         model: &BackendModelConfig,
         endpoint_override: Option<&str>,
+        timeouts: ServerTimeoutConfig,
     ) -> Result<Self, BackendBuildError> {
-        Self::build(backend, credential, model, endpoint_override)
+        Self::build(backend, credential, model, endpoint_override, timeouts)
     }
 
     fn build(
@@ -96,15 +115,10 @@ impl BackendClient {
         credential: &CredentialConfig,
         model: &BackendModelConfig,
         endpoint_override: Option<&str>,
+        timeouts: ServerTimeoutConfig,
     ) -> Result<Self, BackendBuildError> {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("quotamux/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .http2_adaptive_window(true)
-            .build()?;
+        let client = build_http_client(&timeouts, timeouts.upstream_read_ms)?;
+        let stream_client = build_http_client(&timeouts, timeouts.upstream_stream_read_ms)?;
         let adapter = adapter_for(backend.adapter).ok_or(BackendBuildError::UnsupportedAdapter(
             backend.adapter.as_str(),
         ))?;
@@ -162,6 +176,7 @@ impl BackendClient {
             protocols,
             pricing: model.pricing,
             client,
+            stream_client,
         })
     }
 
@@ -204,7 +219,12 @@ impl BackendClient {
     ) -> Result<Response, BackendError> {
         debug_assert!(self.protocols.contains(&protocol));
         let url = self.request_url(protocol);
-        let mut request = self.client.post(url).json(body);
+        let client = if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            &self.stream_client
+        } else {
+            &self.client
+        };
+        let mut request = client.post(url).json(body);
         request = self
             .adapter
             .apply_auth(request, &self.api_key, protocol, inbound_headers);
@@ -261,6 +281,21 @@ impl BackendClient {
             safe_message: details.safe_message,
         })
     }
+}
+
+fn build_http_client(
+    timeouts: &ServerTimeoutConfig,
+    read_timeout_ms: u64,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent(concat!("quotamux/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_millis(timeouts.upstream_connect_ms))
+        .read_timeout(Duration::from_millis(read_timeout_ms))
+        .timeout(Duration::from_millis(timeouts.upstream_total_ms))
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .http2_adaptive_window(true)
+        .build()
 }
 
 async fn read_error_body(mut response: Response) -> Vec<u8> {

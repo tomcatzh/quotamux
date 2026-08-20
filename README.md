@@ -111,6 +111,13 @@ config_version = 3
 listen = "0.0.0.0:8080"
 data_dir = "./data"
 
+[server.timeouts]
+upstream_connect_ms = 10000
+upstream_read_ms = 90000
+upstream_stream_read_ms = 300000
+upstream_total_ms = 7200000
+downstream_sse_heartbeat_ms = 15000
+
 [[backends]]
 id = "go"
 adapter = "opencode-go"

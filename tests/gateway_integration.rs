@@ -35,6 +35,11 @@ enum MockBody {
     Json(Value),
     Raw(String),
     HangingSse(String),
+    PausedSse {
+        first: String,
+        rest: String,
+        pause: Duration,
+    },
 }
 
 struct MockReply {
@@ -72,6 +77,19 @@ impl MockReply {
         }
     }
 
+    fn paused_sse(first: impl Into<String>, rest: impl Into<String>, pause: Duration) -> Self {
+        Self {
+            status: StatusCode::OK,
+            body: MockBody::PausedSse {
+                first: first.into(),
+                rest: rest.into(),
+                pause,
+            },
+            headers: vec![(CONTENT_TYPE.as_str().into(), "text/event-stream".into())],
+            delay: None,
+        }
+    }
+
     fn delayed(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
         self
@@ -90,6 +108,14 @@ impl MockReply {
                 let stream = async_stream::stream! {
                     yield Ok::<Bytes, Infallible>(Bytes::from(body));
                     std::future::pending::<()>().await;
+                };
+                Response::new(Body::from_stream(stream))
+            }
+            MockBody::PausedSse { first, rest, pause } => {
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(first));
+                    tokio::time::sleep(pause).await;
+                    yield Ok::<Bytes, Infallible>(Bytes::from(rest));
                 };
                 Response::new(Body::from_stream(stream))
             }
@@ -207,6 +233,7 @@ impl Gateway {
             server: ServerConfig {
                 listen: "127.0.0.1:0".into(),
                 data_dir: "unused-test-data".into(),
+                timeouts: Default::default(),
             },
             affinity: Default::default(),
             backends: vec![
@@ -444,6 +471,7 @@ fn test_config(
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
+            timeouts: Default::default(),
         },
         affinity: Default::default(),
         backends,
@@ -738,6 +766,7 @@ async fn named_tool_choice_reaches_upstream_and_400_does_not_fallback_or_open_ci
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
+            timeouts: Default::default(),
         },
         affinity: Default::default(),
         backends: vec![
@@ -834,6 +863,7 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
+            timeouts: Default::default(),
         },
         affinity: Default::default(),
         backends: vec![
@@ -2621,6 +2651,109 @@ async fn streaming_chat_passes_reasoning_content_usage_and_done() {
     assert!(stream.contains("data: [DONE]"));
     assert_eq!(primary.calls().await, 1);
     assert_eq!(fallback.calls().await, 0);
+}
+
+#[tokio::test]
+async fn streaming_pause_uses_stream_timeout_and_emits_downstream_heartbeats() {
+    let primary = MockProvider::start(vec![MockReply::paused_sse(
+        chat_stream("long thinking", "partial answer", false),
+        "data: [DONE]\n\n",
+        Duration::from_millis(90),
+    )])
+    .await;
+    let mut config = test_config(
+        vec![test_backend("opencode-go", "go-plan", &primary)],
+        vec![("plan", vec![target("opencode-go", "go-plan")])],
+    );
+    config.server.timeouts.upstream_connect_ms = 100;
+    config.server.timeouts.upstream_read_ms = 20;
+    config.server.timeouts.upstream_stream_read_ms = 250;
+    config.server.timeouts.upstream_total_ms = 1_000;
+    config.server.timeouts.downstream_sse_heartbeat_ms = 20;
+    let gateway = Gateway::start_config(config, 0x5eed).await;
+    let client = reqwest::Client::new();
+
+    let mut body = chat_request();
+    body["stream"] = json!(true);
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .expect("paused stream response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let stream = response.text().await.expect("paused stream body");
+    assert!(stream.contains("partial answer"));
+    assert!(stream.contains("data: [DONE]"));
+    assert!(
+        stream.matches(": keep-alive\n\n").count() >= 2,
+        "expected periodic downstream heartbeats: {stream}"
+    );
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("timeout status response")
+        .json::<Value>()
+        .await
+        .expect("timeout status JSON");
+    assert_eq!(status["timeouts"]["upstream_read_ms"], 20);
+    assert_eq!(status["timeouts"]["upstream_stream_read_ms"], 250);
+    assert_eq!(status["timeouts"]["downstream_sse_heartbeat_ms"], 20);
+}
+
+#[tokio::test]
+async fn streaming_read_timeout_records_precise_sanitized_error_after_commit() {
+    let primary = MockProvider::start(vec![MockReply::hanging_sse(chat_stream(
+        "stalled thinking",
+        "partial answer",
+        false,
+    ))])
+    .await;
+    let mut config = test_config(
+        vec![test_backend("opencode-go", "go-plan", &primary)],
+        vec![("plan", vec![target("opencode-go", "go-plan")])],
+    );
+    config.server.timeouts.upstream_connect_ms = 100;
+    config.server.timeouts.upstream_read_ms = 70;
+    config.server.timeouts.upstream_stream_read_ms = 70;
+    config.server.timeouts.upstream_total_ms = 1_000;
+    config.server.timeouts.downstream_sse_heartbeat_ms = 15;
+    let gateway = Gateway::start_config(config, 0x5eed).await;
+    let client = reqwest::Client::new();
+
+    let mut body = chat_request();
+    body["stream"] = json!(true);
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&body)
+        .send()
+        .await
+        .expect("stalled stream response");
+    let request_id = header_value(&response, "x-relay-request-id");
+    assert_eq!(response.status(), StatusCode::OK);
+    let stream = response.text().await.expect("stalled stream body");
+    assert!(stream.contains("partial answer"));
+    assert!(stream.contains(": keep-alive\n\n"));
+    assert!(!stream.contains("data: [DONE]"));
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=20"))
+        .send()
+        .await
+        .expect("stalled stream attempts response")
+        .json::<Value>()
+        .await
+        .expect("stalled stream attempts JSON");
+    let request_attempts = attempts_for_request(&attempts, &request_id);
+    assert_eq!(request_attempts.len(), 1);
+    assert_eq!(request_attempts[0]["error_class"], "stream_failure");
+    assert_eq!(
+        request_attempts[0]["sanitized_error"],
+        "upstream SSE read timed out"
+    );
 }
 
 #[tokio::test]
