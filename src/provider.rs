@@ -539,6 +539,7 @@ mod tests {
                     "kimi-k2.6",
                     "deepseek-v4-pro",
                     "deepseek-v4-flash",
+                    "deepseek-v4-flash-vision-exp",
                     "mimo-v2.5",
                     "mimo-v2.5-pro",
                     "hy3",

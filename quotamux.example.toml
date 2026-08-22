@@ -39,11 +39,16 @@ api_key = ""
 [[backends.models]]
 name = "deepseek-v4-flash"
 # The OpenCode Go adapter owns this official model's endpoint family.
-pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
+# Static cost estimates use current off-peak rates; peak rates are 2x.
+pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
+
+[[backends.models]]
+name = "deepseek-v4-flash-vision-exp"
+pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
 
 [[backends.models]]
 name = "deepseek-v4-pro"
-pricing = { cache_hit_input_usd_per_million = 0.003625, cache_miss_input_usd_per_million = 0.435, output_usd_per_million = 0.87 }
+pricing = { cache_hit_input_usd_per_million = 0.022, cache_miss_input_usd_per_million = 0.66, output_usd_per_million = 1.98 }
 
 [[backends]]
 id = "deepseek"
@@ -56,12 +61,17 @@ api_key = ""
 [[backends.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
-pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
+pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
+
+[[backends.models]]
+name = "deepseek-v4-flash-vision-exp"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
 
 [[backends.models]]
 name = "deepseek-v4-pro"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
-pricing = { cache_hit_input_usd_per_million = 0.003625, cache_miss_input_usd_per_million = 0.435, output_usd_per_million = 0.87 }
+pricing = { cache_hit_input_usd_per_million = 0.022, cache_miss_input_usd_per_million = 0.66, output_usd_per_million = 1.98 }
 
 # QuotaMux owns this public model name and its explicit compatibility alias.
 [[models]]
@@ -84,6 +94,24 @@ name = "payg"
 strategy = "random"
 targets = [
   { backend = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
+]
+
+[[models]]
+name = "deepseek-v4-flash-vision-exp"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+[[models.layers]]
+name = "plan"
+strategy = "random"
+targets = [
+  { backend = "opencode-go", credential = "go-plan", model = "deepseek-v4-flash-vision-exp" },
+]
+
+[[models.layers]]
+name = "payg"
+strategy = "random"
+targets = [
+  { backend = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash-vision-exp" },
 ]
 
 [[models]]

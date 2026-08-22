@@ -104,11 +104,12 @@ different prices on different backends.
 
 These official references define the external identities used by the adapters:
 
-- DeepSeek exposes model IDs from `/models` and currently documents
-  `deepseek-v4-flash` and `deepseek-v4-pro`:
-  <https://api-docs.deepseek.com/api/list-models>
+- DeepSeek currently documents `deepseek-v4-flash`, `deepseek-v4-pro`, and the
+  multimodal `deepseek-v4-flash-vision-exp`; the vision model accepts Chat,
+  Responses, and Anthropic image blocks:
+  <https://api-docs.deepseek.com/guides/vision/>
 - OpenCode Go publishes a model-by-model endpoint table and `/models` endpoint:
-  <https://dev.opencode.ai/docs/go/>
+  <https://opencode.ai/docs/go/>
 - OpenCode Zen likewise mixes Responses, Anthropic, and Chat Completions models:
   <https://opencode.ai/docs/zen>
 - Kimi's China Open Platform uses the exact `kimi-k3` model ID, a 1M context
@@ -253,7 +254,8 @@ api_key = "..."
 
 [[backends.models]]
 name = "deepseek-v4-flash"
-pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
+# Static estimates use the current off-peak rates; peak rates are 2x.
+pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
 
 [[backends]]
 id = "deepseek"
@@ -266,7 +268,7 @@ api_key = "..."
 [[backends.models]]
 name = "deepseek-v4-flash"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
-pricing = { cache_hit_input_usd_per_million = 0.0028, cache_miss_input_usd_per_million = 0.14, output_usd_per_million = 0.28 }
+pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
 
 [[models]]
 name = "deepseek-v4-flash-0731"

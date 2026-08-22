@@ -191,9 +191,15 @@ async fn responses_stream(
 }
 
 async fn anthropic(client: &reqwest::Client, base: &str, model: &str) -> Result<(), AnyError> {
-    let value:Value=client.post(format!("{base}/v1/messages")).header("anthropic-version","2023-06-01")
+    let response=client.post(format!("{base}/v1/messages")).header("anthropic-version","2023-06-01").header("X-Relay-Include-Metadata","1")
         .json(&json!({"model":model,"max_tokens":128,"thinking":{"type":"enabled","budget_tokens":64},"output_config":{"effort":"high"},"messages":[{"role":"user","content":"Reply with exactly MESSAGE_OK."}]}))
-        .send().await?.error_for_status()?.json().await?;
+        .send().await?.error_for_status()?;
+    let translated = response
+        .headers()
+        .get("x-relay-translated")
+        .and_then(|value| value.to_str().ok())
+        == Some("1");
+    let value: Value = response.json().await?;
     let kinds: BTreeSet<_> = value
         .get("content")
         .and_then(Value::as_array)
@@ -202,10 +208,17 @@ async fn anthropic(client: &reqwest::Client, base: &str, model: &str) -> Result<
         .filter_map(|v| v.get("type").and_then(Value::as_str))
         .collect();
     ensure(
-        kinds.contains("thinking") && kinds.contains("text"),
+        kinds.contains("text") && (translated || kinds.contains("thinking")),
         "Anthropic thinking/text blocks missing",
     )?;
-    println!("PASS Anthropic Messages non-stream");
+    println!(
+        "PASS Anthropic Messages non-stream{}",
+        if translated {
+            " (translated without fabricated thinking signature)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 

@@ -164,6 +164,34 @@ targets = [
 See [`quotamux.example.toml`](quotamux.example.toml) for a ready-to-copy
 configuration.
 
+### DeepSeek V4 Flash Vision Exp
+
+Use the exact public and upstream model ID
+`deepseek-v4-flash-vision-exp`. The example configuration routes OpenCode Go
+first and DeepSeek Official second, just like V4 Flash. Image inputs work over
+Chat Completions, Responses, and Anthropic Messages. When the Go target is
+selected, QuotaMux converts Anthropic and Responses user-image blocks to the
+OpenAI-compatible Chat format without removing the image.
+
+DeepSeek supports JPEG, PNG, GIF, and WebP inputs through base64 data URLs,
+public URLs, or Files API IDs. Images are converted to input tokens and are
+therefore included in QuotaMux token and estimated-cost statistics. See the
+[DeepSeek vision guide](https://api-docs.deepseek.com/guides/vision/) for the
+current size, count, role, and token limits.
+
+OpenCode Go publishes these request-count estimates for its dollar-valued
+subscription windows; they are estimates based on typical request shapes, not
+fixed per-model request limits:
+
+| Model | 5 hours | Week | Month |
+| --- | ---: | ---: | ---: |
+| DeepSeek V4 Pro | 1,050 | 2,600 | 5,200 |
+| DeepSeek V4 Flash | 7,600 | 18,900 | 37,800 |
+| DeepSeek V4 Flash Vision Exp | 3,800 | 9,450 | 18,900 |
+
+The exact model endpoint, prices, and estimates are maintained in the
+[OpenCode Go documentation](https://opencode.ai/docs/go/).
+
 ## Backends and adapters
 
 A backend declares a local identity, one adapter, one or more credentials, and
@@ -262,6 +290,10 @@ Values are USD per one million tokens and must be finite and non-negative.
 QuotaMux combines them with upstream-reported usage. If pricing is absent,
 usage is recorded without an estimated cost. No model price is built into the
 binary; configure the provider's current prices yourself.
+
+DeepSeek V4 pricing changes by time of day. The example configuration uses the
+current off-peak USD rates; peak rates are twice those values, so QuotaMux's
+static cost field remains an estimate rather than a billing statement.
 
 ## Served models
 

@@ -224,12 +224,24 @@ fn translate_message(message: &Value, messages: &mut Vec<Value>) {
     let mut current = Map::new();
     current.insert("role".into(), Value::String(role.into()));
     let mut text = String::new();
+    let mut chat_content = Vec::new();
+    let mut has_image = false;
     let mut reasoning = String::new();
     let mut calls = Vec::new();
     let mut tool_results = Vec::new();
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
-            Some("text") => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("text") => {
+                let block_text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                text.push_str(block_text);
+                chat_content.push(json!({"type":"text","text":block_text}));
+            }
+            Some("image") => {
+                if let Some(image) = anthropic_image_to_chat(block) {
+                    chat_content.push(image);
+                    has_image = true;
+                }
+            }
             Some("thinking") => reasoning.push_str(block.get("thinking").and_then(Value::as_str).unwrap_or("")),
             Some("tool_use") => calls.push(json!({
                 "id":block.get("id").cloned().unwrap_or_else(|| Value::String(Uuid::now_v7().to_string())),
@@ -243,9 +255,12 @@ fn translate_message(message: &Value, messages: &mut Vec<Value>) {
         }
     }
     let has_text = !text.is_empty();
+    let has_content = has_text || has_image;
     let has_reasoning = !reasoning.is_empty();
     let has_calls = !calls.is_empty();
-    if has_text {
+    if has_image {
+        current.insert("content".into(), Value::Array(chat_content));
+    } else if has_text {
         current.insert("content".into(), Value::String(text));
     } else {
         current.insert("content".into(), Value::Null);
@@ -257,8 +272,34 @@ fn translate_message(message: &Value, messages: &mut Vec<Value>) {
         current.insert("tool_calls".into(), Value::Array(calls));
     }
     messages.extend(tool_results);
-    if has_text || has_reasoning || has_calls {
+    if has_content || has_reasoning || has_calls {
         messages.push(Value::Object(current));
+    }
+}
+
+fn anthropic_image_to_chat(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            let data = source.get("data").and_then(Value::as_str).unwrap_or("");
+            Some(json!({
+                "type":"image_url",
+                "image_url":{"url":format!("data:{media_type};base64,{data}")}
+            }))
+        }
+        Some("url") => Some(json!({
+            "type":"image_url",
+            "image_url":{"url":source.get("url").cloned().unwrap_or(Value::Null)}
+        })),
+        Some("file") => Some(json!({
+            "type":"file",
+            "file_id":source.get("file_id").cloned().unwrap_or(Value::Null)
+        })),
+        _ => None,
     }
 }
 
@@ -741,6 +782,44 @@ mod tests {
         assert_eq!(
             chat["messages"][2]["content"],
             "continue after the tool result"
+        );
+    }
+
+    #[test]
+    fn translates_anthropic_image_sources_to_chat_content_blocks() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "max_tokens":128,
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"Compare these images."},
+                {"type":"image","source":{
+                    "type":"base64","media_type":"image/png","data":"cG5n"
+                }},
+                {"type":"image","source":{
+                    "type":"url","url":"https://example.com/image.webp"
+                }},
+                {"type":"image","source":{
+                    "type":"file","file_id":"file-api-image"
+                }}
+            ]}]
+        });
+        let chat = prepare_for_chat(body, "deepseek-v4-flash-vision-exp").unwrap();
+        let content = chat["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            json!({"type":"text","text":"Compare these images."})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type":"image_url","image_url":{"url":"data:image/png;base64,cG5n"}})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type":"image_url","image_url":{"url":"https://example.com/image.webp"}})
+        );
+        assert_eq!(
+            content[3],
+            json!({"type":"file","file_id":"file-api-image"})
         );
     }
 

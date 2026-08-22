@@ -201,8 +201,9 @@ fn translate_input_items(items: &[Value], messages: &mut Vec<Value>) {
             "message" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let role = if role == "developer" { "system" } else { role };
-                let content = responses_content_text(item.get("content"));
-                let mut message = json!({"role":role,"content":content});
+                let content = responses_content_to_chat(item.get("content"));
+                let has_content = content.is_some();
+                let mut message = json!({"role":role,"content":content.unwrap_or(Value::Null)});
                 let mut carries_reasoning = false;
                 if role == "assistant" && !pending_reasoning.is_empty() {
                     message.as_object_mut().unwrap().insert(
@@ -213,12 +214,7 @@ fn translate_input_items(items: &[Value], messages: &mut Vec<Value>) {
                 } else if role != "assistant" {
                     pending_reasoning.clear();
                 }
-                if carries_reasoning
-                    || message
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
-                {
+                if carries_reasoning || has_content {
                     messages.push(message);
                 }
             }
@@ -320,6 +316,57 @@ fn responses_content_text(value: Option<&Value>) -> String {
             .join(""),
         Some(_) | None => String::new(),
     }
+}
+
+fn responses_content_to_chat(value: Option<&Value>) -> Option<Value> {
+    match value {
+        Some(Value::String(text)) if !text.is_empty() => Some(Value::String(text.clone())),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            let mut chat_content = Vec::new();
+            let mut has_image = false;
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("input_text" | "output_text") => {
+                        let part_text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                        text.push_str(part_text);
+                        chat_content.push(json!({"type":"text","text":part_text}));
+                    }
+                    Some("input_image") => {
+                        if let Some(image) = responses_image_to_chat(part) {
+                            chat_content.push(image);
+                            has_image = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if has_image {
+                Some(Value::Array(chat_content))
+            } else if text.is_empty() {
+                None
+            } else {
+                Some(Value::String(text))
+            }
+        }
+        Some(_) | None => None,
+    }
+}
+
+fn responses_image_to_chat(part: &Value) -> Option<Value> {
+    if let Some(url) = part.get("image_url") {
+        let mut image_url = Map::new();
+        image_url.insert("url".into(), url.clone());
+        if let Some(detail) = part.get("detail") {
+            image_url.insert("detail".into(), detail.clone());
+        }
+        return Some(json!({
+            "type":"image_url",
+            "image_url":Value::Object(image_url)
+        }));
+    }
+    part.get("file_id")
+        .map(|file_id| json!({"type":"file","file_id":file_id}))
 }
 
 fn reasoning_text(item: &Value) -> String {
@@ -908,6 +955,35 @@ mod tests {
         assert_eq!(chat["messages"][1]["reasoning_content"], "think");
         assert_eq!(chat["messages"][1]["tool_calls"][0]["id"], "c1");
         assert_eq!(chat["messages"][2]["role"], "tool");
+    }
+
+    #[test]
+    fn translates_response_images_to_chat_content_blocks() {
+        let body = json!({
+            "model":LOGICAL_MODEL,
+            "input":[{"type":"message","role":"user","content":[
+                {"type":"input_text","text":"Compare these images."},
+                {"type":"input_image","image_url":"data:image/webp;base64,d2VicA==","detail":"low"},
+                {"type":"input_image","file_id":"file-api-image"}
+            ]}]
+        });
+        let chat = prepare_for_chat(body, "deepseek-v4-flash-vision-exp").unwrap();
+        let content = chat["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            json!({"type":"text","text":"Compare these images."})
+        );
+        assert_eq!(
+            content[1],
+            json!({
+                "type":"image_url",
+                "image_url":{"url":"data:image/webp;base64,d2VicA==","detail":"low"}
+            })
+        );
+        assert_eq!(
+            content[2],
+            json!({"type":"file","file_id":"file-api-image"})
+        );
     }
 
     #[test]
