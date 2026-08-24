@@ -1041,6 +1041,415 @@ async fn kimi_code_anthropic_ingress_uses_native_messages_protocol() {
 }
 
 #[tokio::test]
+async fn kimi_code_unknown_403_retries_same_target_once_before_success() {
+    let code = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::FORBIDDEN,
+            json!({"error":{"message":"temporary membership edge rejection"}}),
+        ),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("retry reasoning", "retry recovered"),
+        ),
+    ])
+    .await;
+    let config = test_config(
+        vec![test_backend_adapter_model(
+            "kimi-code",
+            "allegretto",
+            &code,
+            AdapterKind::KimiCode,
+            Protocol::OpenAiChat,
+            "k3",
+        )],
+        vec![("code", vec![target_model("kimi-code", "allegretto", "k3")])],
+    );
+    let gateway = Gateway::start_config(config, 0x403_0001).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("Kimi unknown 403 retry response");
+    let request_id = header_value(&response, "x-relay-request-id");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-backend"), "kimi-code");
+    assert_eq!(header_value(&response, "x-relay-fallback"), "0");
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "retry recovered"
+    );
+    assert_eq!(code.calls().await, 2);
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=10"))
+        .send()
+        .await
+        .expect("Kimi retry attempts response")
+        .json::<Value>()
+        .await
+        .expect("Kimi retry attempts JSON");
+    let mut attempts = attempts_for_request(&attempts, &request_id);
+    attempts.sort_by_key(|attempt| attempt["sequence"].as_u64().unwrap());
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["status"], 403);
+    assert_eq!(attempts[0]["error_class"], "provider_ambiguous_rejection");
+    assert_eq!(attempts[1]["status"], 200);
+    assert_eq!(attempts[1]["error_class"], Value::Null);
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("Kimi retry circuit response")
+        .json::<Value>()
+        .await
+        .expect("Kimi retry circuit JSON");
+    assert_eq!(
+        status_target(&status, "kimi-code")["circuit"]["mode"],
+        "closed"
+    );
+}
+
+#[tokio::test]
+async fn repeated_kimi_code_unknown_403_falls_back_without_poisoning_circuit() {
+    let code = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::FORBIDDEN,
+            json!({"error":{"message":"temporary membership edge rejection"}}),
+        ),
+        MockReply::json(
+            StatusCode::FORBIDDEN,
+            json!({"error":{"message":"temporary membership edge rejection"}}),
+        ),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("next reasoning", "next request uses code"),
+        ),
+    ])
+    .await;
+    let fallback = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("fallback reasoning", "fallback answer"),
+    )])
+    .await;
+    let config = test_config(
+        vec![
+            test_backend_adapter_model(
+                "kimi-code",
+                "allegretto",
+                &code,
+                AdapterKind::KimiCode,
+                Protocol::OpenAiChat,
+                "k3",
+            ),
+            test_backend_adapter_model(
+                "kimi-official",
+                "payg",
+                &fallback,
+                AdapterKind::KimiOfficial,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+        ],
+        vec![
+            ("code", vec![target_model("kimi-code", "allegretto", "k3")]),
+            (
+                "payg",
+                vec![target_model("kimi-official", "payg", "kimi-k3")],
+            ),
+        ],
+    );
+    let gateway = Gateway::start_config(config, 0x403_0002).await;
+    let client = reqwest::Client::new();
+
+    let fallback_response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("Kimi repeated 403 fallback response");
+    let request_id = header_value(&fallback_response, "x-relay-request-id");
+    assert_eq!(fallback_response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&fallback_response, "x-relay-backend"),
+        "kimi-official"
+    );
+    assert_eq!(header_value(&fallback_response, "x-relay-fallback"), "1");
+    assert_eq!(
+        header_value(&fallback_response, "x-relay-fallback-reason"),
+        "provider_ambiguous_rejection"
+    );
+    let _ = fallback_response.json::<Value>().await.unwrap();
+    assert_eq!(code.calls().await, 2);
+    assert_eq!(fallback.calls().await, 1);
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=10"))
+        .send()
+        .await
+        .expect("Kimi fallback attempts response")
+        .json::<Value>()
+        .await
+        .expect("Kimi fallback attempts JSON");
+    let mut attempts = attempts_for_request(&attempts, &request_id);
+    attempts.sort_by_key(|attempt| attempt["sequence"].as_u64().unwrap());
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0]["backend"], "kimi-code");
+    assert_eq!(attempts[0]["sequence"], 1);
+    assert_eq!(attempts[1]["backend"], "kimi-code");
+    assert_eq!(attempts[1]["sequence"], 2);
+    assert_eq!(attempts[2]["backend"], "kimi-official");
+    assert_eq!(attempts[2]["sequence"], 3);
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("Kimi fallback circuit response")
+        .json::<Value>()
+        .await
+        .expect("Kimi fallback circuit JSON");
+    assert_eq!(
+        status_target(&status, "kimi-code")["circuit"]["mode"],
+        "closed"
+    );
+
+    let next = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("Kimi request after ambiguous rejection");
+    assert_eq!(next.status(), StatusCode::OK);
+    assert_eq!(header_value(&next, "x-relay-backend"), "kimi-code");
+    assert_eq!(header_value(&next, "x-relay-fallback"), "0");
+    let _ = next.json::<Value>().await.unwrap();
+    assert_eq!(code.calls().await, 3);
+    assert_eq!(fallback.calls().await, 1);
+}
+
+#[tokio::test]
+async fn kimi_code_unknown_403_stream_retries_before_response_commit() {
+    let code = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::FORBIDDEN,
+            json!({"error":{"message":"temporary membership edge rejection"}}),
+        ),
+        MockReply::sse(chat_stream("stream retry", "stream recovered", true)),
+    ])
+    .await;
+    let config = test_config(
+        vec![test_backend_adapter_model(
+            "kimi-code",
+            "allegretto",
+            &code,
+            AdapterKind::KimiCode,
+            Protocol::OpenAiChat,
+            "k3",
+        )],
+        vec![("code", vec![target_model("kimi-code", "allegretto", "k3")])],
+    );
+    let gateway = Gateway::start_config(config, 0x403_0003).await;
+    let client = reqwest::Client::new();
+    let mut request = chat_request();
+    request["stream"] = json!(true);
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&request)
+        .send()
+        .await
+        .expect("Kimi stream retry response");
+    let request_id = header_value(&response, "x-relay-request-id");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_value(&response, "x-relay-backend"), "kimi-code");
+    let body = response.text().await.expect("Kimi retried stream");
+    assert!(body.contains("stream recovered"));
+    assert!(body.contains("data: [DONE]"));
+    assert_eq!(code.calls().await, 2);
+
+    let attempts = client
+        .get(gateway.url("/api/attempts?limit=10"))
+        .send()
+        .await
+        .expect("Kimi stream retry attempts response")
+        .json::<Value>()
+        .await
+        .expect("Kimi stream retry attempts JSON");
+    let mut attempts = attempts_for_request(&attempts, &request_id);
+    attempts.sort_by_key(|attempt| attempt["sequence"].as_u64().unwrap());
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["error_class"], "provider_ambiguous_rejection");
+    assert_eq!(attempts[1]["error_class"], Value::Null);
+}
+
+#[tokio::test]
+async fn known_kimi_code_quota_403_skips_retry_and_opens_quota_circuit() {
+    let code = MockProvider::start(vec![MockReply::json(
+        StatusCode::FORBIDDEN,
+        json!({"error":{"message":"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle."}}),
+    )])
+    .await;
+    let fallback = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("fallback reasoning", "known quota fallback"),
+    )])
+    .await;
+    let config = test_config(
+        vec![
+            test_backend_adapter_model(
+                "kimi-code",
+                "allegretto",
+                &code,
+                AdapterKind::KimiCode,
+                Protocol::OpenAiChat,
+                "k3",
+            ),
+            test_backend_adapter_model(
+                "kimi-official",
+                "payg",
+                &fallback,
+                AdapterKind::KimiOfficial,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+        ],
+        vec![
+            ("code", vec![target_model("kimi-code", "allegretto", "k3")]),
+            (
+                "payg",
+                vec![target_model("kimi-official", "payg", "kimi-k3")],
+            ),
+        ],
+    );
+    let gateway = Gateway::start_config(config, 0x403_0004).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("known Kimi quota fallback response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&response, "x-relay-fallback-reason"),
+        "provider_quota"
+    );
+    let _ = response.json::<Value>().await.unwrap();
+    assert_eq!(code.calls().await, 1);
+    assert_eq!(fallback.calls().await, 1);
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("known Kimi quota circuit response")
+        .json::<Value>()
+        .await
+        .expect("known Kimi quota circuit JSON");
+    let target = status_target(&status, "kimi-code");
+    assert_eq!(target["circuit"]["mode"], "open");
+    assert_eq!(target["circuit"]["reason"], "provider_quota");
+}
+
+#[tokio::test]
+async fn concurrent_kimi_code_unknown_403_retries_do_not_open_shared_circuit() {
+    let initial_rejections = (0..8).map(|_| {
+        MockReply::json(
+            StatusCode::FORBIDDEN,
+            json!({"error":{"message":"temporary membership edge rejection"}}),
+        )
+        .delayed(Duration::from_millis(200))
+    });
+    let recoveries = (0..8).map(|index| {
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("retry reasoning", &format!("retry recovered {index}")),
+        )
+    });
+    let code = MockProvider::start(initial_rejections.chain(recoveries).collect()).await;
+    let fallback = MockProvider::start(Vec::new()).await;
+    let config = test_config(
+        vec![
+            test_backend_adapter_model(
+                "kimi-code",
+                "allegretto",
+                &code,
+                AdapterKind::KimiCode,
+                Protocol::OpenAiChat,
+                "k3",
+            ),
+            test_backend_adapter_model(
+                "kimi-official",
+                "payg",
+                &fallback,
+                AdapterKind::KimiOfficial,
+                Protocol::OpenAiChat,
+                "kimi-k3",
+            ),
+        ],
+        vec![
+            ("code", vec![target_model("kimi-code", "allegretto", "k3")]),
+            (
+                "payg",
+                vec![target_model("kimi-official", "payg", "kimi-k3")],
+            ),
+        ],
+    );
+    let gateway = Gateway::start_config(config, 0x403_0005).await;
+    let client = reqwest::Client::new();
+
+    let requests = (0..8)
+        .map(|_| {
+            let client = client.clone();
+            let url = gateway.url("/v1/chat/completions");
+            tokio::spawn(async move {
+                client
+                    .post(url)
+                    .header("x-relay-include-metadata", "1")
+                    .json(&chat_request())
+                    .send()
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let responses = futures_util::future::join_all(requests).await;
+    for response in responses {
+        let response = response
+            .expect("concurrent Kimi request task")
+            .expect("concurrent Kimi response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_value(&response, "x-relay-backend"), "kimi-code");
+        assert_eq!(header_value(&response, "x-relay-fallback"), "0");
+        let _ = response.json::<Value>().await.unwrap();
+    }
+    assert_eq!(code.calls().await, 16);
+    assert_eq!(fallback.calls().await, 0);
+
+    let status = client
+        .get(gateway.url("/api/status"))
+        .send()
+        .await
+        .expect("concurrent Kimi circuit response")
+        .json::<Value>()
+        .await
+        .expect("concurrent Kimi circuit JSON");
+    let target = status_target(&status, "kimi-code");
+    assert_eq!(target["circuit"]["mode"], "closed");
+    assert_eq!(target["circuit"]["consecutive_failures"], 0);
+}
+
+#[tokio::test]
 async fn native_anthropic_stream_persists_accumulated_usage() {
     let upstream_stream = concat!(
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-native-stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"k3\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":20,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":12,\"output_tokens\":1}}}\n\n",

@@ -39,6 +39,8 @@ use crate::{
 };
 
 const METADATA_HEADER: &str = "x-relay-include-metadata";
+const SAME_TARGET_RETRY_MIN_MS: u64 = 200;
+const SAME_TARGET_RETRY_MAX_MS: u64 = 500;
 
 pub struct AppState {
     pub config: Config,
@@ -570,7 +572,7 @@ async fn handle_nonstream(
     let mut last_candidate = None;
     let mut outcome = None;
     let mut sequence = 0_u32;
-    for mut candidate in candidates {
+    'candidates: for mut candidate in candidates {
         let runtime = target_runtime(&state, &candidate.target);
         let permit = match runtime.circuit.decide().await {
             RouteDecision::Primary { permit } => {
@@ -582,41 +584,53 @@ async fn handle_nonstream(
                 continue;
             }
         };
-        sequence += 1;
-        match execute_json_attempt(
-            &state,
-            &candidate,
-            runtime,
-            protocol,
-            &headers,
-            &body,
-            &request_id,
-            sequence,
-            started,
-        )
-        .await
-        {
-            Ok(mut success) => {
-                permit.success().await;
-                observe_affinity(
-                    &state,
-                    &success.candidate,
-                    &usage_for(success.egress, &success.raw_upstream),
-                );
-                success.fallback_reason = fallback_reason;
-                outcome = Some(success);
-                break;
-            }
-            Err(failure) => {
-                let allows_fallback = failure.error.class.allows_fallback();
-                permit
-                    .failure(failure.error.class, failure.error.retry_after)
-                    .await;
-                record_alert_if_needed(&state, &request_id, &candidate, failure.error.class).await;
-                fallback_reason.get_or_insert(failure.error.class);
-                last_candidate = Some(candidate.clone());
-                last_failure = Some(failure);
-                if !allows_fallback {
+        let mut same_target_retry_available = true;
+        loop {
+            sequence += 1;
+            match execute_json_attempt(
+                &state,
+                &candidate,
+                runtime,
+                protocol,
+                &headers,
+                &body,
+                &request_id,
+                sequence,
+                started,
+            )
+            .await
+            {
+                Ok(mut success) => {
+                    permit.success().await;
+                    observe_affinity(
+                        &state,
+                        &success.candidate,
+                        &usage_for(success.egress, &success.raw_upstream),
+                    );
+                    success.fallback_reason = fallback_reason;
+                    outcome = Some(success);
+                    break 'candidates;
+                }
+                Err(failure)
+                    if same_target_retry_available
+                        && failure.error.class.retries_same_target_once() =>
+                {
+                    same_target_retry_available = false;
+                    wait_before_same_target_retry(&state).await;
+                }
+                Err(failure) => {
+                    let allows_fallback = failure.error.class.allows_fallback();
+                    permit
+                        .failure(failure.error.class, failure.error.retry_after)
+                        .await;
+                    record_alert_if_needed(&state, &request_id, &candidate, failure.error.class)
+                        .await;
+                    fallback_reason.get_or_insert(failure.error.class);
+                    last_candidate = Some(candidate.clone());
+                    last_failure = Some(failure);
+                    if !allows_fallback {
+                        break 'candidates;
+                    }
                     break;
                 }
             }
@@ -913,7 +927,7 @@ async fn handle_stream(
     let mut last_candidate = None;
     let mut prepared = None;
     let mut sequence = 0_u32;
-    for mut candidate in candidates {
+    'candidates: for mut candidate in candidates {
         let runtime = state
             .targets
             .get(&candidate.target)
@@ -929,36 +943,48 @@ async fn handle_stream(
                 continue;
             }
         };
-        sequence += 1;
-        match prepare_stream_attempt(
-            state.clone(),
-            &candidate,
-            runtime.clone(),
-            protocol,
-            &headers,
-            &body,
-            &request_id,
-            sequence,
-            started,
-        )
-        .await
-        {
-            Ok(mut success) => {
-                success.fallback_reason = fallback_reason;
-                success.permit = Some(permit);
-                prepared = Some(success);
-                break;
-            }
-            Err(failure) => {
-                let allows_fallback = failure.error.class.allows_fallback();
-                permit
-                    .failure(failure.error.class, failure.error.retry_after)
-                    .await;
-                record_alert_if_needed(&state, &request_id, &candidate, failure.error.class).await;
-                fallback_reason.get_or_insert(failure.error.class);
-                last_candidate = Some(candidate.clone());
-                last_failure = Some(failure);
-                if !allows_fallback {
+        let mut same_target_retry_available = true;
+        loop {
+            sequence += 1;
+            match prepare_stream_attempt(
+                state.clone(),
+                &candidate,
+                runtime.clone(),
+                protocol,
+                &headers,
+                &body,
+                &request_id,
+                sequence,
+                started,
+            )
+            .await
+            {
+                Ok(mut success) => {
+                    success.fallback_reason = fallback_reason;
+                    success.permit = Some(permit);
+                    prepared = Some(success);
+                    break 'candidates;
+                }
+                Err(failure)
+                    if same_target_retry_available
+                        && failure.error.class.retries_same_target_once() =>
+                {
+                    same_target_retry_available = false;
+                    wait_before_same_target_retry(&state).await;
+                }
+                Err(failure) => {
+                    let allows_fallback = failure.error.class.allows_fallback();
+                    permit
+                        .failure(failure.error.class, failure.error.retry_after)
+                        .await;
+                    record_alert_if_needed(&state, &request_id, &candidate, failure.error.class)
+                        .await;
+                    fallback_reason.get_or_insert(failure.error.class);
+                    last_candidate = Some(candidate.clone());
+                    last_failure = Some(failure);
+                    if !allows_fallback {
+                        break 'candidates;
+                    }
                     break;
                 }
             }
@@ -1230,6 +1256,13 @@ async fn handle_stream(
         translated,
     );
     response
+}
+
+async fn wait_before_same_target_retry(state: &AppState) {
+    let delay_ms = state
+        .selector
+        .range_inclusive(SAME_TARGET_RETRY_MIN_MS, SAME_TARGET_RETRY_MAX_MS);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
 
 struct PreparedStream {

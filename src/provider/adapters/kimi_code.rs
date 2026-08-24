@@ -79,6 +79,7 @@ impl ProviderAdapter for KimiCode {
             403 if contains_any(message, &["access terminated"]) => {
                 FailureClass::ProviderConfiguration
             }
+            403 => FailureClass::ProviderAmbiguousRejection,
             429 if contains_any(
                 message,
                 &[

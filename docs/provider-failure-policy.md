@@ -106,6 +106,15 @@ QuotaMux follows the Kimi Code error reference:
 | malformed client-generated `bot_id` rejected by Kimi | `client_request` |
 | missing, disabled, temporarily disabled, or muted account | `provider_configuration` |
 | server/infrastructure failure | `provider_transient` |
+| unrecognized HTTP 403 | `provider_ambiguous_rejection` |
+
+An unrecognized Kimi Code `403` is not evidence that the shared credential is
+invalid. QuotaMux records the first rejection, waits for 200–500 milliseconds
+of jitter, and retries the same target once. If the retry succeeds, routing
+continues normally. If it fails again, only the current request falls back; the
+failure does not open or advance the target circuit. A half-open probe lease is
+released without treating the rejection as recovery evidence. Recognized quota,
+permission, account, and request-security errors do not use this retry path.
 
 Sources:
 

@@ -229,10 +229,7 @@ impl CircuitBreaker {
         class: FailureClass,
         retry_after: Option<Duration>,
     ) {
-        if matches!(
-            class,
-            FailureClass::ClientRequest | FailureClass::ClientCancelled
-        ) {
+        if !class.affects_circuit() {
             self.complete_abandonment(generation, probe).await;
             return;
         }
@@ -425,6 +422,20 @@ mod tests {
             .failure(FailureClass::ProviderAuth, None)
             .await;
         assert_eq!(circuit.snapshot().await.mode, CircuitMode::Suspended);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_provider_rejection_does_not_change_closed_circuit() {
+        let (_dir, circuit) = test_circuit().await;
+        primary(circuit.decide().await)
+            .failure(FailureClass::ProviderAmbiguousRejection, None)
+            .await;
+        let state = circuit.snapshot().await;
+        assert_eq!(state.mode, CircuitMode::Closed);
+        assert_eq!(state.reason, None);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.backoff_level, 0);
+        assert_eq!(state.next_probe_at_ms, None);
     }
 
     #[tokio::test]

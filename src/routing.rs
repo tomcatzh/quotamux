@@ -38,16 +38,30 @@ impl RandomSelector {
         }
         order
     }
+
+    pub fn range_inclusive(&self, minimum: u64, maximum: u64) -> u64 {
+        assert!(minimum <= maximum, "random range must not be inverted");
+        let width = maximum
+            .checked_sub(minimum)
+            .and_then(|difference| difference.checked_add(1))
+            .expect("random range width must fit in u64");
+        let mut state = self.state.fetch_add(GOLDEN_GAMMA, Ordering::Relaxed);
+        minimum + bounded_u64(&mut state, width)
+    }
 }
 
 fn bounded(state: &mut u64, upper: usize) -> usize {
     debug_assert!(upper > 0);
-    let upper = upper as u64;
+    bounded_u64(state, upper as u64) as usize
+}
+
+fn bounded_u64(state: &mut u64, upper: u64) -> u64 {
+    debug_assert!(upper > 0);
     let zone = u64::MAX - u64::MAX % upper;
     loop {
         let value = splitmix64(state);
         if value < zone {
-            return (value % upper) as usize;
+            return value % upper;
         }
     }
 }
@@ -90,5 +104,14 @@ mod tests {
         }
         assert!(first_counts.iter().all(|count| *count > 850));
         assert!(first_counts.iter().all(|count| *count < 1_150));
+    }
+
+    #[test]
+    fn inclusive_ranges_stay_within_bounds() {
+        let selector = RandomSelector::with_seed(99);
+        for _ in 0..1_000 {
+            assert!((200..=500).contains(&selector.range_inclusive(200, 500)));
+        }
+        assert_eq!(selector.range_inclusive(7, 7), 7);
     }
 }

@@ -382,14 +382,18 @@ Adapters classify failures by provider meaning, not by status code alone:
   rate pressure.
 - Kimi Code distinguishes membership quota, capacity, entitlement,
   authentication, and request errors using its
-  [error reference](https://www.kimi.com/code/docs/en/kimi-code/error-reference.html).
+  [error reference](https://www.kimi.com/code/docs/en/kimi-code/error-reference.html). An
+  unrecognized Kimi Code `403` is retried once on the same target after
+  200–500 milliseconds of jitter, then falls back for only that request without
+  opening the shared target circuit.
 - Kimi Official uses the structured Kimi Platform `error.type` values described
   in the [platform error reference](https://platform.kimi.com/docs/api/errors).
 - Custom adapters use generic HTTP classification only.
 
 Request-specific `4xx` failures such as `400` and `422` are returned without
 fallback or circuit impact. Provider-side failures open or suspend the exact
-target and allow the router to continue.
+target and allow the router to continue. Ambiguous provider rejections are the
+exception: they may retry and fall back, but they do not affect circuit health.
 
 Concurrent attempts share a circuit generation. The first accepted failure
 advances that generation; late results from the previous generation cannot

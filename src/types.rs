@@ -27,6 +27,7 @@ impl Protocol {
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
     ClientRequest,
+    ProviderAmbiguousRejection,
     ProviderAuth,
     ProviderBilling,
     ProviderConfiguration,
@@ -44,6 +45,7 @@ impl FailureClass {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ClientRequest => "client_request",
+            Self::ProviderAmbiguousRejection => "provider_ambiguous_rejection",
             Self::ProviderAuth => "provider_auth",
             Self::ProviderBilling => "provider_billing",
             Self::ProviderConfiguration => "provider_configuration",
@@ -60,6 +62,17 @@ impl FailureClass {
 
     pub const fn allows_fallback(self) -> bool {
         !matches!(self, Self::ClientRequest | Self::ClientCancelled)
+    }
+
+    pub const fn retries_same_target_once(self) -> bool {
+        matches!(self, Self::ProviderAmbiguousRejection)
+    }
+
+    pub const fn affects_circuit(self) -> bool {
+        !matches!(
+            self,
+            Self::ClientRequest | Self::ClientCancelled | Self::ProviderAmbiguousRejection
+        )
     }
 }
 

@@ -750,6 +750,15 @@ mod tests {
             ),
             FailureClass::ProviderConfiguration
         );
+        assert_eq!(
+            classify(
+                AdapterKind::KimiCode,
+                StatusCode::FORBIDDEN,
+                "temporary membership edge rejection",
+                None,
+            ),
+            FailureClass::ProviderAmbiguousRejection
+        );
     }
 
     #[test]
