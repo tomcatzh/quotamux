@@ -312,6 +312,7 @@ impl Gateway {
                     | AdapterKind::KimiOfficial
                     | AdapterKind::KimiCode
                     | AdapterKind::OpenCodeGo
+                    | AdapterKind::ZhipuCodingPlan
             ) && let Some(endpoint) = backend.endpoint.take()
             {
                 endpoint_overrides.insert(backend.id.clone(), endpoint);
@@ -2320,6 +2321,110 @@ async fn kimi_k3_two_layer_route_uses_exact_provider_model_ids_before_payg_fallb
     eprintln!(
         "KIMI_LAYER_EVIDENCE {}",
         json!({"plan_attempts":2,"payg_attempts":1,"models":{"opencode-go":"kimi-k3","kimi-code":"k3","kimi-official":"kimi-k3"}})
+    );
+}
+
+#[tokio::test]
+async fn glm_flash_multimodal_plan_quota_falls_back_to_flash_without_payg() {
+    let zhipu = MockProvider::start(vec![MockReply::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"code":1308,"message":"usage limit reached"}}),
+    )])
+    .await;
+    let go = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("go reasoning", "go answer"),
+    )])
+    .await;
+
+    let mut config = test_config(
+        vec![
+            test_backend_adapter_model(
+                "zhipu-coding-plan",
+                "glm-plan",
+                &zhipu,
+                AdapterKind::ZhipuCodingPlan,
+                Protocol::OpenAiResponses,
+                "glm-5.3-flash",
+            ),
+            test_backend_adapter_model(
+                "opencode-go-glm",
+                "go-plan",
+                &go,
+                AdapterKind::OpenCodeGo,
+                Protocol::OpenAiChat,
+                "glm-5.3-flash",
+            ),
+        ],
+        vec![
+            (
+                "zhipu-coding-plan",
+                vec![target_model(
+                    "zhipu-coding-plan",
+                    "glm-plan",
+                    "glm-5.3-flash",
+                )],
+            ),
+            (
+                "opencode-go-plan",
+                vec![target_model("opencode-go-glm", "go-plan", "glm-5.3-flash")],
+            ),
+        ],
+    );
+    config.models[0].name = "glm-5.3-flash".into();
+    let gateway = Gateway::start_config(config, 0x6153_f1a5).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(gateway.url("/v1/responses"))
+        .header("x-relay-include-metadata", "1")
+        .json(&json!({
+            "model":"glm-5.3-flash",
+            "input":[{"type":"message","role":"user","content":[
+                {"type":"input_text","text":"describe the image"},
+                {"type":"input_image","image_url":"data:image/png;base64,aW1hZ2U="}
+            ]}]
+        }))
+        .send()
+        .await
+        .expect("GLM two-layer fallback response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&response, "x-relay-backend"),
+        "opencode-go-glm"
+    );
+    assert_eq!(
+        header_value(&response, "x-relay-route-layer"),
+        "opencode-go-plan"
+    );
+    assert_eq!(header_value(&response, "x-relay-fallback"), "1");
+    assert_eq!(
+        header_value(&response, "x-relay-egress-protocol"),
+        "openai-chat"
+    );
+    assert_eq!(header_value(&response, "x-relay-translated"), "1");
+    let body = response.json::<Value>().await.expect("Responses JSON");
+    assert_eq!(body["model"], "glm-5.3-flash");
+
+    assert_eq!(zhipu.request_paths().await, vec!["/v1/responses"]);
+    assert_eq!(go.request_paths().await, vec!["/chat/completions"]);
+    let zhipu_bodies = zhipu.request_bodies().await;
+    let go_bodies = go.request_bodies().await;
+    assert_eq!(zhipu_bodies[0]["model"], "glm-5.3-flash");
+    assert_eq!(go_bodies[0]["model"], "glm-5.3-flash");
+    assert_eq!(
+        zhipu_bodies[0]["input"][0]["content"][1],
+        json!({
+            "type":"input_image",
+            "image_url":"data:image/png;base64,aW1hZ2U="
+        })
+    );
+    assert_eq!(
+        go_bodies[0]["messages"][0]["content"][1],
+        json!({
+            "type":"image_url",
+            "image_url":{"url":"data:image/png;base64,aW1hZ2U="}
+        })
     );
 }
 

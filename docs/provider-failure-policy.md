@@ -131,6 +131,24 @@ the request; and server/unavailable errors are transient.
 
 Source: [Kimi Open Platform error types](https://platform.kimi.ai/docs/api/errors)
 
+### Zhipu Coding Plan
+
+Zhipu returns a business code inside the JSON error envelope in addition to the
+HTTP status. QuotaMux uses that code so subscription exhaustion is not confused
+with temporary model pressure:
+
+| Condition | Business codes | Classification |
+| --- | --- | --- |
+| invalid or expired credential | 1000–1005 | `provider_auth` |
+| balance, expired plan, or invalid enterprise plan | 1113, 1309, 1314 | `provider_billing` |
+| account, model, method, permission, or key-product mismatch | 1110–1112, 1121, 1211–1212, 1220–1222, 1311, 1315 | `provider_configuration` |
+| malformed, oversized, or safety-blocked request | 1210, 1213–1215, 1261, 1301 | `client_request` |
+| account rate pressure or model overload | 1302, 1305 | `provider_capacity` |
+| daily, rolling, weekly, monthly, or fairness usage limit | 1304, 1308, 1310, 1313, 1316–1321 | `provider_quota` |
+| account access, API flow, or network failure | 1120, 1200, 1230, 1234 | `provider_transient` |
+
+Source: [Zhipu API error codes](https://docs.bigmodel.cn/cn/api/api-code)
+
 ## Generic fallback
 
 Request-specific `4xx` responses such as `400`, `409`, `413`, `414`, `422`, and

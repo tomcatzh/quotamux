@@ -37,7 +37,8 @@ impl ProviderAdapter for OpenCodeGo {
     fn protocol_for_model(&self, model: &str) -> Option<Protocol> {
         match model {
             "grok-4.5" | "gpt-5.6-luna" => Some(Protocol::OpenAiResponses),
-            "glm-5.3"
+            "glm-5.3-flash"
+            | "glm-5.3"
             | "glm-5.2"
             | "glm-5.1"
             | "kimi-k3"

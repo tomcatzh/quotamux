@@ -109,6 +109,8 @@ pub enum AdapterKind {
     OpenCodeZen,
     #[serde(rename = "opencode-go")]
     OpenCodeGo,
+    #[serde(rename = "zhipu-coding-plan")]
+    ZhipuCodingPlan,
     #[serde(rename = "custom-chat-completions")]
     CustomChatCompletions,
     #[serde(rename = "custom-responses")]
@@ -127,6 +129,7 @@ impl AdapterKind {
             Self::OllamaCloud => "ollama-cloud",
             Self::OpenCodeZen => "opencode-zen",
             Self::OpenCodeGo => "opencode-go",
+            Self::ZhipuCodingPlan => "zhipu-coding-plan",
             Self::CustomChatCompletions => "custom-chat-completions",
             Self::CustomResponses => "custom-responses",
             Self::CustomAnthropic => "custom-anthropic",
@@ -780,6 +783,34 @@ data_dir = "data"
         config.validate().unwrap();
 
         assert!(!adapter.supports_protocol(Protocol::OpenAiResponses));
+    }
+
+    #[test]
+    fn zhipu_coding_plan_declares_all_three_native_protocols() {
+        let adapter = adapter_for(AdapterKind::ZhipuCodingPlan).unwrap();
+        assert_eq!(
+            adapter.endpoint_policy(),
+            EndpointPolicy::Official("https://open.bigmodel.cn/api")
+        );
+
+        let mut config = valid();
+        config.backends[0].adapter = AdapterKind::ZhipuCodingPlan;
+        config.backends[0].models[0].name = "glm-5.3-flash".into();
+        config.backends[0].models[0].protocols = vec![
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ];
+        config.models[0].layers[0].targets[0].model = "glm-5.3-flash".into();
+        config.validate().unwrap();
+
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            assert!(adapter.supports_protocol(protocol));
+        }
     }
 
     #[test]

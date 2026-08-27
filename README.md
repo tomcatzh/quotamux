@@ -225,6 +225,7 @@ error.
 | `deepseek-official` | `https://api.deepseek.com` | Chat, Responses, Anthropic |
 | `kimi-code` | `https://api.kimi.com/coding/v1` | Chat, Anthropic |
 | `kimi-official` | `https://api.moonshot.cn/v1` | Chat |
+| `zhipu-coding-plan` | `https://open.bigmodel.cn/api` | Chat, Responses, Anthropic |
 
 For `opencode-go`, the adapter contains the official model-to-protocol catalog.
 Declare only the exact model ID and omit `protocols`:
@@ -243,6 +244,16 @@ Kimi Code and the Kimi Open Platform are separate services with separate keys;
 their adapters and backends must remain separate. See the
 [Kimi Code API overview](https://www.kimi.com/code/docs/) and
 [Kimi Platform API overview](https://platform.kimi.com/docs/api/overview).
+
+Zhipu Coding Plan uses separate official roots for OpenAI Chat, OpenAI
+Responses, and Anthropic Messages. Declare all three native protocols on the
+backend model so Responses requests use Zhipu's `/api/v1/responses` endpoint
+without translation.
+Zhipu `glm-5.3-flash` and OpenCode Go `glm-5.3-flash` both have 1M-token
+multimodal context windows; do not substitute the text-only `glm-5.3` model.
+See the [Zhipu Coding Plan endpoint guide](https://docs.bigmodel.cn/cn/coding-plan/quick-start),
+the [official GLM-5.3-Flash announcement](https://z.ai/blog/glm-5.3-flash), and
+the [OpenCode GLM-5.3-Flash model data](https://opencode.ai/data/zhipu/glm-5-3-flash).
 
 ### Custom adapters
 
@@ -388,6 +399,9 @@ Adapters classify failures by provider meaning, not by status code alone:
   opening the shared target circuit.
 - Kimi Official uses the structured Kimi Platform `error.type` values described
   in the [platform error reference](https://platform.kimi.com/docs/api/errors).
+- Zhipu Coding Plan uses the official numeric business codes to distinguish
+  request errors, rate pressure, subscription quota, billing, and account or
+  model configuration failures.
 - Custom adapters use generic HTTP classification only.
 
 Request-specific `4xx` failures such as `400` and `422` are returned without

@@ -12,6 +12,7 @@ mod deepseek_official;
 mod kimi_code;
 mod kimi_official;
 mod opencode_go;
+mod zhipu_coding_plan;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointPolicy {
@@ -59,6 +60,7 @@ pub fn adapter_for(kind: AdapterKind) -> Option<&'static dyn ProviderAdapter> {
         AdapterKind::KimiOfficial => Some(&kimi_official::KIMI_OFFICIAL),
         AdapterKind::KimiCode => Some(&kimi_code::KIMI_CODE),
         AdapterKind::OpenCodeGo => Some(&opencode_go::OPENCODE_GO),
+        AdapterKind::ZhipuCodingPlan => Some(&zhipu_coding_plan::ZHIPU_CODING_PLAN),
         AdapterKind::CustomChatCompletions => Some(&custom::CUSTOM_CHAT_COMPLETIONS),
         AdapterKind::CustomResponses => Some(&custom::CUSTOM_RESPONSES),
         AdapterKind::CustomAnthropic => Some(&custom::CUSTOM_ANTHROPIC),

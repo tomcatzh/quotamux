@@ -50,6 +50,37 @@ pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_mi
 name = "deepseek-v4-pro"
 pricing = { cache_hit_input_usd_per_million = 0.022, cache_miss_input_usd_per_million = 0.66, output_usd_per_million = 1.98 }
 
+[[backends.models]]
+# OpenCode Go GLM-5.3-Flash has a 1M-token multimodal context window.
+name = "glm-5.3-flash"
+pricing = { cache_hit_input_usd_per_million = 0.01, cache_miss_input_usd_per_million = 0.07, output_usd_per_million = 0.25 }
+
+[[backends]]
+id = "zhipu-coding-plan"
+adapter = "zhipu-coding-plan"
+
+[[backends.credentials]]
+id = "glm-plan"
+api_key = ""
+
+[[backends.models]]
+# Zhipu GLM-5.3-Flash has a 1M-token context window.
+name = "glm-5.3-flash"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+[[backends]]
+id = "kimi-code"
+adapter = "kimi-code"
+
+[[backends.credentials]]
+id = "kimi-code-allegretto"
+api_key = ""
+
+[[backends.models]]
+# Kimi K3 uses model ID `k3`; Allegretto unlocks its full 1M context window.
+name = "k3"
+protocols = ["openai-chat", "anthropic-messages"]
+
 [[backends]]
 id = "deepseek"
 adapter = "deepseek-official"
@@ -130,4 +161,34 @@ name = "payg"
 strategy = "random"
 targets = [
   { backend = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-pro" },
+]
+
+[[models]]
+name = "glm-5.3-flash"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+[[models.layers]]
+name = "zhipu-coding-plan"
+strategy = "random"
+targets = [
+  { backend = "zhipu-coding-plan", credential = "glm-plan", model = "glm-5.3-flash" },
+]
+
+[[models.layers]]
+name = "opencode-go-plan"
+strategy = "random"
+targets = [
+  { backend = "opencode-go", credential = "go-plan", model = "glm-5.3-flash" },
+]
+
+[[models]]
+name = "kimi-k3"
+aliases = ["kimi-k3-1m"]
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+[[models.layers]]
+name = "kimi-code-allegretto"
+strategy = "random"
+targets = [
+  { backend = "kimi-code", credential = "kimi-code-allegretto", model = "k3" },
 ]

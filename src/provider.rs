@@ -365,6 +365,14 @@ fn extract_error_details(bytes: &[u8]) -> ErrorDetails {
     }
 }
 
+fn error_discriminator(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_i64().map(|code| code.to_string()))
+        .or_else(|| value.as_u64().map(|code| code.to_string()))
+}
+
 fn extract_error_details_from_value(value: &Value) -> Option<ErrorDetails> {
     let (message, error_type) = if let Some(error) = value.get("error") {
         if let Some(message) = error.get("message").and_then(Value::as_str) {
@@ -373,7 +381,7 @@ fn extract_error_details_from_value(value: &Value) -> Option<ErrorDetails> {
                 error
                     .get("type")
                     .or_else(|| error.get("code"))
-                    .and_then(Value::as_str),
+                    .and_then(error_discriminator),
             )
         } else {
             let message = error.as_str()?;
@@ -382,7 +390,7 @@ fn extract_error_details_from_value(value: &Value) -> Option<ErrorDetails> {
                 value
                     .get("type")
                     .or_else(|| value.get("code"))
-                    .and_then(Value::as_str),
+                    .and_then(error_discriminator),
             )
         }
     } else {
@@ -392,13 +400,13 @@ fn extract_error_details_from_value(value: &Value) -> Option<ErrorDetails> {
             value
                 .get("type")
                 .or_else(|| value.get("code"))
-                .and_then(Value::as_str),
+                .and_then(error_discriminator),
         )
     };
     Some(ErrorDetails {
         classification_message: truncate(message),
         safe_message: "upstream request failed".into(),
-        error_type: error_type.map(truncate),
+        error_type: error_type.as_deref().map(truncate),
     })
 }
 
@@ -521,6 +529,32 @@ mod tests {
         ] {
             assert_eq!(deepseek.protocol_for(protocol), protocol);
         }
+
+        let mut zhipu = client_for(AdapterKind::ZhipuCodingPlan, "glm-5.3-flash");
+        zhipu.protocols = vec![
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ];
+        assert_eq!(
+            zhipu.request_url(Protocol::OpenAiChat),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            zhipu.request_url(Protocol::OpenAiResponses),
+            "https://open.bigmodel.cn/api/v1/responses"
+        );
+        assert_eq!(
+            zhipu.request_url(Protocol::AnthropicMessages),
+            "https://open.bigmodel.cn/api/anthropic/v1/messages"
+        );
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            assert_eq!(zhipu.protocol_for(protocol), protocol);
+        }
     }
 
     #[test]
@@ -531,6 +565,7 @@ mod tests {
             (
                 Protocol::OpenAiChat,
                 &[
+                    "glm-5.3-flash",
                     "glm-5.3",
                     "glm-5.2",
                     "glm-5.1",
@@ -791,6 +826,36 @@ mod tests {
             ),
             FailureClass::ProviderCapacity
         );
+    }
+
+    #[test]
+    fn classifies_zhipu_business_error_codes() {
+        for (code, expected) in [
+            ("1002", FailureClass::ProviderAuth),
+            ("1113", FailureClass::ProviderBilling),
+            ("1211", FailureClass::ProviderConfiguration),
+            ("1261", FailureClass::ClientRequest),
+            ("1302", FailureClass::ProviderCapacity),
+            ("1308", FailureClass::ProviderQuota),
+            ("1317", FailureClass::ProviderQuota),
+        ] {
+            assert_eq!(
+                classify(
+                    AdapterKind::ZhipuCodingPlan,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "zhipu error",
+                    Some(code),
+                ),
+                expected,
+                "business code {code}"
+            );
+        }
+
+        let details = extract_error_details_from_value(&serde_json::json!({
+            "error":{"code":1308,"message":"usage limit reached"}
+        }))
+        .unwrap();
+        assert_eq!(details.error_type.as_deref(), Some("1308"));
     }
 
     #[test]
