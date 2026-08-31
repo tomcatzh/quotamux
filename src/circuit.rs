@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::{store::Store, types::FailureClass};
 
@@ -50,8 +50,23 @@ impl Default for CircuitSnapshot {
 }
 
 pub enum RouteDecision {
-    Primary { permit: CircuitPermit },
-    Fallback { reason: Option<FailureClass> },
+    Primary {
+        permit: CircuitPermit,
+    },
+    Fallback {
+        reason: Option<FailureClass>,
+        probe_wait: Option<CircuitProbeWait>,
+    },
+}
+
+pub struct CircuitProbeWait {
+    changes: watch::Receiver<u64>,
+}
+
+impl CircuitProbeWait {
+    pub async fn changed(mut self) -> bool {
+        self.changes.changed().await.is_ok()
+    }
 }
 
 pub struct CircuitPermit {
@@ -110,6 +125,7 @@ impl Drop for CircuitPermit {
 
 pub struct CircuitBreaker {
     state: Mutex<CircuitSnapshot>,
+    changes: watch::Sender<u64>,
     store: Store,
     store_key: String,
 }
@@ -145,8 +161,10 @@ impl CircuitBreaker {
         if changed {
             store.put_state(&store_key, &state)?;
         }
+        let (changes, _) = watch::channel(state.generation);
         Ok(Self {
             state: Mutex::new(state),
+            changes,
             store,
             store_key,
         })
@@ -199,6 +217,11 @@ impl CircuitBreaker {
             }
             _ => RouteDecision::Fallback {
                 reason: state.reason,
+                probe_wait: (state.mode == CircuitMode::HalfOpen && state.probe_in_flight).then(
+                    || CircuitProbeWait {
+                        changes: self.changes.subscribe(),
+                    },
+                ),
             },
         }
     }
@@ -219,7 +242,7 @@ impl CircuitBreaker {
             generation,
             ..CircuitSnapshot::default()
         };
-        self.persist(&state);
+        self.persist_and_publish(&state);
     }
 
     async fn complete_failure(
@@ -258,7 +281,7 @@ impl CircuitBreaker {
         state.probe_in_flight = false;
         state.probe_deadline_at_ms = None;
         state.generation = next_generation(state.generation);
-        self.persist(&state);
+        self.persist_and_publish(&state);
     }
 
     async fn complete_abandonment(&self, generation: u64, probe: bool) {
@@ -275,7 +298,7 @@ impl CircuitBreaker {
         state.probe_in_flight = false;
         state.probe_deadline_at_ms = None;
         state.generation = next_generation(state.generation);
-        self.persist(&state);
+        self.persist_and_publish(&state);
     }
 
     pub async fn snapshot(&self) -> CircuitSnapshot {
@@ -286,6 +309,11 @@ impl CircuitBreaker {
         if let Err(error) = self.store.put_state(&self.store_key, state) {
             tracing::error!(%error, "failed to persist circuit state");
         }
+    }
+
+    fn persist_and_publish(&self, state: &CircuitSnapshot) {
+        self.persist(state);
+        self.changes.send_replace(state.generation);
     }
 }
 
@@ -385,7 +413,7 @@ mod tests {
     fn primary(decision: RouteDecision) -> CircuitPermit {
         match decision {
             RouteDecision::Primary { permit } => permit,
-            RouteDecision::Fallback { reason } => panic!("unexpected fallback: {reason:?}"),
+            RouteDecision::Fallback { reason, .. } => panic!("unexpected fallback: {reason:?}"),
         }
     }
 
@@ -447,6 +475,30 @@ mod tests {
         let probe = primary(circuit.decide().await);
         assert!(probe.is_probe());
         probe.success().await;
+        assert_eq!(circuit.snapshot().await.mode, CircuitMode::Closed);
+    }
+
+    #[tokio::test]
+    async fn follower_can_wait_for_an_in_flight_probe_to_settle() {
+        let (_dir, circuit) = test_circuit().await;
+        primary(circuit.decide().await)
+            .failure(FailureClass::ProviderTransient, Some(Duration::ZERO))
+            .await;
+        let probe = primary(circuit.decide().await);
+        let wait = match circuit.decide().await {
+            RouteDecision::Fallback {
+                probe_wait: Some(wait),
+                ..
+            } => wait,
+            _ => panic!("expected an in-flight probe wait handle"),
+        };
+
+        probe.success().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), wait.changed())
+                .await
+                .expect("probe change notification")
+        );
         assert_eq!(circuit.snapshot().await.mode, CircuitMode::Closed);
     }
 

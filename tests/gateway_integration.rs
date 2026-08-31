@@ -3855,6 +3855,497 @@ async fn abandoned_half_open_stream_probe_is_released_before_primary_recovers() 
 }
 
 #[tokio::test]
+async fn follower_requests_wait_for_inflight_half_open_probe_and_succeed() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"trip primary"}}),
+        )
+        .with_header("retry-after", "0"),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("primary probe", "primary recovered"),
+        )
+        .delayed(Duration::from_millis(150)),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("primary retry", "primary recovered again"),
+        ),
+    ])
+    .await;
+    let fallback = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"trip fallback"}}),
+        )
+        .with_header("retry-after", "0"),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("fallback probe", "fallback recovered"),
+        )
+        .delayed(Duration::from_millis(500)),
+    ])
+    .await;
+    let mut config = test_config(
+        vec![test_backend("opencode-go", "go-plan", &primary)],
+        vec![("plan", vec![target("opencode-go", "go-plan")])],
+    );
+    config
+        .backends
+        .push(test_backend("deepseek", "deepseek-payg", &fallback));
+    config.models[0].layers.push(RouteLayerConfig {
+        name: "payg".into(),
+        strategy: RouteStrategy::Random,
+        targets: vec![target("deepseek", "deepseek-payg")],
+    });
+    config.server.timeouts.route_probe_wait_ms = 400;
+    let gateway = Gateway::start_config(config, 0x5eeb).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("open both circuits");
+    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(primary.calls().await, 1);
+    assert_eq!(fallback.calls().await, 1);
+
+    let route_url = gateway.url("/v1/chat/completions");
+    let primary_probe = tokio::spawn({
+        let client = client.clone();
+        let body = chat_request();
+        let route_url = route_url.clone();
+        async move {
+            client
+                .post(route_url)
+                .header("x-relay-include-metadata", "1")
+                .json(&body)
+                .send()
+                .await
+                .expect("primary half-open probe")
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+
+    let fallback_probe = tokio::spawn({
+        let client = client.clone();
+        let body = chat_request();
+        let route_url = route_url.clone();
+        async move {
+            client
+                .post(route_url)
+                .header("x-relay-include-metadata", "1")
+                .json(&body)
+                .send()
+                .await
+                .expect("fallback half-open probe")
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let status = client
+                .get(gateway.url("/api/status"))
+                .send()
+                .await
+                .expect("probe status response")
+                .json::<Value>()
+                .await
+                .expect("probe status JSON");
+            let primary_status = status_target(&status, "opencode-go");
+            let fallback_status = status_target(&status, "deepseek");
+            if primary_status["circuit"]["mode"] == "half-open"
+                && primary_status["circuit"]["probe_in_flight"] == true
+                && fallback_status["circuit"]["mode"] == "half-open"
+                && fallback_status["circuit"]["probe_in_flight"] == true
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("both routes enter probe in-flight");
+
+    let follower = tokio::spawn({
+        let client = client.clone();
+        let body = chat_request();
+        let route_url = route_url.clone();
+        async move {
+            client
+                .post(route_url)
+                .header("x-relay-include-metadata", "1")
+                .json(&body)
+                .send()
+                .await
+                .expect("follower request")
+        }
+    });
+
+    let follower = tokio::time::timeout(Duration::from_secs(1), follower)
+        .await
+        .expect("follower request completes")
+        .expect("follower request task");
+    assert_eq!(follower.status(), StatusCode::OK);
+    assert_eq!(header_value(&follower, "x-relay-backend"), "opencode-go");
+    assert_eq!(header_value(&follower, "x-relay-fallback"), "0");
+    let follower_body = follower.json::<Value>().await.expect("follower JSON");
+    assert_eq!(
+        follower_body["choices"][0]["message"]["content"],
+        "primary recovered again"
+    );
+
+    let (primary_probe_response, fallback_probe_response) =
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(primary_probe, fallback_probe)
+        })
+        .await
+        .expect("probe requests complete");
+    primary_probe_response.expect("primary probe response");
+    fallback_probe_response.expect("fallback probe response");
+
+    assert_eq!(primary.calls().await, 3);
+    assert_eq!(fallback.calls().await, 2);
+}
+
+#[tokio::test]
+async fn follower_keeps_waiting_when_the_first_probe_change_is_a_failure() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"trip primary"}}),
+        )
+        .with_header("retry-after", "0"),
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"primary probe failed"}}),
+        )
+        .with_header("retry-after", "30")
+        .delayed(Duration::from_millis(75)),
+    ])
+    .await;
+    let fallback = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"trip fallback"}}),
+        )
+        .with_header("retry-after", "0"),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("fallback probe", "fallback recovered"),
+        )
+        .delayed(Duration::from_millis(180)),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("fallback retry one", "fallback follower one"),
+        ),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("fallback retry two", "fallback follower two"),
+        ),
+    ])
+    .await;
+    let mut config = test_config(
+        vec![test_backend("opencode-go", "go-plan", &primary)],
+        vec![("plan", vec![target("opencode-go", "go-plan")])],
+    );
+    config
+        .backends
+        .push(test_backend("deepseek", "deepseek-payg", &fallback));
+    config.models[0].layers.push(RouteLayerConfig {
+        name: "payg".into(),
+        strategy: RouteStrategy::Random,
+        targets: vec![target("deepseek", "deepseek-payg")],
+    });
+    config.server.timeouts.route_probe_wait_ms = 400;
+    let gateway = Gateway::start_config(config, 0x5eed).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("open both circuits");
+    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let route_url = gateway.url("/v1/chat/completions");
+    let primary_probe = tokio::spawn({
+        let client = client.clone();
+        let body = chat_request();
+        let route_url = route_url.clone();
+        async move {
+            client
+                .post(route_url)
+                .header("x-relay-include-metadata", "1")
+                .json(&body)
+                .send()
+                .await
+                .expect("primary half-open probe")
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+
+    let fallback_probe = tokio::spawn({
+        let client = client.clone();
+        let body = chat_request();
+        let route_url = route_url.clone();
+        async move {
+            client
+                .post(route_url)
+                .header("x-relay-include-metadata", "1")
+                .json(&body)
+                .send()
+                .await
+                .expect("fallback half-open probe")
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let status = client
+                .get(gateway.url("/api/status"))
+                .send()
+                .await
+                .expect("probe status response")
+                .json::<Value>()
+                .await
+                .expect("probe status JSON");
+            let primary_status = status_target(&status, "opencode-go");
+            let fallback_status = status_target(&status, "deepseek");
+            if primary_status["circuit"]["mode"] == "half-open"
+                && primary_status["circuit"]["probe_in_flight"] == true
+                && fallback_status["circuit"]["mode"] == "half-open"
+                && fallback_status["circuit"]["probe_in_flight"] == true
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("both routes enter probe in-flight");
+
+    let follower = client
+        .post(route_url)
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("follower request");
+    assert_eq!(follower.status(), StatusCode::OK);
+    assert_eq!(header_value(&follower, "x-relay-backend"), "deepseek");
+    assert_eq!(header_value(&follower, "x-relay-fallback"), "1");
+
+    let (primary_probe_response, fallback_probe_response) =
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(primary_probe, fallback_probe)
+        })
+        .await
+        .expect("probe requests complete");
+    assert_eq!(
+        primary_probe_response.expect("primary probe task").status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        fallback_probe_response
+            .expect("fallback probe task")
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(primary.calls().await, 2);
+    assert_eq!(fallback.calls().await, 4);
+}
+
+#[tokio::test]
+async fn a_target_repeated_across_layers_is_attempted_only_once() {
+    let provider = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"route unavailable"}}),
+        )
+        .with_header("retry-after", "0"),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("unexpected second attempt", "must not be called"),
+        ),
+    ])
+    .await;
+    let repeated_target = target("opencode-go", "go-plan");
+    let config = test_config(
+        vec![test_backend("opencode-go", "go-plan", &provider)],
+        vec![
+            ("first", vec![repeated_target.clone()]),
+            ("duplicate", vec![repeated_target]),
+        ],
+    );
+    let gateway = Gateway::start_config(config, 0x5eee).await;
+
+    let response = reqwest::Client::new()
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("gateway response");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(provider.calls().await, 1);
+}
+
+#[tokio::test]
+async fn follower_requests_return_retry_after_when_probe_wait_expires() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"trip primary"}}),
+        )
+        .with_header("retry-after", "0"),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("primary probe", "primary recovered"),
+        )
+        .delayed(Duration::from_millis(300)),
+    ])
+    .await;
+    let fallback = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":{"message":"trip fallback"}}),
+        )
+        .with_header("retry-after", "0"),
+        MockReply::json(
+            StatusCode::OK,
+            chat_completion("fallback probe", "fallback recovered"),
+        )
+        .delayed(Duration::from_millis(300)),
+    ])
+    .await;
+    let mut config = test_config(
+        vec![test_backend("opencode-go", "go-plan", &primary)],
+        vec![("plan", vec![target("opencode-go", "go-plan")])],
+    );
+    config
+        .backends
+        .push(test_backend("deepseek", "deepseek-payg", &fallback));
+    config.models[0].layers.push(RouteLayerConfig {
+        name: "payg".into(),
+        strategy: RouteStrategy::Random,
+        targets: vec![target("deepseek", "deepseek-payg")],
+    });
+    config.server.timeouts.route_probe_wait_ms = 50;
+    let gateway = Gateway::start_config(config, 0x5eec).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .header("x-relay-include-metadata", "1")
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("open both circuits");
+    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(primary.calls().await, 1);
+    assert_eq!(fallback.calls().await, 1);
+
+    let route_url = gateway.url("/v1/chat/completions");
+    let primary_probe = tokio::spawn({
+        let client = client.clone();
+        let body = chat_request();
+        let route_url = route_url.clone();
+        async move {
+            client
+                .post(route_url)
+                .header("x-relay-include-metadata", "1")
+                .json(&body)
+                .send()
+                .await
+                .expect("primary half-open probe")
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+
+    let fallback_probe = tokio::spawn({
+        let client = client.clone();
+        let body = chat_request();
+        let route_url = route_url.clone();
+        async move {
+            client
+                .post(route_url)
+                .header("x-relay-include-metadata", "1")
+                .json(&body)
+                .send()
+                .await
+                .expect("fallback half-open probe")
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let status = client
+                .get(gateway.url("/api/status"))
+                .send()
+                .await
+                .expect("probe status response")
+                .json::<Value>()
+                .await
+                .expect("probe status JSON");
+            let primary_status = status_target(&status, "opencode-go");
+            let fallback_status = status_target(&status, "deepseek");
+            if primary_status["circuit"]["mode"] == "half-open"
+                && primary_status["circuit"]["probe_in_flight"] == true
+                && fallback_status["circuit"]["mode"] == "half-open"
+                && fallback_status["circuit"]["probe_in_flight"] == true
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("both routes enter probe in-flight");
+
+    let mut follower_request = chat_request();
+    follower_request["stream"] = json!(true);
+    let follower = client
+        .post(route_url)
+        .header("x-relay-include-metadata", "1")
+        .json(&follower_request)
+        .send()
+        .await
+        .expect("follower request");
+    assert_eq!(follower.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        follower
+            .headers()
+            .get("retry-after")
+            .expect("retry-after header")
+            .to_str()
+            .expect("retry-after parse"),
+        "1"
+    );
+    let follower_body = follower.json::<Value>().await.expect("follower error JSON");
+    assert_eq!(follower_body["error"]["type"], "fallback_unavailable");
+
+    let (primary_probe_response, fallback_probe_response) =
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(primary_probe, fallback_probe)
+        })
+        .await
+        .expect("probe requests complete");
+    primary_probe_response.expect("primary probe response");
+    fallback_probe_response.expect("fallback probe response");
+
+    assert_eq!(primary.calls().await, 2);
+    assert_eq!(fallback.calls().await, 2);
+}
+
+#[tokio::test]
 async fn concurrent_delayed_primary_429s_count_one_circuit_failure() {
     let primary = MockProvider::start(
         (0..8)

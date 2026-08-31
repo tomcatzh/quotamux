@@ -117,6 +117,7 @@ upstream_read_ms = 90000
 upstream_stream_read_ms = 300000
 upstream_total_ms = 7200000
 downstream_sse_heartbeat_ms = 15000
+route_probe_wait_ms = 5000
 
 [[backends]]
 id = "go"
@@ -429,7 +430,16 @@ When a deadline expires, one request receives a half-open probe lease. Success
 closes the circuit; a provider failure advances the schedule once. Cancellation
 or an abandoned stream releases the probe and makes it eligible again after one
 second without increasing backoff. A probe lease has a ten-minute hard limit,
-and process startup releases any half-open state immediately.
+and process startup releases any half-open state immediately. If all remaining
+routes are blocked by an in-flight probe, concurrent requests use one total
+`route_probe_wait_ms` budget. Each probe state change triggers another route
+evaluation, and the request keeps waiting within the remaining budget while an
+unattempted route still has a probe in flight. A concrete target is selected
+from the route graph at most once even if it appears in multiple layers (the
+documented ambiguous-rejection retry remains internal to that one selection). A
+timed-out synthetic `503` includes `Retry-After` rounded up from
+`route_probe_wait_ms` (five seconds by default) so callers do not immediately
+rejoin the same probe window.
 
 Provider error bodies are inspected only for classification, with a 16 KiB
 limit. QuotaMux records and returns a controlled summary rather than copying

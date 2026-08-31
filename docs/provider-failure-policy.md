@@ -36,6 +36,19 @@ This ownership also applies to streaming responses. Dropping a downstream
 stream drops its permit, so a cancelled half-open probe cannot leave the target
 permanently unavailable.
 
+If every remaining route is blocked by an in-flight half-open probe, the router
+uses one total `server.timeouts.route_probe_wait_ms` budget. A probe completion,
+failure, or abandonment wakes the followers, which re-evaluate concrete targets
+they have not already attempted. If another unattempted route is still probing,
+the follower waits again within the same remaining budget; an early failed probe
+therefore cannot mask a later successful probe. A concrete target is selected
+from the route graph at most once even if configuration repeats it across layers;
+the documented ambiguous-rejection retry remains internal to that selection.
+The bound prevents a long-running streaming probe from creating an unbounded
+request queue. If the wait expires, QuotaMux returns its synthetic
+`fallback_unavailable` `503` with a `Retry-After` value rounded up from the
+configured wait budget.
+
 ## Retry timing
 
 `Retry-After` is parsed using HTTP semantics: an integer is seconds and an HTTP

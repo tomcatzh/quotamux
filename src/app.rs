@@ -12,13 +12,14 @@ use axum::{
     extract::{Query, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE},
+        header::{CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER},
     },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use bytes::Bytes;
 use chrono::Utc;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -27,7 +28,7 @@ use crate::{
     affinity::{
         AffinityDirectory, CacheDomain, CacheEvidence, EvidenceConfidence, FingerprintPath,
     },
-    circuit::{CircuitBreaker, CircuitPermit, RouteDecision},
+    circuit::{CircuitBreaker, CircuitPermit, CircuitProbeWait, RouteDecision},
     config::{AdapterKind, Config, RouteStrategy, RouteTargetConfig, ServedModelConfig},
     dashboard::serve_spa,
     protocol::{self, ValidationError, anthropic, chat, responses},
@@ -572,73 +573,110 @@ async fn handle_nonstream(
     let mut last_candidate = None;
     let mut outcome = None;
     let mut sequence = 0_u32;
-    'candidates: for mut candidate in candidates {
-        let runtime = target_runtime(&state, &candidate.target);
-        let permit = match runtime.circuit.decide().await {
-            RouteDecision::Primary { permit } => {
-                candidate.probe = permit.is_probe();
-                permit
-            }
-            RouteDecision::Fallback { reason } => {
-                fallback_reason = fallback_reason.or(reason);
+    let mut attempted = HashSet::new();
+    let mut probe_wait_started = None;
+    let mut probe_wait_timed_out = false;
+    'routing: loop {
+        let mut probe_waiters = Vec::new();
+        let mut evaluated = HashSet::new();
+        for candidate_template in &candidates {
+            if attempted.contains(&candidate_template.target)
+                || !evaluated.insert(candidate_template.target.clone())
+            {
                 continue;
             }
-        };
-        let mut same_target_retry_available = true;
-        loop {
-            sequence += 1;
-            match execute_json_attempt(
-                &state,
-                &candidate,
-                runtime,
-                protocol,
-                &headers,
-                &body,
-                &request_id,
-                sequence,
-                started,
-            )
-            .await
-            {
-                Ok(mut success) => {
-                    permit.success().await;
-                    observe_affinity(
-                        &state,
-                        &success.candidate,
-                        &usage_for(success.egress, &success.raw_upstream),
-                    );
-                    success.fallback_reason = fallback_reason;
-                    outcome = Some(success);
-                    break 'candidates;
-                }
-                Err(failure)
-                    if same_target_retry_available
-                        && failure.error.class.retries_same_target_once() =>
-                {
-                    same_target_retry_available = false;
-                    wait_before_same_target_retry(&state).await;
-                }
-                Err(failure) => {
-                    let allows_fallback = failure.error.class.allows_fallback();
+            let mut candidate = candidate_template.clone();
+            let runtime = target_runtime(&state, &candidate.target);
+            let permit = match runtime.circuit.decide().await {
+                RouteDecision::Primary { permit } => {
+                    attempted.insert(candidate.target.clone());
+                    candidate.probe = permit.is_probe();
                     permit
-                        .failure(failure.error.class, failure.error.retry_after)
-                        .await;
-                    record_alert_if_needed(&state, &request_id, &candidate, failure.error.class)
-                        .await;
-                    fallback_reason.get_or_insert(failure.error.class);
-                    last_candidate = Some(candidate.clone());
-                    last_failure = Some(failure);
-                    if !allows_fallback {
-                        break 'candidates;
+                }
+                RouteDecision::Fallback { reason, probe_wait } => {
+                    fallback_reason = fallback_reason.or(reason);
+                    if let Some(wait) = probe_wait {
+                        probe_waiters.push(wait);
                     }
-                    break;
+                    continue;
+                }
+            };
+            let mut same_target_retry_available = true;
+            loop {
+                sequence += 1;
+                match execute_json_attempt(
+                    &state,
+                    &candidate,
+                    runtime,
+                    protocol,
+                    &headers,
+                    &body,
+                    &request_id,
+                    sequence,
+                    started,
+                )
+                .await
+                {
+                    Ok(mut success) => {
+                        permit.success().await;
+                        observe_affinity(
+                            &state,
+                            &success.candidate,
+                            &usage_for(success.egress, &success.raw_upstream),
+                        );
+                        success.fallback_reason = fallback_reason;
+                        outcome = Some(success);
+                        break 'routing;
+                    }
+                    Err(failure)
+                        if same_target_retry_available
+                            && failure.error.class.retries_same_target_once() =>
+                    {
+                        same_target_retry_available = false;
+                        wait_before_same_target_retry(&state).await;
+                    }
+                    Err(failure) => {
+                        let allows_fallback = failure.error.class.allows_fallback();
+                        permit
+                            .failure(failure.error.class, failure.error.retry_after)
+                            .await;
+                        record_alert_if_needed(
+                            &state,
+                            &request_id,
+                            &candidate,
+                            failure.error.class,
+                        )
+                        .await;
+                        fallback_reason.get_or_insert(failure.error.class);
+                        last_candidate = Some(candidate.clone());
+                        last_failure = Some(failure);
+                        if !allows_fallback {
+                            break 'routing;
+                        }
+                        break;
+                    }
                 }
             }
         }
+        if !probe_waiters.is_empty() {
+            let wait_started = *probe_wait_started.get_or_insert_with(Instant::now);
+            let wait_budget =
+                Duration::from_millis(state.config.server.timeouts.route_probe_wait_ms);
+            let remaining = wait_budget.saturating_sub(wait_started.elapsed());
+            if !remaining.is_zero() && wait_for_probe_change(probe_waiters, remaining).await {
+                continue;
+            }
+            probe_wait_timed_out = true;
+        }
+        break;
     }
     let Some(outcome) = outcome else {
-        let (failure, candidate) = terminal_route_failure(last_failure, last_candidate);
-        return terminal_failure(
+        let (failure, candidate) = if probe_wait_timed_out {
+            terminal_route_failure(None, None)
+        } else {
+            terminal_route_failure(last_failure, last_candidate)
+        };
+        let mut response = terminal_failure(
             &state,
             protocol,
             protocol::model_name(&body).unwrap_or(&served_model.name),
@@ -653,6 +691,13 @@ async fn handle_nonstream(
             fallback_reason,
         )
         .await;
+        if probe_wait_timed_out {
+            apply_probe_retry_after(
+                &mut response,
+                state.config.server.timeouts.route_probe_wait_ms,
+            );
+        }
+        return response;
     };
 
     let response_bytes = serde_json::to_vec(&outcome.body).unwrap_or_default();
@@ -927,72 +972,109 @@ async fn handle_stream(
     let mut last_candidate = None;
     let mut prepared = None;
     let mut sequence = 0_u32;
-    'candidates: for mut candidate in candidates {
-        let runtime = state
-            .targets
-            .get(&candidate.target)
-            .expect("validated runtime target")
-            .clone();
-        let permit = match runtime.circuit.decide().await {
-            RouteDecision::Primary { permit } => {
-                candidate.probe = permit.is_probe();
-                permit
-            }
-            RouteDecision::Fallback { reason } => {
-                fallback_reason = fallback_reason.or(reason);
+    let mut attempted = HashSet::new();
+    let mut probe_wait_started = None;
+    let mut probe_wait_timed_out = false;
+    'routing: loop {
+        let mut probe_waiters = Vec::new();
+        let mut evaluated = HashSet::new();
+        for candidate_template in &candidates {
+            if attempted.contains(&candidate_template.target)
+                || !evaluated.insert(candidate_template.target.clone())
+            {
                 continue;
             }
-        };
-        let mut same_target_retry_available = true;
-        loop {
-            sequence += 1;
-            match prepare_stream_attempt(
-                state.clone(),
-                &candidate,
-                runtime.clone(),
-                protocol,
-                &headers,
-                &body,
-                &request_id,
-                sequence,
-                started,
-            )
-            .await
-            {
-                Ok(mut success) => {
-                    success.fallback_reason = fallback_reason;
-                    success.permit = Some(permit);
-                    prepared = Some(success);
-                    break 'candidates;
-                }
-                Err(failure)
-                    if same_target_retry_available
-                        && failure.error.class.retries_same_target_once() =>
-                {
-                    same_target_retry_available = false;
-                    wait_before_same_target_retry(&state).await;
-                }
-                Err(failure) => {
-                    let allows_fallback = failure.error.class.allows_fallback();
+            let mut candidate = candidate_template.clone();
+            let runtime = state
+                .targets
+                .get(&candidate.target)
+                .expect("validated runtime target")
+                .clone();
+            let permit = match runtime.circuit.decide().await {
+                RouteDecision::Primary { permit } => {
+                    attempted.insert(candidate.target.clone());
+                    candidate.probe = permit.is_probe();
                     permit
-                        .failure(failure.error.class, failure.error.retry_after)
-                        .await;
-                    record_alert_if_needed(&state, &request_id, &candidate, failure.error.class)
-                        .await;
-                    fallback_reason.get_or_insert(failure.error.class);
-                    last_candidate = Some(candidate.clone());
-                    last_failure = Some(failure);
-                    if !allows_fallback {
-                        break 'candidates;
+                }
+                RouteDecision::Fallback { reason, probe_wait } => {
+                    fallback_reason = fallback_reason.or(reason);
+                    if let Some(wait) = probe_wait {
+                        probe_waiters.push(wait);
                     }
-                    break;
+                    continue;
+                }
+            };
+            let mut same_target_retry_available = true;
+            loop {
+                sequence += 1;
+                match prepare_stream_attempt(
+                    state.clone(),
+                    &candidate,
+                    runtime.clone(),
+                    protocol,
+                    &headers,
+                    &body,
+                    &request_id,
+                    sequence,
+                    started,
+                )
+                .await
+                {
+                    Ok(mut success) => {
+                        success.fallback_reason = fallback_reason;
+                        success.permit = Some(permit);
+                        prepared = Some(success);
+                        break 'routing;
+                    }
+                    Err(failure)
+                        if same_target_retry_available
+                            && failure.error.class.retries_same_target_once() =>
+                    {
+                        same_target_retry_available = false;
+                        wait_before_same_target_retry(&state).await;
+                    }
+                    Err(failure) => {
+                        let allows_fallback = failure.error.class.allows_fallback();
+                        permit
+                            .failure(failure.error.class, failure.error.retry_after)
+                            .await;
+                        record_alert_if_needed(
+                            &state,
+                            &request_id,
+                            &candidate,
+                            failure.error.class,
+                        )
+                        .await;
+                        fallback_reason.get_or_insert(failure.error.class);
+                        last_candidate = Some(candidate.clone());
+                        last_failure = Some(failure);
+                        if !allows_fallback {
+                            break 'routing;
+                        }
+                        break;
+                    }
                 }
             }
         }
+        if !probe_waiters.is_empty() {
+            let wait_started = *probe_wait_started.get_or_insert_with(Instant::now);
+            let wait_budget =
+                Duration::from_millis(state.config.server.timeouts.route_probe_wait_ms);
+            let remaining = wait_budget.saturating_sub(wait_started.elapsed());
+            if !remaining.is_zero() && wait_for_probe_change(probe_waiters, remaining).await {
+                continue;
+            }
+            probe_wait_timed_out = true;
+        }
+        break;
     }
     let Some(prepared) = prepared else {
-        let (failure, candidate) = terminal_route_failure(last_failure, last_candidate);
-        return terminal_failure(
+        let (failure, candidate) = if probe_wait_timed_out {
+            terminal_route_failure(None, None)
+        } else {
+            terminal_route_failure(last_failure, last_candidate)
+        };
+        let mut response = terminal_failure(
             &state,
             protocol,
             protocol::model_name(&body).unwrap_or(&served_model.name),
@@ -1007,6 +1089,13 @@ async fn handle_stream(
             fallback_reason,
         )
         .await;
+        if probe_wait_timed_out {
+            apply_probe_retry_after(
+                &mut response,
+                state.config.server.timeouts.route_probe_wait_ms,
+            );
+        }
+        return response;
     };
 
     let candidate = prepared.candidate.clone();
@@ -1263,6 +1352,29 @@ async fn wait_before_same_target_retry(state: &AppState) {
         .selector
         .range_inclusive(SAME_TARGET_RETRY_MIN_MS, SAME_TARGET_RETRY_MAX_MS);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+async fn wait_for_probe_change(waiters: Vec<CircuitProbeWait>, wait_for: Duration) -> bool {
+    let mut changes = FuturesUnordered::new();
+    for waiter in waiters {
+        changes.push(waiter.changed());
+    }
+    tokio::time::timeout(wait_for, changes.next())
+        .await
+        .is_ok_and(|changed| changed == Some(true))
+}
+
+fn apply_probe_retry_after(response: &mut Response, wait_ms: u64) {
+    let retry_after_seconds = probe_retry_after_seconds(wait_ms);
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from_str(&retry_after_seconds.to_string())
+            .expect("integer Retry-After is a valid header value"),
+    );
+}
+
+fn probe_retry_after_seconds(wait_ms: u64) -> u64 {
+    wait_ms.saturating_add(999).saturating_div(1_000).max(1)
 }
 
 struct PreparedStream {
@@ -2279,6 +2391,15 @@ mod tests {
             model: "d".into(),
         };
         assert_ne!(circuit_store_key(&left), circuit_store_key(&right));
+    }
+
+    #[test]
+    fn probe_retry_after_rounds_the_wait_budget_up_to_seconds() {
+        assert_eq!(probe_retry_after_seconds(1), 1);
+        assert_eq!(probe_retry_after_seconds(1_000), 1);
+        assert_eq!(probe_retry_after_seconds(1_001), 2);
+        assert_eq!(probe_retry_after_seconds(5_000), 5);
+        assert_eq!(probe_retry_after_seconds(u64::MAX), u64::MAX / 1_000);
     }
 
     #[test]

@@ -44,6 +44,7 @@ pub struct ServerTimeoutConfig {
     pub upstream_stream_read_ms: u64,
     pub upstream_total_ms: u64,
     pub downstream_sse_heartbeat_ms: u64,
+    pub route_probe_wait_ms: u64,
 }
 
 impl Default for ServerTimeoutConfig {
@@ -54,6 +55,7 @@ impl Default for ServerTimeoutConfig {
             upstream_stream_read_ms: 300_000,
             upstream_total_ms: 2 * 60 * 60 * 1_000,
             downstream_sse_heartbeat_ms: 15_000,
+            route_probe_wait_ms: 5_000,
         }
     }
 }
@@ -69,6 +71,7 @@ impl ServerTimeoutConfig {
                 "downstream_sse_heartbeat_ms",
                 self.downstream_sse_heartbeat_ms,
             ),
+            ("route_probe_wait_ms", self.route_probe_wait_ms),
         ] {
             if value == 0 {
                 return Err(invalid(format!("server.timeouts.{name} must be positive")));
@@ -683,6 +686,10 @@ data_dir = "data"
             server.timeouts.downstream_sse_heartbeat_ms,
             defaults.downstream_sse_heartbeat_ms
         );
+        assert_eq!(
+            server.timeouts.route_probe_wait_ms,
+            defaults.route_probe_wait_ms
+        );
     }
 
     #[test]
@@ -1023,6 +1030,7 @@ upstream_read_ms = 60000
 upstream_stream_read_ms = 300000
 upstream_total_ms = 7200000
 downstream_sse_heartbeat_ms = 15000
+route_probe_wait_ms = 5000
 [affinity]
 checkpoint_bytes = 256
 max_checkpoints_per_path = 1024
@@ -1056,6 +1064,7 @@ targets = [{ backend = "go", credential = "go-a", model = "deepseek-v4-flash" }]
         assert_eq!(config.server.timeouts.upstream_connect_ms, 5_000);
         assert_eq!(config.server.timeouts.upstream_stream_read_ms, 300_000);
         assert_eq!(config.server.timeouts.downstream_sse_heartbeat_ms, 15_000);
+        assert_eq!(config.server.timeouts.route_probe_wait_ms, 5_000);
         assert_eq!(
             config.backends[0].models[0].pricing,
             Some(ModelPricingConfig {

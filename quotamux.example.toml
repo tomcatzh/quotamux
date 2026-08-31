@@ -17,6 +17,9 @@ upstream_read_ms = 90000
 upstream_stream_read_ms = 300000
 upstream_total_ms = 7200000
 downstream_sse_heartbeat_ms = 15000
+# When every remaining route is waiting on an in-flight half-open probe, wait
+# briefly for that probe to settle before returning a retryable 503.
+route_probe_wait_ms = 5000
 
 # Prefix affinity metadata is process-local and never written to redb.
 [affinity]
