@@ -58,6 +58,7 @@ async fn run_quota_probe(kind: AdapterKind, max_attempts: usize) {
     config.server = ServerConfig {
         listen: "127.0.0.1:8081".into(),
         data_dir: data_dir.path().to_path_buf(),
+        max_inference_body_bytes: config.server.max_inference_body_bytes,
         timeouts: config.server.timeouts,
     };
     config.models = vec![ServedModelConfig {

@@ -232,6 +232,7 @@ config_version = 3
 [server]
 listen = "0.0.0.0:8080"
 data_dir = "./data"
+max_inference_body_bytes = 33554432
 
 [affinity]
 checkpoint_bytes = 128

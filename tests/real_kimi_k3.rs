@@ -60,6 +60,7 @@ async fn mixed_subscription_targets_keep_a_divergent_prefix_on_the_warm_target()
     config.server = ServerConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: data_dir.path().to_path_buf(),
+        max_inference_body_bytes: config.server.max_inference_body_bytes,
         timeouts: config.server.timeouts,
     };
     let state = Arc::new(
@@ -180,6 +181,7 @@ async fn start_single_target(
     config.server = ServerConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: data_dir.path().to_path_buf(),
+        max_inference_body_bytes: config.server.max_inference_body_bytes,
         timeouts: config.server.timeouts,
     };
     config.models = vec![ServedModelConfig {

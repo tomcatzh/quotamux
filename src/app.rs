@@ -9,10 +9,10 @@ use async_stream::stream;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State, rejection::JsonRejection},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER},
+        header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER},
     },
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -234,13 +234,15 @@ fn circuit_store_key(target: &RouteTargetConfig) -> String {
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
+    let max_inference_body_bytes = state.config.server.max_inference_body_bytes;
     let v1 = Router::new()
         .route("/models", get(models))
         .route("/chat/completions", post(chat_completions))
         .route("/responses", post(openai_responses))
         .route("/messages", post(anthropic_messages))
         .route("/messages/count_tokens", post(count_tokens))
-        .fallback(api_not_found);
+        .fallback(api_not_found)
+        .layer(DefaultBodyLimit::max(max_inference_body_bytes));
     let api = Router::new()
         .route("/status", get(status))
         .route("/stats", get(stats))
@@ -283,33 +285,131 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let body = match inference_json(&state, Protocol::OpenAiChat, &headers, payload) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
     handle_inference(state, Protocol::OpenAiChat, headers, body).await
 }
 
 async fn openai_responses(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let body = match inference_json(&state, Protocol::OpenAiResponses, &headers, payload) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
     handle_inference(state, Protocol::OpenAiResponses, headers, body).await
 }
 
 async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let body = match inference_json(&state, Protocol::AnthropicMessages, &headers, payload) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
     handle_inference(state, Protocol::AnthropicMessages, headers, body).await
 }
 
-async fn count_tokens(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+async fn count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let body = match inference_json(&state, Protocol::AnthropicMessages, &headers, payload) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
     if let Err(error) = resolve_served_model(&state, Protocol::AnthropicMessages, &body) {
         return validation_error(Protocol::AnthropicMessages, error);
     }
     Json(json!({"input_tokens":anthropic::estimate_tokens(&body),"x_quotamux_estimated":true}))
         .into_response()
+}
+
+fn inference_json(
+    state: &AppState,
+    protocol: Protocol,
+    headers: &HeaderMap,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Result<Value, Box<Response>> {
+    match payload {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            Err(Box::new(inference_body_too_large(state, protocol, headers)))
+        }
+        Err(rejection) => Err(Box::new(rejection.into_response())),
+    }
+}
+
+fn inference_body_too_large(state: &AppState, protocol: Protocol, headers: &HeaderMap) -> Response {
+    let request_id = Uuid::now_v7().to_string();
+    let now_ms = Utc::now().timestamp_millis();
+    let limit = state.config.server.max_inference_body_bytes;
+    let content_length = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let limit_bytes = u64::try_from(limit).unwrap_or(u64::MAX);
+    let request_bytes = content_length.unwrap_or_else(|| limit_bytes.saturating_add(1));
+    let message = format!("request body exceeds configured limit of {limit} bytes");
+    let body = error_body(protocol, &message, FailureClass::ClientRequest);
+    let response_bytes = serde_json::to_vec(&body)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    let record = RequestRecord {
+        id: request_id.clone(),
+        started_at_ms: now_ms,
+        completed_at_ms: now_ms,
+        protocol,
+        requested_model: "<unparsed>".into(),
+        served_model: None,
+        upstream_model: None,
+        streaming: false,
+        status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+        error_class: Some(FailureClass::ClientRequest),
+        backend: None,
+        adapter: None,
+        credential: None,
+        route_layer: None,
+        route_layer_index: None,
+        selection_reason: None,
+        matched_prefix_bytes: None,
+        fallback: None,
+        fallback_exhausted: false,
+        translated: false,
+        request_bytes,
+        response_bytes,
+        first_byte_ms: None,
+        total_ms: 0,
+        usage: Usage::default(),
+        claude_session_id: header_text(headers, "x-claude-code-session-id"),
+        claude_agent_id: header_text(headers, "x-claude-code-agent-id"),
+        claude_parent_agent_id: header_text(headers, "x-claude-code-parent-agent-id"),
+    };
+    persist_request(state, &record);
+    tracing::warn!(
+        %request_id,
+        protocol = protocol.as_str(),
+        configured_limit_bytes = limit,
+        ?content_length,
+        "rejected oversized inference request before JSON parsing"
+    );
+
+    let mut response = (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response();
+    if metadata_requested(headers)
+        && let Ok(value) = HeaderValue::from_str(&request_id)
+    {
+        response.headers_mut().insert("x-relay-request-id", value);
+    }
+    response
 }
 
 async fn handle_inference(

@@ -12,7 +12,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
@@ -21,15 +21,19 @@ use quotamux::{
     AppState, Config,
     app::build_app,
     config::{
-        AdapterKind, BackendConfig, BackendModelConfig, CredentialConfig, LOGICAL_MODEL,
-        ModelPricingConfig, RouteLayerConfig, RouteStrategy, RouteTargetConfig, ServedModelConfig,
-        ServerConfig, UPSTREAM_MODEL,
+        AdapterKind, BackendConfig, BackendModelConfig, CredentialConfig,
+        DEFAULT_MAX_INFERENCE_BODY_BYTES, LOGICAL_MODEL, ModelPricingConfig, RouteLayerConfig,
+        RouteStrategy, RouteTargetConfig, ServedModelConfig, ServerConfig, UPSTREAM_MODEL,
     },
     types::Protocol,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{sync::Mutex, task::JoinHandle};
+
+const DATA_IMAGE_URL_PREFIX: &str = "data:image/png;base64,";
+const OVERSIZED_CHAT_TEXT_LEN: usize = 1_500_000;
+const OVERSIZED_CHAT_IMAGE_PAYLOAD_LEN: usize = 300_000;
 
 enum MockBody {
     Json(Value),
@@ -178,6 +182,7 @@ impl MockProvider {
         });
         let app = Router::new()
             .fallback(mock_provider_handler)
+            .layer(DefaultBodyLimit::max(DEFAULT_MAX_INFERENCE_BODY_BYTES))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -233,6 +238,7 @@ impl Gateway {
             server: ServerConfig {
                 listen: "127.0.0.1:0".into(),
                 data_dir: "unused-test-data".into(),
+                max_inference_body_bytes: DEFAULT_MAX_INFERENCE_BODY_BYTES,
                 timeouts: Default::default(),
             },
             affinity: Default::default(),
@@ -389,6 +395,25 @@ fn chat_request_with_content(content: &str) -> Value {
     })
 }
 
+fn oversized_multimodal_chat_request_body() -> Vec<u8> {
+    let long_text = "l".repeat(OVERSIZED_CHAT_TEXT_LEN);
+    let image_payload = "A".repeat(OVERSIZED_CHAT_IMAGE_PAYLOAD_LEN);
+    let body = json!({
+        "model": LOGICAL_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type":"text","text": long_text},
+                {"type":"image_url","image_url":{"url": format!("{DATA_IMAGE_URL_PREFIX}{image_payload}")}},
+                {"type":"image_url","image_url":{"url": format!("{DATA_IMAGE_URL_PREFIX}{image_payload}")}}
+            ]
+        }]
+    });
+    let bytes = serde_json::to_vec(&body).expect("serialize oversized chat request");
+    assert!(bytes.len() > 2 * 1024 * 1024);
+    bytes
+}
+
 fn test_backend(id: &str, credential: &str, upstream: &MockProvider) -> BackendConfig {
     test_backend_adapter(
         id,
@@ -472,6 +497,7 @@ fn test_config(
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
+            max_inference_body_bytes: DEFAULT_MAX_INFERENCE_BODY_BYTES,
             timeouts: Default::default(),
         },
         affinity: Default::default(),
@@ -767,6 +793,7 @@ async fn named_tool_choice_reaches_upstream_and_400_does_not_fallback_or_open_ci
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
+            max_inference_body_bytes: DEFAULT_MAX_INFERENCE_BODY_BYTES,
             timeouts: Default::default(),
         },
         affinity: Default::default(),
@@ -864,6 +891,7 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: "unused-test-data".into(),
+            max_inference_body_bytes: DEFAULT_MAX_INFERENCE_BODY_BYTES,
             timeouts: Default::default(),
         },
         affinity: Default::default(),
@@ -954,6 +982,157 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
     assert_eq!(
         upstream["messages"][3]["content"],
         "continue after all tool results"
+    );
+}
+
+#[tokio::test]
+async fn large_multimodal_body_obeys_limit_and_records_ingress_413() {
+    let oversized_request = oversized_multimodal_chat_request_body();
+    let request_len = oversized_request.len() as u64;
+    assert!(request_len > 2 * 1024 * 1024);
+
+    let upstream_ok = MockProvider::start(vec![MockReply::json(
+        StatusCode::OK,
+        chat_completion("reasoning", "success"),
+    )])
+    .await;
+    let mut exact_limit_config = test_config(
+        vec![test_backend_protocol(
+            "custom-primary",
+            "primary-key",
+            &upstream_ok,
+            Protocol::OpenAiChat,
+        )],
+        vec![("primary", vec![target("custom-primary", "primary-key")])],
+    );
+    exact_limit_config.server.max_inference_body_bytes = request_len as usize;
+    let exact_limit_gateway = Gateway::start_config(exact_limit_config, 0x6000_d3ed).await;
+    let client = reqwest::Client::new();
+    let exact_limit_response = client
+        .post(exact_limit_gateway.url("/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(oversized_request.clone())
+        .send()
+        .await
+        .expect("exact limit request reaches upstream");
+    assert_eq!(exact_limit_response.status(), StatusCode::OK);
+    assert_eq!(upstream_ok.calls().await, 1);
+
+    let upstream_bodies = upstream_ok.request_bodies().await;
+    assert_eq!(upstream_bodies.len(), 1);
+    let upstream_content = upstream_bodies[0]["messages"][0]["content"]
+        .as_array()
+        .expect("upstream multimodal content array");
+    let image_payload_len = DATA_IMAGE_URL_PREFIX.len() + OVERSIZED_CHAT_IMAGE_PAYLOAD_LEN;
+    assert_eq!(upstream_content.len(), 3);
+    assert_eq!(upstream_content[0]["type"], "text");
+    assert_eq!(
+        upstream_content[0]["text"]
+            .as_str()
+            .expect("upstream text")
+            .len(),
+        OVERSIZED_CHAT_TEXT_LEN
+    );
+    assert_eq!(upstream_content[1]["type"], "image_url");
+    assert_eq!(
+        upstream_content[1]["image_url"]["url"]
+            .as_str()
+            .expect("upstream image url"),
+        upstream_content[2]["image_url"]["url"]
+            .as_str()
+            .expect("upstream image url")
+    );
+    let image_url = upstream_content[1]["image_url"]["url"]
+        .as_str()
+        .expect("upstream image url");
+    assert_eq!(image_url.len(), image_payload_len);
+    assert!(image_url.starts_with(DATA_IMAGE_URL_PREFIX));
+
+    let exact_limit_requests = client
+        .get(exact_limit_gateway.url("/api/requests?limit=1"))
+        .send()
+        .await
+        .expect("exact limit request rows")
+        .json::<Value>()
+        .await
+        .expect("exact limit request rows JSON");
+    assert_eq!(exact_limit_requests["requests"][0]["status"], 200);
+    assert!(exact_limit_requests["requests"][0]["error_class"].is_null());
+    assert_eq!(
+        exact_limit_requests["requests"][0]["request_bytes"].as_u64(),
+        Some(request_len)
+    );
+
+    let exact_limit_attempts = client
+        .get(exact_limit_gateway.url("/api/attempts?limit=10"))
+        .send()
+        .await
+        .expect("exact limit attempt rows")
+        .json::<Value>()
+        .await
+        .expect("exact limit attempt rows JSON");
+    assert_eq!(
+        exact_limit_attempts["attempts"]
+            .as_array()
+            .expect("attempt array")
+            .len(),
+        1
+    );
+
+    let upstream_overflow = MockProvider::start(Vec::new()).await;
+    let mut overflow_config = test_config(
+        vec![test_backend_protocol(
+            "custom-primary",
+            "primary-key",
+            &upstream_overflow,
+            Protocol::OpenAiChat,
+        )],
+        vec![("primary", vec![target("custom-primary", "primary-key")])],
+    );
+    overflow_config.server.max_inference_body_bytes = request_len as usize - 1;
+    let overflow_gateway = Gateway::start_config(overflow_config, 0x6000_d3ee).await;
+    let overflow_response = client
+        .post(overflow_gateway.url("/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(oversized_request)
+        .send()
+        .await
+        .expect("overflow request returns 413");
+    assert_eq!(overflow_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(upstream_overflow.calls().await, 0);
+
+    let overflow_requests = client
+        .get(overflow_gateway.url("/api/requests?limit=1"))
+        .send()
+        .await
+        .expect("overflow request rows")
+        .json::<Value>()
+        .await
+        .expect("overflow request rows JSON");
+    assert_eq!(overflow_requests["requests"][0]["status"], 413);
+    assert_eq!(
+        overflow_requests["requests"][0]["error_class"],
+        "client_request"
+    );
+    assert_eq!(
+        overflow_requests["requests"][0]["request_bytes"].as_u64(),
+        Some(request_len)
+    );
+
+    let overflow_attempts = client
+        .get(overflow_gateway.url("/api/attempts?limit=10"))
+        .send()
+        .await
+        .expect("overflow attempt rows")
+        .json::<Value>()
+        .await
+        .expect("overflow attempt rows JSON");
+    assert_eq!(
+        overflow_attempts["attempts"]
+            .as_array()
+            .expect("attempt array")
+            .len(),
+        0
     );
 }
 

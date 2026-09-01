@@ -151,6 +151,7 @@ fn real_probe_config(path: &PathBuf, data_dir: &TempDir) -> (Config, String) {
     config.server = ServerConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: data_dir.path().to_path_buf(),
+        max_inference_body_bytes: config.server.max_inference_body_bytes,
         timeouts: config.server.timeouts,
     };
     config.models = vec![ServedModelConfig {
@@ -210,6 +211,7 @@ fn legacy_v1_config(document: &toml::Value) -> Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
             data_dir: PathBuf::from("unused-real-probe-data"),
+            max_inference_body_bytes: quotamux::config::DEFAULT_MAX_INFERENCE_BODY_BYTES,
             timeouts: Default::default(),
         },
         affinity: Default::default(),

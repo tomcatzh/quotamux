@@ -7,6 +7,9 @@ config_version = 3
 # interfaces so OrbStack can forward the host port.
 listen = "0.0.0.0:8080"
 data_dir = "./data"
+# Limit the encoded JSON body (including Base64 image expansion) while leaving
+# enough headroom for the provider's default multimodal request budget.
+max_inference_body_bytes = 33554432
 
 # Active upstream streams may legitimately pause during long reasoning. Keep
 # their idle-read deadline separate from ordinary responses and from the total

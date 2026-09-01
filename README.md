@@ -110,6 +110,7 @@ config_version = 3
 [server]
 listen = "0.0.0.0:8080"
 data_dir = "./data"
+max_inference_body_bytes = 33554432
 
 [server.timeouts]
 upstream_connect_ms = 10000
@@ -161,6 +162,12 @@ targets = [
   { backend = "deepseek", credential = "deepseek-payg", model = "deepseek-v4-flash" },
 ]
 ```
+
+`server.max_inference_body_bytes` is a finite limit on each encoded inference
+JSON body, including Base64 image expansion. It defaults to 32 MiB when omitted
+for compatibility with existing configuration files. Oversized requests are
+rejected with `413 Payload Too Large` before any upstream attempt and are kept
+in the request history as unattributed client errors.
 
 See [`quotamux.example.toml`](quotamux.example.toml) for a ready-to-copy
 configuration.

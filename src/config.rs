@@ -15,6 +15,11 @@ use crate::{
 
 pub const LOGICAL_MODEL: &str = "deepseek-v4-flash-0731";
 pub const UPSTREAM_MODEL: &str = "deepseek-v4-flash";
+pub const DEFAULT_MAX_INFERENCE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+const fn default_max_inference_body_bytes() -> usize {
+    DEFAULT_MAX_INFERENCE_BODY_BYTES
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +37,8 @@ pub struct Config {
 pub struct ServerConfig {
     pub listen: String,
     pub data_dir: PathBuf,
+    #[serde(default = "default_max_inference_body_bytes")]
+    pub max_inference_body_bytes: usize,
     #[serde(default)]
     pub timeouts: ServerTimeoutConfig,
 }
@@ -292,6 +299,9 @@ impl Config {
             .listen
             .parse::<std::net::SocketAddr>()
             .map_err(|_| invalid("server.listen must be an IP socket address"))?;
+        if self.server.max_inference_body_bytes == 0 {
+            return Err(invalid("server.max_inference_body_bytes must be positive"));
+        }
         self.server.timeouts.validate()?;
         if self.backends.is_empty() {
             return Err(invalid("backends must not be empty"));
@@ -580,6 +590,7 @@ mod tests {
             server: ServerConfig {
                 listen: "127.0.0.1:8080".into(),
                 data_dir: "data".into(),
+                max_inference_body_bytes: DEFAULT_MAX_INFERENCE_BODY_BYTES,
                 timeouts: ServerTimeoutConfig::default(),
             },
             affinity: PrefixAffinityConfig::default(),
@@ -670,6 +681,10 @@ data_dir = "data"
         .unwrap();
         let defaults = ServerTimeoutConfig::default();
         assert_eq!(
+            server.max_inference_body_bytes,
+            DEFAULT_MAX_INFERENCE_BODY_BYTES
+        );
+        assert_eq!(
             server.timeouts.upstream_connect_ms,
             defaults.upstream_connect_ms
         );
@@ -703,6 +718,14 @@ data_dir = "data"
         config.server.timeouts.upstream_total_ms = 300_000;
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("upstream_total_ms must be at least upstream_stream_read_ms"));
+    }
+
+    #[test]
+    fn validates_positive_inference_body_limit() {
+        let mut config = valid();
+        config.server.max_inference_body_bytes = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("server.max_inference_body_bytes must be positive"));
     }
 
     #[test]
@@ -1024,6 +1047,7 @@ config_version = 3
 [server]
 listen = "127.0.0.1:8080"
 data_dir = "data"
+max_inference_body_bytes = 4194304
 [server.timeouts]
 upstream_connect_ms = 5000
 upstream_read_ms = 60000
@@ -1061,6 +1085,7 @@ targets = [{ backend = "go", credential = "go-a", model = "deepseek-v4-flash" }]
         assert_eq!(config.affinity.checkpoint_bytes, 256);
         assert_eq!(config.affinity.max_checkpoints_per_path, 1024);
         assert_eq!(config.affinity.max_leases, 2048);
+        assert_eq!(config.server.max_inference_body_bytes, 4 * 1024 * 1024);
         assert_eq!(config.server.timeouts.upstream_connect_ms, 5_000);
         assert_eq!(config.server.timeouts.upstream_stream_read_ms, 300_000);
         assert_eq!(config.server.timeouts.downstream_sse_heartbeat_ms, 15_000);
