@@ -282,6 +282,7 @@ fn legacy_provider(
         id: id.into(),
         adapter: kind,
         endpoint: None,
+        region: None,
         credentials: vec![CredentialConfig {
             pool: None,
             id: format!("{id}-real"),

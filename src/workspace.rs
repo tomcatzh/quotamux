@@ -176,6 +176,7 @@ impl Workspace {
                     && let Some(existing) = current
                         .document
                         .backend(&backend.id)
+                        .filter(|b| b.adapter == backend.adapter)
                         .and_then(|b| b.credential(&credential.id))
                 {
                     credential.api_key = existing.api_key.clone();
@@ -199,6 +200,7 @@ impl Workspace {
                         && current.document.backend(&backend.id).is_some_and(|old| {
                             old.adapter == backend.adapter
                                 && old.endpoint == backend.endpoint
+                                && old.region == backend.region
                                 && old
                                     .credential(&credential.id)
                                     .is_some_and(|c| c.api_key == credential.api_key)

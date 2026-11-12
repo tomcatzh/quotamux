@@ -248,6 +248,7 @@ impl Gateway {
                     id: "opencode-go".into(),
                     adapter: AdapterKind::OpenCodeGo,
                     endpoint: Some(primary.endpoint()),
+                    region: None,
                     credentials: vec![CredentialConfig {
                         pool: None,
                         id: "go-plan".into(),
@@ -264,6 +265,7 @@ impl Gateway {
                     id: "deepseek".into(),
                     adapter: AdapterKind::DeepSeekOfficial,
                     endpoint: Some(fallback.endpoint()),
+                    region: None,
                     credentials: vec![CredentialConfig {
                         pool: None,
                         id: "deepseek-payg".into(),
@@ -467,6 +469,7 @@ fn test_backend_adapter_model(
         id: id.into(),
         adapter: kind,
         endpoint: Some(upstream.endpoint()),
+        region: None,
         credentials: vec![CredentialConfig {
             pool: None,
             id: credential.into(),

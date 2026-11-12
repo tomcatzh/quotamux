@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod adapters;
+mod bedrock;
 
 use adapters::ProviderAdapter;
 pub(crate) use adapters::{EndpointPolicy, ModelProtocolPolicy, adapter_for};
@@ -49,6 +50,7 @@ pub struct BackendClient {
     tariff: crate::pricing::Tariff,
     client: reqwest::Client,
     stream_client: reqwest::Client,
+    bedrock: Option<bedrock::BedrockTransport>,
 }
 
 #[derive(Debug)]
@@ -115,6 +117,8 @@ pub enum BackendBuildError {
     MissingEndpoint(String),
     #[error("custom backend {0} endpoint is not an absolute HTTP(S) URL")]
     InvalidEndpoint(String),
+    #[error("Bedrock backend {0} requires a region, no endpoint and no API key")]
+    InvalidBedrock(String),
     #[error("backend {0} has invalid usage pricing")]
     InvalidPricing(String),
     #[error("backend {backend} has no protocol contract for model {model}")]
@@ -176,10 +180,26 @@ impl BackendClient {
         let adapter = adapter_for(backend.adapter).ok_or(BackendBuildError::UnsupportedAdapter(
             backend.adapter.as_str(),
         ))?;
+        if backend.adapter == AdapterKind::AwsBedrock
+            && (backend.region.as_deref().is_none_or(|r| {
+                r.is_empty()
+                    || !r
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            }) || backend.endpoint.is_some()
+                || !credential.api_key.is_empty())
+        {
+            return Err(BackendBuildError::InvalidBedrock(backend.id.clone()));
+        }
         let endpoint_policy = adapter.endpoint_policy();
+        let regional_endpoint = format!(
+            "https://bedrock-runtime.{}.amazonaws.com",
+            backend.region.as_deref().unwrap_or_default()
+        );
         let endpoint = endpoint_override.unwrap_or_else(|| match endpoint_policy {
             EndpointPolicy::Official(endpoint) => endpoint,
             EndpointPolicy::ConfiguredExact => backend.endpoint.as_deref().unwrap_or_default(),
+            EndpointPolicy::AwsRegional => &regional_endpoint,
         });
         if endpoint.is_empty() {
             return Err(BackendBuildError::MissingEndpoint(backend.id.clone()));
@@ -233,6 +253,13 @@ impl BackendClient {
                 .map_err(|_| BackendBuildError::InvalidPricing(backend.id.clone()))?,
             client,
             stream_client,
+            bedrock: (backend.adapter == AdapterKind::AwsBedrock).then(|| {
+                bedrock::BedrockTransport::new(
+                    backend.region.clone().unwrap_or_default(),
+                    endpoint_override.map(str::to_owned),
+                    timeouts,
+                )
+            }),
         })
     }
 
@@ -277,6 +304,9 @@ impl BackendClient {
         inbound_headers: &HeaderMap,
     ) -> Result<Response, BackendError> {
         debug_assert!(self.protocols.contains(&protocol));
+        if let Some(bedrock) = &self.bedrock {
+            return bedrock.send(&self.model, body, inbound_headers).await;
+        }
         let url = self.request_url(protocol);
         let client = if body.get("stream").and_then(Value::as_bool) == Some(true) {
             &self.stream_client
@@ -350,7 +380,7 @@ fn build_http_client(
     timeouts: &ServerTimeoutConfig,
     read_timeout_ms: u64,
 ) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+    crate::tls::reqwest_builder()?
         .user_agent(concat!("quotamux/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_millis(timeouts.upstream_connect_ms))
         .read_timeout(Duration::from_millis(read_timeout_ms))
@@ -539,6 +569,7 @@ mod tests {
 
     fn client_for(kind: AdapterKind, model: &str) -> BackendClient {
         let backend = BackendConfig {
+            region: None,
             id: kind.as_str().into(),
             adapter: kind,
             endpoint: None,
@@ -697,6 +728,7 @@ mod tests {
         let backend = BackendConfig {
             id: "customer".into(),
             adapter: AdapterKind::CustomChatCompletions,
+            region: None,
             endpoint: Some("https://customer.example/private/inference".into()),
             credentials: vec![CredentialConfig {
                 pool: None,
@@ -732,6 +764,7 @@ mod tests {
         let mut backend = BackendConfig {
             id: "bad".into(),
             adapter: AdapterKind::AliyunBailian,
+            region: None,
             endpoint: None,
             credentials: vec![CredentialConfig {
                 pool: None,

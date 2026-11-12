@@ -56,6 +56,7 @@ const browseActions = new Set([
 ]);
 const protocols = ["openai-chat", "openai-responses", "anthropic-messages"];
 const adapters = [
+  "aws-bedrock",
   "opencode-go",
   "deepseek-official",
   "kimi-official",
@@ -170,17 +171,18 @@ function accounts() {
 }
 function accountEditor(b, i) {
       const p = `backends.${i}`;
-      return `<p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p><article><div class="heading"><h3 data-account-heading>${esc(displayName(b.id || "New account"))}</h3>${button("remove", "Delete account", p)}</div><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
+      const bedrock = b.adapter === "aws-bedrock";
+      return `${bedrock ? "" : '<p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p>'}<article><div class="heading"><h3 data-account-heading>${esc(displayName(b.id || "New account"))}</h3>${button("remove", "Delete account", p)}</div><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}${bedrock ? field(p + ".region", "AWS 区域") + '<p class="muted">使用运行环境的 IAM Role；无需 API Key。EC2 上由实例角色自动提供凭据。</p>' : ""}<h4>Credentials</h4>${b.credentials
         .map((c, j) => {
           const q = `${p}.credentials.${j}`;
-          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${!c.pool ? button("add-pool", "Create capacity pool", q) : ""}${button("remove", "Delete credential", q)}</div>`;
+          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${bedrock ? "" : field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${!c.pool ? button("add-pool", "Create capacity pool", q) : ""}${button("remove", "Delete credential", q)}</div>`;
         })
         .join(
           "",
-        )}${button("add-credential", "+ Add credential", p + ".credentials")}${capacityPanel(b)}<h4>Upstream models</h4>${b.models
+        )}${!bedrock || !b.credentials.length ? button("add-credential", "+ Add credential", p + ".credentials") : ""}${capacityPanel(b)}<h4>Upstream models</h4>${b.models
         .map((m, j) => {
           const q = `${p}.models.${j}`;
-          return `<fieldset><legend>Upstream model</legend>${field(q + ".name", "Upstream model name")}${choices(
+          return `<fieldset><legend>Upstream model</legend>${field(q + ".name", "Upstream model name")}${bedrock ? '<p class="muted">原生协议：Anthropic Messages；其他协议使用网关转换。</p>' : choices(
             q + ".protocols",
             "Protocols (empty uses adapter defaults)",
             protocols.map((v) => [v, v]),
@@ -203,7 +205,7 @@ function rateSummary(rates) {
 }
 function accountSummary(backend) {
   const dayNames = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-  return `<article><h2>${esc(displayName(backend.id))}</h2>${infoRows([["Adapter", displayName(backend.adapter)], ["Endpoint", backend.adapter.startsWith("custom-") ? backend.endpoint || "Saved endpoint is redacted" : "Official endpoint managed by adapter"]])}<h3>Credentials</h3>${backend.credentials.length ? `<div class="table-scroll"><table><thead><tr><th>Credential</th><th>Shared capacity</th></tr></thead><tbody>${backend.credentials.map(credential => `<tr><td>${esc(credential.id)}</td><td >${esc(credential.pool || "No local limit")}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">No credentials configured.</p>'}</article>${capacityPanel(backend)}<h2>Upstream models</h2>${backend.models.map(model => `<article><h3>${esc(model.name)}</h3>${infoRows([["Supported protocols", model.protocols?.length ? model.protocols.join(", ") : "Adapter defaults"], ["Billing context", model.pricing_note || "Not configured"], ["Rate reference", model.pricing_source || "Not configured"], ["Default rates", rateSummary(model.pricing)]])}<h4>Active rates</h4><p data-price-backend="${esc(backend.id)}" data-price-model="${esc(model.name)}">${esc(activePriceText(state.live?.pricing?.find(row => row.backend === backend.id && row.model === model.name)))}</p><p class="muted">Usage value is an estimate, not an actual cash bill. Subscription requests may consume quota.</p>${model.pricing_schedule ? `<h4>Weekly price windows · ${esc(model.pricing_schedule.timezone)}</h4><div class="table-scroll"><table><thead><tr><th>Window</th><th>Starting days</th><th>Start</th><th>End</th><th>Rates (USD / million tokens)</th></tr></thead><tbody>${model.pricing_schedule.windows.map(window => `<tr><td>${esc(window.name)}</td><td>${esc(window.days.map(day => dayNames[day] || day).join(", "))}</td><td>${esc(window.start)}</td><td>${esc(window.end)}</td><td>${esc(rateSummary(window.pricing))}</td></tr>`).join("")}</tbody></table></div>` : ""}</article>`).join("") || '<p class="muted">No upstream models configured.</p>'}`;
+  return `<article><h2>${esc(displayName(backend.id))}</h2>${infoRows([["Adapter", displayName(backend.adapter)], ...(backend.adapter === "aws-bedrock" ? [["AWS 区域", backend.region], ["鉴权", "运行环境 IAM Role"]] : []), ["Endpoint", backend.adapter.startsWith("custom-") ? backend.endpoint || "Saved endpoint is redacted" : "Official endpoint managed by adapter"]])}<h3>Credentials</h3>${backend.credentials.length ? `<div class="table-scroll"><table><thead><tr><th>Credential</th><th>Shared capacity</th></tr></thead><tbody>${backend.credentials.map(credential => `<tr><td>${esc(credential.id)}</td><td >${esc(credential.pool || "No local limit")}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">No credentials configured.</p>'}</article>${capacityPanel(backend)}<h2>Upstream models</h2>${backend.models.map(model => `<article><h3>${esc(model.name)}</h3>${infoRows([["Supported protocols", model.protocols?.length ? model.protocols.join(", ") : "Adapter defaults"], ["Billing context", model.pricing_note || "Not configured"], ["Rate reference", model.pricing_source || "Not configured"], ["Default rates", rateSummary(model.pricing)]])}<h4>Active rates</h4><p data-price-backend="${esc(backend.id)}" data-price-model="${esc(model.name)}">${esc(activePriceText(state.live?.pricing?.find(row => row.backend === backend.id && row.model === model.name)))}</p><p class="muted">Usage value is an estimate, not an actual cash bill. Subscription requests may consume quota.</p>${model.pricing_schedule ? `<h4>Weekly price windows · ${esc(model.pricing_schedule.timezone)}</h4><div class="table-scroll"><table><thead><tr><th>Window</th><th>Starting days</th><th>Start</th><th>End</th><th>Rates (USD / million tokens)</th></tr></thead><tbody>${model.pricing_schedule.windows.map(window => `<tr><td>${esc(window.name)}</td><td>${esc(window.days.map(day => dayNames[day] || day).join(", "))}</td><td>${esc(window.start)}</td><td>${esc(window.end)}</td><td>${esc(rateSummary(window.pricing))}</td></tr>`).join("")}</tbody></table></div>` : ""}</article>`).join("") || '<p class="muted">No upstream models configured.</p>'}`;
 }
 function poolReferences(id) {
   const pool = state.draft.capacity_pools.find(pool => pool.id === id);
@@ -755,8 +757,15 @@ app.addEventListener("change", (event) => {
   if (path?.endsWith(".adapter")) {
     const backend = get(path.slice(0, -8));
     delete backend.endpoint;
+    delete backend.region;
+    backend.credentials.forEach(credential => credential.api_key = "");
+    if (backend.adapter === "aws-bedrock") {
+      backend.region = "us-east-1";
+      backend.credentials = backend.credentials.slice(0, 1);
+    }
     const adapterProtocols = {
       "opencode-go": [],
+      "aws-bedrock": [],
       "custom-chat-completions": ["openai-chat"],
       "custom-responses": ["openai-responses"],
       "custom-anthropic": ["anthropic-messages"],
@@ -1080,6 +1089,9 @@ app.addEventListener("click", async (event) => {
             ? state.draft.backends
             : get(p);
       if (!Array.isArray(array)) return;
+      if (a === "add-upstream" && get(p.split(".").slice(0, 2).join(".")).adapter === "aws-bedrock") {
+        defaults[a].protocols = [];
+      }
       array.push(defaults[a]);
       if (a === "add-backend") state.accountTab = `backend:${array.length - 1}`;
       if (a === "add-layer") {

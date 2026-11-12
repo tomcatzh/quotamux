@@ -9,6 +9,10 @@ It accepts OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
 When the selected upstream uses another supported protocol, QuotaMux translates
 the request and response at the protocol boundary.
 
+AWS Bedrock 的 EC2 Role、`us-east-1` 与 Global 推理接入见
+[接入说明](docs/aws-bedrock.md) 和
+[四款 Claude 模型的独立示例](quotamux.bedrock.example.toml)。
+
 > [!IMPORTANT]
 > QuotaMux does not authenticate inference clients. Bind it to localhost, keep it
 > on a private network, or place it behind an authenticated reverse proxy. The

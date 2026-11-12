@@ -14,12 +14,32 @@ struct Args {
     config: PathBuf,
 
     /// Validate configuration, backend identities, and adapter model contracts, then exit.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "diagnose")]
     check: bool,
+
+    /// 执行独立诊断并写入脱敏报告，不启动网关。
+    #[arg(long)]
+    diagnose: bool,
+
+    /// 诊断报告 JSON 路径（不覆盖现有文件）。
+    #[arg(long, requires = "diagnose")]
+    report: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            let code = if error.use_stderr() { 1 } else { 0 };
+            let _ = error.print();
+            std::process::exit(code);
+        }
+    };
+    if args.diagnose {
+        std::process::exit(quotamux::diagnostics::run(&args.config, args.report.as_deref()).await);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| "quotamux=info".into()),
@@ -28,7 +48,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_current_span(false)
         .init();
 
-    let args = Args::parse();
     let config = Config::load(&args.config)?;
     if args.check {
         println!("configuration valid");

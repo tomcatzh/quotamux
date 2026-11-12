@@ -1,0 +1,74 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GlobalProfilesInSourceRegion",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-opus-5-5",
+        "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-haiku-5-5",
+        "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-fable-5-2"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+    {
+      "Sid": "SourceRegionFoundationModels",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-5-5",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-5-5",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-fable-5-2"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1",
+          "bedrock:InferenceProfileArn": [
+            "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-opus-5-5",
+            "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-sonnet-5-5",
+            "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-haiku-5-5",
+            "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-fable-5-2"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "GlobalFoundationModels",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:::foundation-model/anthropic.claude-opus-5-5",
+        "arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:::foundation-model/anthropic.claude-haiku-5-5",
+        "arn:aws:bedrock:::foundation-model/anthropic.claude-fable-5-2"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "unspecified",
+          "bedrock:InferenceProfileArn": [
+            "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-opus-5-5",
+            "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-sonnet-5-5",
+            "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-haiku-5-5",
+            "arn:aws:bedrock:us-east-1:ACCOUNT_ID:inference-profile/global.anthropic.claude-fable-5-2"
+          ]
+        }
+      }
+    }
+  ]
+}

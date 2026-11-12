@@ -1,0 +1,77 @@
+# EC2 Instance Role + us-east-1 + Global 推理配置。
+# 本示例使用隔离的 8081 与独立数据；不会修改生产配置。
+config_version = 4
+
+[server]
+listen = "127.0.0.1:8081"
+data_dir = "./data"
+
+[server.timeouts]
+upstream_connect_ms = 10000
+upstream_read_ms = 90000
+upstream_stream_read_ms = 300000
+upstream_total_ms = 7200000
+downstream_sse_heartbeat_ms = 15000
+route_probe_wait_ms = 5000
+
+[[backends]]
+id = "aws-bedrock"
+adapter = "aws-bedrock"
+region = "us-east-1"
+
+# 一个凭据条目代表运行环境的 AWS 身份，不填写 api_key。
+[[backends.credentials]]
+id = "instance-role"
+
+[[backends.models]]
+name = "global.anthropic.claude-opus-5-5"
+
+[[backends.models]]
+name = "global.anthropic.claude-sonnet-5-5"
+
+[[backends.models]]
+name = "global.anthropic.claude-haiku-5-5"
+
+[[backends.models]]
+name = "global.anthropic.claude-fable-5-2"
+
+# Anthropic Messages 为原生协议，其余两个入口使用既有网关转换。
+[[models]]
+name = "claude-opus-5-5"
+aliases = ["global.anthropic.claude-opus-5-5"]
+protocols = ["anthropic-messages", "openai-chat", "openai-responses"]
+
+[[models.layers]]
+name = "bedrock-global"
+strategy = "random"
+targets = [{ backend = "aws-bedrock", credential = "instance-role", model = "global.anthropic.claude-opus-5-5" }]
+
+[[models]]
+name = "claude-sonnet-5-5"
+aliases = ["global.anthropic.claude-sonnet-5-5"]
+protocols = ["anthropic-messages", "openai-chat", "openai-responses"]
+
+[[models.layers]]
+name = "bedrock-global"
+strategy = "random"
+targets = [{ backend = "aws-bedrock", credential = "instance-role", model = "global.anthropic.claude-sonnet-5-5" }]
+
+[[models]]
+name = "claude-haiku-5-5"
+aliases = ["global.anthropic.claude-haiku-5-5"]
+protocols = ["anthropic-messages", "openai-chat", "openai-responses"]
+
+[[models.layers]]
+name = "bedrock-global"
+strategy = "random"
+targets = [{ backend = "aws-bedrock", credential = "instance-role", model = "global.anthropic.claude-haiku-5-5" }]
+
+[[models]]
+name = "claude-fable-5-2"
+aliases = ["global.anthropic.claude-fable-5-2"]
+protocols = ["anthropic-messages", "openai-chat", "openai-responses"]
+
+[[models.layers]]
+name = "bedrock-global"
+strategy = "random"
+targets = [{ backend = "aws-bedrock", credential = "instance-role", model = "global.anthropic.claude-fable-5-2" }]

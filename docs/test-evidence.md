@@ -1,11 +1,42 @@
 # QuotaMux routing verification evidence
 
-Updated: 2026-09-18 (Asia/Shanghai)
+Updated: 2026-11-13 (Asia/Shanghai)
 
 This report records the data produced by the configuration-v3, layered-routing,
 protocol-translation, configurable inference-body-limit, memory-only
 prompt-prefix-affinity, token-detail, and estimated-thinking test runs. API keys,
 prompt bodies, and model response bodies are excluded.
+
+## 2026-11-13：一次性 Bedrock 诊断与最终 Linux 包
+
+用户无法频繁往返 EC2，因此现场改为一次 `./start.sh --diagnose`，回传一个私有 JSON；不再要求逐条 curl。
+
+- 完整 Rust 回归：286 项通过、7 项既有真实环境测试跳过；其中诊断离线测试 15 项、Bedrock 网关模拟 12 项。全目标全特性 Clippy、默认构建和格式检查通过。
+- 诊断覆盖配置白名单、环境变量存在性、默认凭据链与 STS 身份、正在运行的本地网关的错误/熔断快照、四款 Global 模型普通和流式共八项探测。凭据失败保留报告并跳过推理；STS 失败仍继续独立模型探测；单项模型失败不阻止后续项目。
+- 报告保留真实 `CircuitSnapshot`、`AttemptRecord` 与上游错误汇总中的原始拒绝原因。脱敏、截断边界、流式结束标记与错误判断、坏配置、私有权限及拒绝覆盖均有离线回归。
+- 最终两个 ZIP 位于 `data/releases/diagnostics/`，仍各含静态程序、配置、启动脚本三个文件，ELF 架构、无动态加载器/共享库、CRC、权限和 SHA256 检查通过。
+- 两架构最终程序在 scratch、无网络、只读根文件系统下通过诊断验收；缺少凭据及坏配置都生成 `0600` 报告，旧报告和 symlink 不被覆盖，真实启动脚本保留退出码与私有日志，未创建业务数据库。
+- 两架构 scratch 使用明确假凭据、缺失系统 CA 路径、错误环境端点覆盖进行 HTTPS 验证：STS 返回鉴权错误后，八项 Bedrock 调用全部继续并收到 AWS 鉴权拒绝；错误类型/说明及脱敏均通过。此项没有真实凭据、模型推理或真实账户权限验收。
+- 默认 IMDSv2 链另以本地假元数据服务通过五个场景：两架构 Role token/名称/凭据获取、缺失 Role、禁用元数据、环境凭据优先级。未测试真实临时凭据的过期刷新。
+
+构建和诊断验收证据位于 `data/releases/diagnostics/`，IMDS 模拟证据为 `data/releases/imds-mock-results.json`。用户 EC2 原始 503 根因仍待一次报告或直接连接确认；本轮未连接 EC2、修改生产 `8080` 或更改主机配置。
+
+## 2026-11-12：AWS Bedrock 文档驱动接入与模拟验收
+
+本轮仅在 `.worktrees/0.3.0`、`feat/0.3.0` 开发；未调用真实 AWS，未改动生产 `8080`。
+
+- `cargo test --locked --all-targets --all-features -- --test-threads=1`：268 项通过，7 项既有真实环境测试按原标记跳过。其中 Bedrock 网关模拟 10 项、库单元测试 172 项、既有网关集成测试 60 项。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check`：通过。
+- `npm ci`、`npm run build`、`npm run test:e2e`：完成；浏览器使用独立 `8081` 和临时数据。新增用例验证区域、Role 提示、单身份、密钥隐藏及新增模型的空协议声明；保存请求被测试拦截，未调用 AWS。截图位于忽略目录 `data/e2e/bedrock-role-draft.png`，已目视检查。
+- `quotamux.bedrock.example.toml --check`：配置通过；四款模型目录、IAM 三段策略 JSON 和前端 gzip 内容一致性检查通过。
+- 三文件 Linux 包追加验收：启用 `standalone-tls` 后全套 269 项通过、7 项真实环境测试跳过，严格 Clippy 与格式检查通过；两个发行程序分别为 ARM64 静态 ELF 和 x86_64 静态 PIE。每个 ZIP 严格三个文件，CRC、Unix 权限与 SHA256 均已校验。两个架构的 scratch 配置检查、健康接口、四模型目录、无系统 CA 下的假凭据 AWS 403、TRACE、真实启动脚本与 Ctrl+C 退出均通过；未进行真实模型推理。构建与运行证据在 `data/releases/`。
+- 独立子代理审查发现并修复：凭据加载失败的鉴权分类、HTTP 状态与 `Retry-After` 丢失。贯穿网关测试又发现 SDK 流异常枚举可能没有 `code()` 元数据，现按具体枚举变体补足。SDK 默认停滞保护关闭，超时统一沿用网关预算。
+
+模拟服务验证真实 SDK 的 SigV4 服务/区域签名、临时凭据 session token、四款 global 模型的 Invoke 路径、原生消息/thinking/工具/cache 字段、未知字段保留、碎片化 AWS EventStream、usage、限流回退、请求错误不回退、提交后异常不回退和空闲超时。`count_tokens` 保留为显式本地估算。
+
+尚未验证：真实 EC2 IMDSv2/Instance Profile、账户模型访问资格、global 配额、真实临时凭据过期刷新，以及云端长请求和价格。配置与部署材料见 [Bedrock 接入说明](aws-bedrock.md)。
+
+依赖安装时，现有前端 lockfile 的 `vite@8.1.5`、`source-map-js` 被 `npm audit` 标记为 2 项高危开发依赖告警；本次没有变更前端依赖版本。它们涉及开发工具/源码映射处理，需另行评估升级，未作为 Bedrock 已验证能力。参见 [Vite 公告](https://github.com/advisories/GHSA-587h-7wmj-h5pm) 和 [source-map-js 公告](https://github.com/advisories/GHSA-68fv-2mgg-jv7q)。
 
 ## September 18, 2026: Estimated thinking tokens for upstreams that omit the split
 

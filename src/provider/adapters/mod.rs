@@ -7,6 +7,7 @@ use crate::{
 
 use super::{ErrorDetails, classify_status};
 
+pub(super) mod aws_bedrock;
 mod custom;
 mod deepseek_official;
 mod kimi_code;
@@ -19,6 +20,7 @@ mod zhipu_coding_plan;
 pub enum EndpointPolicy {
     Official(&'static str),
     ConfiguredExact,
+    AwsRegional,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +59,7 @@ pub trait ProviderAdapter: Send + Sync {
 
 pub fn adapter_for(kind: AdapterKind) -> Option<&'static dyn ProviderAdapter> {
     match kind {
+        AdapterKind::AwsBedrock => Some(&aws_bedrock::AWS_BEDROCK),
         AdapterKind::DeepSeekOfficial => Some(&deepseek_official::DEEPSEEK_OFFICIAL),
         AdapterKind::KimiOfficial => Some(&kimi_official::KIMI_OFFICIAL),
         AdapterKind::KimiCode => Some(&kimi_code::KIMI_CODE),

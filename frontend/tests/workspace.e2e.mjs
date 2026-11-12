@@ -232,6 +232,44 @@ async function auditConfirmations(browser) {
   await page.close();
   console.log('PASS Save/Discard cancellation and 9 delete kinds cancel/confirm without premature writes; unused account covered separately');
 }
+async function auditBedrockDraft(browser) {
+  const page = await browser.newPage();
+  await page.goto(base);
+  await action(page, "accounts").click();
+  await action(page, "enable-edit").click();
+  await field(page, "backends.0.adapter").selectOption("aws-bedrock");
+  await expect(field(page, "backends.0.region")).toHaveValue("us-east-1");
+  await expect(field(page, "backends.0.credentials.0.api_key")).toHaveCount(0);
+  await expect(field(page, "backends.0.endpoint")).toHaveCount(0);
+  await expect(action(page, "add-credential", "backends.0.credentials")).toHaveCount(0);
+  await expect(page.locator("main")).toContainText("EC2 上由实例角色自动提供凭据");
+  await field(page, "backends.0.region").fill("us-east-2");
+  await expect(field(page, "backends.0.region")).toHaveValue("us-east-2");
+  const before = (await (await fetch(base + "/api/routing")).json()).document.backends[0].models.length;
+  await action(page, "add-upstream", "backends.0.models").click();
+  await field(page, `backends.0.models.${before}.name`).fill("global.anthropic.claude-fable-5-2");
+  let submitted;
+  await page.route("**/api/routing", async route => {
+    if (route.request().method() !== "PUT") return route.continue();
+    submitted = route.request().postDataJSON();
+    await route.fulfill({status:400, contentType:"application/json", body:JSON.stringify({error:"模拟拦截，未调用 AWS"})});
+  });
+  await save(page, 400);
+  assert.deepEqual(submitted.document.backends[0].models[before].protocols, [], "Bedrock 新增模型由适配器管理协议");
+  assert.equal(submitted.document.backends[0].region, "us-east-2");
+  assert.equal(submitted.document.backends[0].credentials[0].api_key, "");
+  await page.screenshot({path: artifacts + "/bedrock-role-draft.png", fullPage:true});
+  await field(page, "backends.0.adapter").selectOption("custom-chat-completions");
+  await expect(field(page, "backends.0.region")).toHaveCount(0);
+  await expect(field(page, "backends.0.credentials.0.api_key")).toBeVisible();
+  // 仅检查草稿，不保存会触发真实 AWS 校验的配置。
+  page.once("dialog", dialog => dialog.accept());
+  await action(page, "discard").click();
+  await expect(page.locator("#draft-status")).toHaveText("All changes saved");
+  await page.close();
+  console.log("通过：Bedrock 草稿显示区域与 Role 鉴权，隐藏密钥并限制单身份；未提交 AWS 配置");
+}
+
 async function auditAccountDependencies(browser) {
   const baseline = await (await fetch(base+'/api/routing')).json();
   const bytes = await readFile(dir+'/config.toml');
@@ -592,6 +630,7 @@ try {
   await inspectReadonlyAccounts(browser);
   await auditConfirmations(browser);
   await auditAccountDependencies(browser);
+  await auditBedrockDraft(browser);
   await inspectSettingsAndCapacity(browser);
   // The independent Settings page has saved and restored the shared document.
   await action(page,'discard').click();

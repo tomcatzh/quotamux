@@ -380,7 +380,15 @@ pub(crate) fn target_identity(config: &Config, target: &RouteTargetConfig) -> St
             .protocols,
     ))
     .unwrap();
-    blake3::hash(&bytes).to_hex().to_string()
+    // Preserve existing identities for API-key backends while separating AWS
+    // regions, which select different clients, permissions, and quota scopes.
+    let mut identity = blake3::Hasher::new();
+    identity.update(&bytes);
+    if let Some(region) = &backend.region {
+        identity.update(b":aws-region:");
+        identity.update(region.as_bytes());
+    }
+    identity.finalize().to_hex().to_string()
 }
 
 fn circuit_store_key(target: &RouteTargetConfig) -> String {
@@ -2843,6 +2851,48 @@ fn attempt_rollup_json(value: AttemptRollup) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_identity_preserves_legacy_hashes_and_separates_aws_regions() {
+        let mut config: Config = serde_json::from_value(json!({
+            "config_version":4,
+            "server":{"listen":"127.0.0.1:8081", "data_dir":"unused-test-data"},
+            "backends":[{"id":"legacy", "adapter":"custom-anthropic", "endpoint":"https://example.com/messages",
+                "credentials":[{"id":"key", "api_key":"fake-key"}],
+                "models":[{"name":"upstream", "protocols":["anthropic-messages"]}]}],
+            "models":[{"name":"public", "protocols":["anthropic-messages"], "layers":[{"name":"one", "strategy":"random",
+                "targets":[{"backend":"legacy", "credential":"key", "model":"upstream"}]}]}]
+        })).unwrap();
+        let target = config.models[0].layers[0].targets[0].clone();
+        let backend = config.backend(&target.backend).unwrap();
+        let legacy = serde_json::to_vec(&(
+            &target,
+            backend.adapter,
+            &backend.endpoint,
+            &backend.credential(&target.credential).unwrap().api_key,
+            &backend.model(&target.model).unwrap().protocols,
+        ))
+        .unwrap();
+        assert_eq!(
+            target_identity(&config, &target),
+            blake3::hash(&legacy).to_hex().to_string()
+        );
+        let backend = config
+            .backends
+            .iter_mut()
+            .find(|b| b.id == target.backend)
+            .unwrap();
+        backend.adapter = AdapterKind::AwsBedrock;
+        backend.region = Some("us-east-1".into());
+        let east = target_identity(&config, &target);
+        config
+            .backends
+            .iter_mut()
+            .find(|b| b.id == target.backend)
+            .unwrap()
+            .region = Some("us-east-2".into());
+        assert_ne!(target_identity(&config, &target), east);
+    }
 
     #[test]
     fn client_error_bodies_carry_the_upstream_discriminator() {

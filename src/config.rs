@@ -118,6 +118,8 @@ impl ServerTimeoutConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum AdapterKind {
+    #[serde(rename = "aws-bedrock")]
+    AwsBedrock,
     #[serde(rename = "deepseek-official")]
     DeepSeekOfficial,
     #[serde(rename = "kimi-official")]
@@ -145,6 +147,7 @@ pub enum AdapterKind {
 impl AdapterKind {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AwsBedrock => "aws-bedrock",
             Self::DeepSeekOfficial => "deepseek-official",
             Self::KimiOfficial => "kimi-official",
             Self::KimiCode => "kimi-code",
@@ -167,6 +170,8 @@ pub struct BackendConfig {
     pub adapter: AdapterKind,
     #[serde(default)]
     pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     pub credentials: Vec<CredentialConfig>,
     pub models: Vec<BackendModelConfig>,
 }
@@ -187,6 +192,7 @@ impl BackendConfig {
 #[serde(deny_unknown_fields)]
 pub struct CredentialConfig {
     pub id: String,
+    #[serde(default)]
     pub api_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
@@ -477,7 +483,41 @@ fn validate_backend(path: &str, backend: &BackendConfig) -> Result<(), ConfigErr
             backend.adapter.as_str()
         )));
     }
+    if backend.adapter != AdapterKind::AwsBedrock && backend.region.is_some() {
+        return Err(invalid(format!(
+            "{path}.region is only supported for aws-bedrock"
+        )));
+    }
     match adapter.endpoint_policy() {
+        EndpointPolicy::AwsRegional => {
+            if backend.endpoint.is_some() {
+                return Err(invalid(format!(
+                    "{path}.endpoint is not configurable for aws-bedrock"
+                )));
+            }
+            let region = backend.region.as_deref().unwrap_or_default();
+            let parts: Vec<_> = region.split('-').collect();
+            if parts.len() < 3
+                || parts[0].len() != 2
+                || !parts[..parts.len().saturating_sub(1)]
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase()))
+                || !parts
+                    .last()
+                    .is_some_and(|p| p.len() == 1 && p.bytes().all(|b| b.is_ascii_digit()))
+                || region.starts_with("cn-")
+                || region.starts_with("us-gov-")
+            {
+                return Err(invalid(format!(
+                    "{path}.region must be an explicit commercial AWS region (for example us-east-1)"
+                )));
+            }
+            if backend.credentials.len() != 1 {
+                return Err(invalid(format!(
+                    "{path}.credentials must contain exactly one AWS identity"
+                )));
+            }
+        }
         EndpointPolicy::Official(_) if backend.endpoint.is_some() => {
             return Err(invalid(format!(
                 "{path}.endpoint is not configurable for official adapter {}; use the matching custom-* adapter for a custom endpoint",
@@ -508,7 +548,12 @@ fn validate_backend(path: &str, backend: &BackendConfig) -> Result<(), ConfigErr
                 credential.id
             )));
         }
-        if credential.api_key.trim().is_empty() {
+        if backend.adapter == AdapterKind::AwsBedrock && !credential.api_key.is_empty() {
+            return Err(invalid(format!(
+                "{credential_path}.api_key must be omitted for aws-bedrock; use the AWS credential provider chain"
+            )));
+        }
+        if backend.adapter != AdapterKind::AwsBedrock && credential.api_key.trim().is_empty() {
             return Err(invalid(format!("{credential_path}.api_key is empty")));
         }
     }
@@ -659,6 +704,135 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 mod tests {
     use super::*;
 
+    fn bedrock() -> Config {
+        let mut config = valid();
+        config.backends[0].adapter = AdapterKind::AwsBedrock;
+        config.backends[0].region = Some("us-east-1".into());
+        config.backends[0].credentials[0].api_key.clear();
+        let name = "global.anthropic.claude-opus-5-5";
+        config.backends[0].models[0].name = name.into();
+        for layer in &mut config.models[0].layers {
+            for target in &mut layer.targets {
+                if target.backend == "go" {
+                    target.model = name.into();
+                }
+            }
+        }
+        config
+    }
+
+    #[test]
+    fn bedrock_role_configuration_and_four_global_models() {
+        for name in [
+            "global.anthropic.claude-opus-5-5",
+            "global.anthropic.claude-sonnet-5-5",
+            "global.anthropic.claude-haiku-5-5",
+            "global.anthropic.claude-fable-5-2",
+        ] {
+            let mut config = bedrock();
+            config.backends[0].models[0].name = name.into();
+            for layer in &mut config.models[0].layers {
+                for target in &mut layer.targets {
+                    if target.backend == "go" {
+                        target.model = name.into();
+                    }
+                }
+            }
+            config.validate().unwrap();
+            let mut value = serde_json::to_value(&config).unwrap();
+            value["backends"][0]["credentials"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("api_key");
+            serde_json::from_value::<Config>(value)
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn bedrock_rejects_invalid_identity_and_endpoint_settings() {
+        let mut config = bedrock();
+        config.backends[0].region = None;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("region")
+        );
+        for region in [
+            "",
+            "us-east-1.example.com",
+            "us-east-1/path",
+            "cn-north-1",
+            "us-gov-west-1",
+        ] {
+            let mut config = bedrock();
+            config.backends[0].region = Some(region.into());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("region")
+            );
+        }
+        let mut config = bedrock();
+        config.backends[0].endpoint = Some("https://example.com".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("endpoint")
+        );
+        let mut config = bedrock();
+        config.backends[0].credentials[0].api_key = "should-not-be-used".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("api_key")
+        );
+        let mut config = bedrock();
+        let mut second = config.backends[0].credentials[0].clone();
+        second.id = "second".into();
+        config.backends[0].credentials.push(second);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
+    }
+
+    #[test]
+    fn existing_backends_still_require_keys_and_reject_region() {
+        let mut config = valid();
+        config.validate().unwrap();
+        config.backends[0].region = Some("us-east-1".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("region")
+        );
+        config.backends[0].region = None;
+        config.backends[0].credentials[0].api_key.clear();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("api_key")
+        );
+    }
+
     pub fn valid() -> Config {
         Config {
             capacity_pools: vec![],
@@ -675,6 +849,7 @@ mod tests {
                     id: "go".into(),
                     adapter: AdapterKind::OpenCodeGo,
                     endpoint: None,
+                    region: None,
                     credentials: vec![CredentialConfig {
                         pool: None,
                         id: "go-plan".into(),
@@ -691,6 +866,7 @@ mod tests {
                     id: "deepseek".into(),
                     adapter: AdapterKind::DeepSeekOfficial,
                     endpoint: None,
+                    region: None,
                     credentials: vec![CredentialConfig {
                         pool: None,
                         id: "deepseek-payg".into(),
