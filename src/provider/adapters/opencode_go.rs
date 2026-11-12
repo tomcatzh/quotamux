@@ -41,6 +41,7 @@ impl ProviderAdapter for OpenCodeGo {
             | "glm-5.3"
             | "glm-5.2"
             | "glm-5.1"
+            | "kimi-k3.1-pro"
             | "kimi-k3"
             | "kimi-k2.7-code"
             | "kimi-k2.6"

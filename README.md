@@ -300,6 +300,14 @@ name = "kimi-k3"
 QuotaMux rejects a Go model that is not in the adapter catalog. The catalog
 follows the [OpenCode Go endpoint table](https://dev.opencode.ai/docs/go/#endpoints).
 
+Kimi K3.1 Pro uses the exact upstream model ID `kimi-k3.1-pro` on OpenCode Go.
+Declare that ID in `backends.models` without `protocols`, and reference it from
+the served model's route. Go uses native Chat Completions for this model;
+Responses and Anthropic Messages ingress use the existing protocol translation.
+K3.1 Pro requires thinking mode; QuotaMux preserves the caller's settings and
+lets the upstream validate them. See the [Go model table](https://opencode.ai/v2/docs/console/go/)
+and [Kimi model guide](https://www.kimi.com/code/docs/en/third-party-tools/opencode).
+
 For the other official adapters, declare the native protocols enabled for each
 model. The adapter verifies that every declaration is supported by that API.
 Kimi Code and the Kimi Open Platform are separate services with separate keys;

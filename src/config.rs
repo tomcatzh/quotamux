@@ -980,6 +980,44 @@ data_dir = "data"
     }
 
     #[test]
+    fn kimi_k31_pro_go_route_validates_and_uses_native_chat() {
+        let mut config = valid();
+        config.backends.truncate(1);
+        config.backends[0].models[0].name = "kimi-k3.1-pro".into();
+        config.models[0].name = "kimi-k3.1-pro".into();
+        config.models[0].aliases.clear();
+        config.models[0].layers.truncate(1);
+        config.models[0].layers[0].targets[0].model = "kimi-k3.1-pro".into();
+        config.validate().unwrap();
+
+        let backend = &config.backends[0];
+        let client = crate::provider::BackendClient::new(
+            backend,
+            &backend.credentials[0],
+            &backend.models[0],
+        )
+        .unwrap();
+        assert_eq!(client.protocols(), &[Protocol::OpenAiChat]);
+        for ingress in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            assert_eq!(client.protocol_for(ingress), Protocol::OpenAiChat);
+        }
+
+        config.backends[0].models[0].name = "kimi-k3.1-pro-unknown".into();
+        config.models[0].layers[0].targets[0].model = "kimi-k3.1-pro-unknown".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("not in the current official catalog")
+        );
+    }
+
+    #[test]
     fn removed_endpoint_protocol_field_is_rejected_during_deserialization() {
         let error = toml::from_str::<BackendModelConfig>(
             "name = \"model\"\nendpoint_protocol = \"openai-chat\"\nprotocols = [\"openai-chat\"]",
