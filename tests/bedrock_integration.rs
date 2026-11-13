@@ -719,3 +719,55 @@ fn base64(bytes: &[u8]) -> String {
     }
     result
 }
+
+#[tokio::test]
+async fn reported_bedrock_thinking_usage_survives_native_responses_and_ledgers() {
+    for streaming in [false, true] {
+        let mut expected = answer();
+        expected["usage"]["output_tokens_details"] = json!({"thinking_tokens":4});
+        let mut events = stream_events();
+        let delta = events
+            .iter_mut()
+            .find(|event| event["type"] == "message_delta")
+            .unwrap();
+        delta["usage"]["output_tokens_details"] = json!({"thinking_tokens":4});
+        let reply = if streaming {
+            Reply::Stream(events.iter().flat_map(chunk_frame).collect())
+        } else {
+            Reply::Json(StatusCode::OK, None, expected.clone())
+        };
+        let upstream = FakeBedrock::start(vec![reply]).await;
+        let gateway = Gateway::start(&upstream, None).await;
+        let response = gateway.post("/v1/messages", &request(0, streaming)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        if streaming {
+            let text = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            let actual = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, events);
+        } else {
+            assert_eq!(json_body(response).await, expected);
+        }
+        for (path, key) in [
+            ("/api/attempts?limit=10", "attempts"),
+            ("/api/requests?limit=10", "requests"),
+        ] {
+            let rows = gateway.get(path).await;
+            let usage = &rows[key][0]["usage"];
+            assert_eq!(usage["reasoning_tokens"], 4);
+            assert_eq!(usage["reasoning_reported"], true);
+            assert_eq!(usage["reasoning_estimated_tokens"], 0);
+            assert_eq!(usage["output_tokens"], 5);
+            assert_eq!(usage["input_tokens"], if streaming { 18 } else { 21 });
+        }
+    }
+}

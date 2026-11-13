@@ -494,13 +494,17 @@ pub fn message_to_chat(message: &Value, response_model: &str) -> Value {
         "created":chrono::Utc::now().timestamp(),
         "model":response_model,
         "choices":[{"index":0,"message":Value::Object(chat_message),"finish_reason":finish_reason}],
-        "usage":{
-            "prompt_tokens":usage.input_tokens,
-            "completion_tokens":usage.output_tokens,
-            "total_tokens":usage.total_tokens,
-            "prompt_tokens_details":{"cached_tokens":usage.cache_hit_tokens}
-        }
+        "usage":anthropic_chat_usage(&usage)
     })
+}
+
+fn anthropic_chat_usage(usage: &Usage) -> Value {
+    let mut value = json!({"prompt_tokens":usage.input_tokens,"completion_tokens":usage.output_tokens,
+        "total_tokens":usage.total_tokens,"prompt_tokens_details":{"cached_tokens":usage.cache_hit_tokens}});
+    if usage.reasoning_reported {
+        value["completion_tokens_details"] = json!({"reasoning_tokens":usage.reasoning_tokens});
+    }
+    value
 }
 
 pub struct ChatToAnthropicStream {
@@ -724,12 +728,7 @@ impl AnthropicToChatStream {
                     "object":"chat.completion.chunk",
                     "model":self.model,
                     "choices":[{"index":0,"delta":{},"finish_reason":finish}],
-                    "usage":{
-                        "prompt_tokens":self.usage.input_tokens,
-                        "completion_tokens":self.usage.output_tokens,
-                        "total_tokens":self.usage.total_tokens,
-                        "prompt_tokens_details":{"cached_tokens":self.usage.cache_hit_tokens}
-                    }
+                    "usage":anthropic_chat_usage(&self.usage)
                 })]
             }
             _ => Vec::new(),
@@ -764,6 +763,34 @@ pub fn estimate_tokens(body: &Value) -> u64 {
 mod tests {
     use super::*;
     use crate::config::LOGICAL_MODEL;
+
+    #[test]
+    fn reported_anthropic_thinking_is_preserved_by_chat_conversion() {
+        for count in [None, Some(0), Some(305)] {
+            let mut message = json!({"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"cache_read_input_tokens":11,"output_tokens":436}});
+            if let Some(count) = count {
+                message["usage"]["output_tokens_details"] = json!({"thinking_tokens":count});
+            }
+            let converted = message_to_chat(&message, "model");
+            let mut stream = AnthropicToChatStream::new("model");
+            stream.translate(&json!({"type":"message_start","message":{"id":"m","usage":{"input_tokens":7,"cache_read_input_tokens":11}}}));
+            let finish = stream.translate(&json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":message["usage"]}));
+            for usage in [&converted["usage"], &finish[0]["usage"]] {
+                assert_eq!(usage["prompt_tokens"], 18);
+                assert_eq!(usage["completion_tokens"], 436);
+                assert_eq!(usage["total_tokens"], 454);
+                assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 11);
+                if let Some(count) = count {
+                    assert_eq!(
+                        usage["completion_tokens_details"]["reasoning_tokens"],
+                        count
+                    );
+                } else {
+                    assert!(usage.get("completion_tokens_details").is_none());
+                }
+            }
+        }
+    }
 
     #[test]
     fn translates_thinking_and_tool_history() {

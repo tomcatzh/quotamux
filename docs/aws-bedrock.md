@@ -1,6 +1,6 @@
 # AWS Bedrock 接入
 
-核对日期：2026-11-13。实现使用官方 AWS SDK for Rust 的 `InvokeModel` / `InvokeModelWithResponseStream`，目标是在 EC2 Instance Role 下调用 Bedrock。当前验证限于本地模拟服务与代码审查；尚无真实 EC2、模型授权或 AWS 配额验收结果。
+核对日期：2026-11-13。实现使用官方 AWS SDK for Rust 的 `InvokeModel` / `InvokeModelWithResponseStream`，目标是在 EC2 Instance Role 下调用 Bedrock。已通过用户提供的隔离 `8081` 实例完成四款模型的真实普通/流式请求、兼容接口、工具及签名历史回传验证；真实 Instance Profile 凭据来源、过期刷新、长上下文和限流/配额边界仍未完成主机级验收。
 
 ## 入口与模型
 
@@ -44,7 +44,10 @@ QuotaMux 由 `quotamux.toml` 决定路由。
 报告中的 `targets[].circuit.reason` 和 `next_probe_at_ms` 给出暂停原因与下次探测时间；
 尝试记录保留首次调用的上游状态和错误类型。现有鉴权/配置失败首次冷却为 300 秒，
 期间的后续请求可能只看到上述 503。2026-11-13 的模拟测试已复现该路径，
-但用户 EC2 的原始失败仍需一次报告或直接连接确认。名称兼容配置不会重置熔断状态。
+2026-11-13 的远端只读记录显示，历史失败为 Role 缺少 `bedrock:InvokeModel` 的
+`AccessDeniedException`；随后四模型的真实普通/流式请求已全部成功。原始 503 的具体请求号
+未在当前账本检索到，因此历史权限拒绝与该次 503 的关联仍是结合时间和熔断机制的判断。
+名称兼容配置不会重置熔断状态。实测实例仍只接受短名；使用 Global 名称需要部署含上述 aliases 的配置。
 
 ## 配置与凭据
 
@@ -87,6 +90,11 @@ EC2 容器部署还要确认容器能够访问 IMDSv2。AWS 文档指出，hop l
 
 这几款模型的保留 thinking 与模型及原始对话前缀绑定，部分还与 AWS 账户绑定。原生请求不重写这些字段；自行配置回退时应注意跨模型或跨账户重放可能被上游拒绝。接入没有修改模型的默认 thinking 或采样语义。[Sonnet 5.5 模型约束](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5-5.html)
 
+上游提供 `usage.output_tokens_details.thinking_tokens` 时，统计采用真实计数（包括显式 `0`），
+普通和流式请求均不再以字节估算覆盖；Chat Completions 和 Responses 转换保留对应的 reasoning
+明细。历史记录不会重新计算。只有上游未提供有效明细时，才沿用既有思考 token 估算。
+[AWS 思考 token 用量](https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html)
+
 `/v1/messages/count_tokens` 继续提供带 `x_quotamux_estimated: true` 的网关本地估算，不调用 Bedrock `CountTokens`，不能当作 AWS 精确计数。示例未填价格，避免把未核实的费率记成实际账单。
 
 ## 验证与后续验收
@@ -118,4 +126,8 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo run --locked --bin quotamux -- --config quotamux.bedrock.example.toml --check
 ```
 
-后续有 EC2 后，在独立 `8081` 与独立数据中验证 Role 身份、四款模型的普通/流式请求、工具往返、thinking 历史、临时凭据刷新和实际限流表现。只有完成真实环境验收后，才按项目流程考虑生产 `8080`。本次没有发布、合并或修改生产实例。
+当前远端已验证四款模型的普通/流式请求、Haiku 的两种 OpenAI 兼容接口、Haiku/Fable 工具往返及
+Fable 的流式 thinking 签名历史回传。现场同时发现 Global 别名未部署和思考 token 记账遗漏；
+别名已包含在配置模板，记账修复已补回归。代码/静态包修复不代表该实例已经更新。
+后续仍需在独立 `8081` 与独立数据中核实 Role 身份来源、真实临时凭据刷新、长上下文和限流表现。
+只有完成真实环境验收后，才按项目流程考虑生产 `8080`。本次没有合并或修改生产实例。

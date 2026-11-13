@@ -413,12 +413,15 @@ impl Usage {
             .unwrap_or(0);
         let cache_miss = uncached_input.saturating_add(cache_creation);
         let input = cache_miss.saturating_add(cache_hit);
+        let reasoning = usage
+            .pointer("/output_tokens_details/thinking_tokens")
+            .and_then(Value::as_u64);
         Self {
             input_tokens: input,
             cache_hit_tokens: cache_hit,
             cache_miss_tokens: cache_miss,
-            reasoning_tokens: 0,
-            reasoning_reported: false,
+            reasoning_tokens: reasoning.unwrap_or(0),
+            reasoning_reported: reasoning.is_some(),
             reasoning_estimated_tokens: 0,
             output_tokens: output,
             total_tokens: input.saturating_add(output),
@@ -450,6 +453,14 @@ impl Usage {
             self.output_tokens = output;
         }
 
+        if let Some(reasoning) = usage
+            .pointer("/output_tokens_details/thinking_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.reasoning_tokens = reasoning;
+            self.reasoning_reported = true;
+            self.reasoning_estimated_tokens = 0;
+        }
         self.total_tokens = self.input_tokens.saturating_add(self.output_tokens);
         self.provider_reported = true;
     }
@@ -704,6 +715,64 @@ mod tests {
             "output_tokens": 1
         }}));
         assert!(!anthropic.reasoning_reported);
+    }
+
+    #[test]
+    fn anthropic_reported_thinking_counts_override_estimates_including_zero() {
+        for count in [0, 305] {
+            let value = json!({"usage":{"input_tokens":7,"cache_creation_input_tokens":3,
+                "cache_read_input_tokens":11,"output_tokens":436,
+                "output_tokens_details":{"thinking_tokens":count}}});
+            let usage = Usage::from_anthropic(&value);
+            assert_eq!(usage.input_tokens, 21);
+            assert_eq!(usage.cache_hit_tokens, 11);
+            assert_eq!(usage.cache_miss_tokens, 10);
+            assert_eq!(usage.total_tokens, 457);
+            assert_eq!(usage.reasoning_tokens, count);
+            assert!(usage.reasoning_reported);
+            let mut stream = Usage::default();
+            stream.observe_anthropic_stream_event(&json!({"type":"message_start","message":{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":11}}}));
+            stream.reasoning_estimated_tokens = 276;
+            stream.observe_anthropic_stream_event(&json!({"type":"message_delta","usage":{"output_tokens_details":{"thinking_tokens":count}}}));
+            stream.observe_anthropic_stream_event(
+                &json!({"type":"message_delta","usage":{"output_tokens":436}}),
+            );
+            assert_eq!(stream.as_json(), usage.as_json());
+            assert!(!stream.estimate_reasoning(GeneratedTextBytes {
+                reasoning: 999,
+                other: 1
+            }));
+            assert_eq!(stream.reasoning_estimated_tokens, 0);
+        }
+    }
+
+    #[test]
+    fn anthropic_invalid_thinking_details_do_not_become_reported_counts() {
+        for details in [
+            json!({}),
+            json!({"thinking_tokens":null}),
+            json!({"thinking_tokens":"305"}),
+            json!({"thinking_tokens":-1}),
+            json!({"thinking_tokens":1.5}),
+        ] {
+            let usage =
+                json!({"input_tokens":7,"output_tokens":10,"output_tokens_details":details});
+            let mut parsed = Usage::from_anthropic(&json!({"usage":usage}));
+            assert!(!parsed.reasoning_reported);
+            assert!(parsed.estimate_reasoning(GeneratedTextBytes {
+                reasoning: 9,
+                other: 1
+            }));
+            let mut stream = Usage::default();
+            stream.observe_anthropic_stream_event(
+                &json!({"type":"message_start","message":{"usage":usage}}),
+            );
+            assert!(!stream.reasoning_reported);
+            stream.observe_anthropic_stream_event(&json!({"type":"message_delta","usage":{"output_tokens_details":{"thinking_tokens":3}}}));
+            stream.observe_anthropic_stream_event(&json!({"type":"message_delta","usage":usage}));
+            assert_eq!(stream.reasoning_tokens, 3);
+            assert!(stream.reasoning_reported);
+        }
     }
 
     #[test]

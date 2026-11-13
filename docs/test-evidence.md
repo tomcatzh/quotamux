@@ -7,6 +7,22 @@ protocol-translation, configurable inference-body-limit, memory-only
 prompt-prefix-affinity, token-detail, and estimated-thinking test runs. API keys,
 prompt bodies, and model response bodies are excluded.
 
+## 2026-11-13：用户提供实例的真实 Bedrock HTTP 验收
+
+直接测试用户提供的隔离 `8081` 服务，版本 `0.3.0`；只读状态与短提示推理，不修改实例配置。
+
+- 四款 Global 上游模型的 Anthropic Messages 普通/流式请求共 8 项全部通过，回答为 `OK`，流式终止事件完整。
+- Haiku 的 Chat Completions 与 Responses 普通/流式共 4 项全部通过；结束事件与用量字段完整。
+- Haiku 与 Fable 各完成一次原生工具调用和结果回传，共 4 次 HTTP 请求均成功。
+- Fable 补充流式 thinking 与签名历史回传，两轮 `200`，真实签名 delta、`message_stop` 和下一轮回答通过。首个独立数值测试的严格文本断言未通过，未继续历史回传；该首轮 HTTP/流终止/签名正常，但原文未保存，不能判定是格式还是答案差异。后续采用独立数值检查与签名协议验收完成复测，数值亦正确。
+- 发现部署配置缺口：实例只公开四个短名，四个 `global.anthropic.*` 名称均返回网关 `400 unsupported model`。上游目标已正确使用 Global ID；仓库配置模板已有 aliases，远端配置尚未替换。
+- 发现真实记账缺陷：同一 Fable 响应上游 `thinking_tokens=305/output_tokens=436`，账本却为 `reasoning_tokens=0/reasoning_reported=false/reasoning_estimated_tokens=276`。现修复普通/流式解析和兼容协议转换，真实计数（包括 0）优先于估算，既有输入/缓存/输出/总量与历史记录不变。
+- 修复后本地完整回归 290 项通过、7 项既有真实环境测试跳过；新增单测覆盖有效/无效数值、部分事件、显式 0 和兼容转换，SDK 模拟回归覆盖普通/流式响应保真及请求/尝试记账一致性。
+- 修复后的 ARM64/x86_64 静态三文件 ZIP 位于 `data/releases/bedrock-usage-fix/`，均通过 ELF/权限/CRC/SHA256 以及真实发行程序的 scratch 离线诊断、CLI、私有报告和启动脚本验收。
+- 历史记录有 Role 缺少 `bedrock:InvokeModel` 的 AWS `403 AccessDeniedException`；本轮真实推理没有出现该错误。原始用户贴出的 503 请求号未在当前账本找到，不能将具体请求关联宣称为完全复现。
+
+原始状态、逐项结果、签名计数和脱敏记账对照位于本地忽略目录 `data/remote-bedrock-*/`；不保存 thinking 原文或签名。代码修复不等于远端实例已部署修复版。真实临时凭据过期刷新、长上下文、缓存命中/TTL、实际限流与生产 `8080` 未验收。
+
 ## 2026-11-13：一次性 Bedrock 诊断与最终 Linux 包
 
 用户无法频繁往返 EC2，因此现场改为一次 `./start.sh --diagnose`，回传一个私有 JSON；不再要求逐条 curl。
