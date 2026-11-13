@@ -15,7 +15,7 @@ prompt bodies, and model response bodies are excluded.
 - Haiku 的 Chat Completions 与 Responses 普通/流式共 4 项全部通过；结束事件与用量字段完整。
 - Haiku 与 Fable 各完成一次原生工具调用和结果回传，共 4 次 HTTP 请求均成功。
 - Fable 补充流式 thinking 与签名历史回传，两轮 `200`，真实签名 delta、`message_stop` 和下一轮回答通过。首个独立数值测试的严格文本断言未通过，未继续历史回传；该首轮 HTTP/流终止/签名正常，但原文未保存，不能判定是格式还是答案差异。后续采用独立数值检查与签名协议验收完成复测，数值亦正确。
-- 发现部署配置缺口：实例只公开四个短名，四个 `global.anthropic.*` 名称均返回网关 `400 unsupported model`。上游目标已正确使用 Global ID；仓库配置模板已有 aliases，远端配置尚未替换。
+- 对外/上游命名核对：实例公开四个短名，后台目标使用 Global ID，符合用户通过 QuotaMux 调用的方式。额外使用四个 `global.anthropic.*` 名称请求时均返回 `400 unsupported model`，这是未配置可选别名的预期结果，不是配置缺陷，无需为当前调用方式更改配置。此前将其列为部署缺口的判断已更正。
 - 发现真实记账缺陷：同一 Fable 响应上游 `thinking_tokens=305/output_tokens=436`，账本却为 `reasoning_tokens=0/reasoning_reported=false/reasoning_estimated_tokens=276`。现修复普通/流式解析和兼容协议转换，真实计数（包括 0）优先于估算，既有输入/缓存/输出/总量与历史记录不变。
 - 修复后本地完整回归 290 项通过、7 项既有真实环境测试跳过；新增单测覆盖有效/无效数值、部分事件、显式 0 和兼容转换，SDK 模拟回归覆盖普通/流式响应保真及请求/尝试记账一致性。
 - 修复后的 ARM64/x86_64 静态三文件 ZIP 位于 `data/releases/bedrock-usage-fix/`，均通过 ELF/权限/CRC/SHA256 以及真实发行程序的 scratch 离线诊断、CLI、私有报告和启动脚本验收。

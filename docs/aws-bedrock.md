@@ -17,6 +17,9 @@
 
 示例和三文件包配置同时接受短名和对应的 Global ID，例如 `claude-haiku-5-5` 与
 `global.anthropic.claude-haiku-5-5`。实际 AWS 请求始终使用路由目标中的 Global ID。
+对外模型名由 QuotaMux 配置决定，与后台的 Bedrock 模型 ID 分开。客户端使用
+`claude-haiku-5-5`、后台映射到 `global.anthropic.claude-haiku-5-5` 是正确配置；
+Global 名称别名只是可选兼容，不是 Bedrock 接入要求。
 `CLAUDE_CODE_USE_BEDROCK`、`ANTHROPIC_MODEL` 等 Claude Code 环境变量不配置 QuotaMux；
 QuotaMux 由 `quotamux.toml` 决定路由。
 
@@ -47,7 +50,8 @@ QuotaMux 由 `quotamux.toml` 决定路由。
 2026-11-13 的远端只读记录显示，历史失败为 Role 缺少 `bedrock:InvokeModel` 的
 `AccessDeniedException`；随后四模型的真实普通/流式请求已全部成功。原始 503 的具体请求号
 未在当前账本检索到，因此历史权限拒绝与该次 503 的关联仍是结合时间和熔断机制的判断。
-名称兼容配置不会重置熔断状态。实测实例仍只接受短名；使用 Global 名称需要部署含上述 aliases 的配置。
+名称兼容配置不会重置熔断状态。实测实例以短名对外、Global ID 调用上游，符合 QuotaMux 的使用方式，
+无需增加别名。仅当希望客户端直接使用 Global ID 作为对外模型名时，才需要配置相应 aliases。
 
 ## 配置与凭据
 
@@ -127,7 +131,7 @@ cargo run --locked --bin quotamux -- --config quotamux.bedrock.example.toml --ch
 ```
 
 当前远端已验证四款模型的普通/流式请求、Haiku 的两种 OpenAI 兼容接口、Haiku/Fable 工具往返及
-Fable 的流式 thinking 签名历史回传。现场同时发现 Global 别名未部署和思考 token 记账遗漏；
-别名已包含在配置模板，记账修复已补回归。代码/静态包修复不代表该实例已经更新。
+Fable 的流式 thinking 签名历史回传。实例当前的短名到 Global ID 映射正确，可以直接调用；
+思考 token 记账遗漏已修复并补回归，代码/静态包修复不代表该实例已经更新。
 后续仍需在独立 `8081` 与独立数据中核实 Role 身份来源、真实临时凭据刷新、长上下文和限流表现。
 只有完成真实环境验收后，才按项目流程考虑生产 `8080`。本次没有合并或修改生产实例。
