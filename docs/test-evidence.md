@@ -7,6 +7,16 @@ protocol-translation, configurable inference-body-limit, memory-only
 prompt-prefix-affinity, token-detail, and estimated-thinking test runs. API keys,
 prompt bodies, and model response bodies are excluded.
 
+## 2026-11-13：Claude Code 正常工具模式的实验 beta 兼容验收
+
+- 用户在 Claude Code `2.1.323` 的 Fable 5.2 普通会话中请求读取目录，收到 `400 upstream request failed`。网关记录确认 AWS `ValidationException` 拒绝 `advanced-tool-use-2025-11-20`、`advisor-tool-2026-03-01`、`redact-thinking-2026-02-12` 等实验标记；模型名和 Role 鉴权没有报错。
+- 先前 `2.1.318` 的 CC 成功测试使用 `--bare --tools ''`，只验证无工具调用，未覆盖这类正常模式能力。验收结论限定为该范围。
+- 已用相同 `2.1.323`，非 bare 的 `--safe-mode -p`、正常内置工具定义和只读权限，读取隔离临时 README 的随机校验码。未关闭实验 beta 的对照先出现三次 `advanced-tool-use` 的 AWS 400，再由客户端降级完成读取；不能将最终退出 0 当作全程无上游错误。
+- 仅增加 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` 后，Read 调用与结果回传两轮全部直接 `200`，随机校验码正确、退出码 0、无权限拒绝，也未出现新的 beta 400。
+- 测试使用独立临时配置、停用自动更新、hooks/MCP 自定义，并限制实际执行为 Read；未读取用户真实 vault、修改 macOS 设置或实例配置。用户自定义插件/MCP 全流程不在本次覆盖范围。
+
+证据位于忽略目录 `data/claude-code-400-*/normal-tools-beta-comparison.json`。应在原有 export 参数中补充实验 beta 兼容开关，再重启 Claude Code；当前 `/v1/messages` 接口继续使用 `ANTHROPIC_BASE_URL`。官方依据见[网关兼容说明](https://code.claude.com/docs/en/llm-gateway-protocol#disable-pre-release-capabilities)。本轮没有变更网关转发代码或静态包。
+
 ## 2026-11-13：用户提供实例的真实 Bedrock HTTP 验收
 
 直接测试用户提供的隔离 `8081` 服务，版本 `0.3.0`；只读状态与短提示推理，不修改实例配置。

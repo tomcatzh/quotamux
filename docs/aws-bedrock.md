@@ -23,6 +23,38 @@ Global 名称别名只是可选兼容，不是 Bedrock 接入要求。
 `CLAUDE_CODE_USE_BEDROCK`、`ANTHROPIC_MODEL` 等 Claude Code 环境变量不配置 QuotaMux；
 QuotaMux 由 `quotamux.toml` 决定路由。
 
+### Claude Code 接入参数
+
+客户端通过 QuotaMux 的 Anthropic Messages 接口访问，保持 `CLAUDE_CODE_USE_BEDROCK` 关闭；
+Bedrock 协议和 Role 鉴权由服务端处理。将下例地址替换为实际网关地址：
+
+```sh
+unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+export ANTHROPIC_BASE_URL='http://QUOTAMUX_HOST:8081'
+export ANTHROPIC_AUTH_TOKEN='quotamux'
+export ANTHROPIC_MODEL='claude-fable-5-2'
+export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5-5'
+export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-sonnet-5-5'
+export ANTHROPIC_DEFAULT_HAIKU_MODEL='claude-haiku-5-5'
+export ANTHROPIC_DEFAULT_FABLE_MODEL='claude-fable-5-2'
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+claude
+```
+
+`quotamux` 是当前无网关鉴权配置下的占位 token。环境变量在重新启动的 Claude Code 中生效。
+关闭实验 beta 是此类 Anthropic 格式网关转接 Bedrock 的兼容选项：正常模式会发送上游可能
+不支持的实验标记及配套字段。2026-11-13 的实例错误包含 `advanced-tool-use-2025-11-20`、
+`advisor-tool-2026-03-01` 和 `redact-thinking-2026-02-12`，AWS 返回 `400 ValidationException`。
+该开关保留普通工具、adaptive thinking 和顶层 effort，关闭实验扩展及配套字段；
+MCP 工具搜索会关闭，工具改为提前加载。开发者手动设置的 `ANTHROPIC_BETAS` 不受它过滤，
+如另有设置，应移除其中不受支持的值。[Claude Code 官方兼容说明](https://code.claude.com/docs/en/llm-gateway-protocol#disable-pre-release-capabilities)
+
+客户端 `CLAUDE_CODE_USE_BEDROCK=1` 会选择另一种协议，需要 Bedrock Invoke 路径及二进制事件流；
+当前 QuotaMux 对外提供 `/v1/messages`。不能仅切换该变量而继续使用现有接口。
+普通无工具请求、`--bare` 成功不代表完整 Claude Code 功能均已验收；已补充同版本 `2.1.323`
+的非 bare Read 工具往返，关闭实验 beta 后两轮均直接返回 `200`。
+
 ### 收到 no route target is currently available
 
 这条 503 是本次没有可调用目标的网关响应，不能仅凭它判定 AWS 根因。
